@@ -209,7 +209,7 @@ impl NanonisConnection {
         let course_menu = CourseMotionState::new(&course_voltages, &move_sender);
 
         let address = address.as_ref();
-        LineWorker::new(&frame_queue_tx, &scan_status).run(address, 6501);
+        LineWorker::new(&frame_queue_tx, &scan_status).run(address, 6500);
         FrameWorker::new(
             &ctx,
             &forward_data,
@@ -218,9 +218,9 @@ impl NanonisConnection {
             &channel_state,
             &scan_status,
         )
-        .run(address, 6502);
+        .run(address, 6500);
         FastStatusWorker::new(&ctx, &image_transform, &tip_pos, &fast_status_init)
-            .run(address, 6503);
+            .run(address, 6500);
         SlowStatusWorker::new(
             &ctx,
             &area_size,
@@ -231,7 +231,7 @@ impl NanonisConnection {
             &move_receiver,
             &slow_status_init,
         )
-        .run(address, 6504);
+        .run(address, 6500);
         Self {
             image_transform,
             area_size,
