@@ -1,3 +1,4 @@
+use crate::analysis::ring_stamp::RingStamp;
 use core::f32;
 use std::{fmt::Debug, io::Write, sync::Arc};
 
@@ -32,6 +33,8 @@ pub struct LiveImage {
     pub forward_data: FrameData,
     pub backward_data: FrameData,
     pub unit: String,
+    /// Ring Assist result recorded when this image was stamped.
+    pub ring: Option<RingStamp>,
     uuid: Uuid,
 }
 
@@ -56,6 +59,7 @@ impl LiveImage {
             backward_data: empty_data,
             transform,
             unit: "".into(),
+            ring: None,
             uuid,
         }
     }
@@ -88,6 +92,19 @@ impl LiveImage {
                 ui.label(format!("X Slope: {:.2}{}", EngFmt(*x_slope), self.unit));
                 ui.label(format!("Y Slope: {:.2}{}", EngFmt(*y_slope), self.unit));
             }
+        }
+        if let Some(r) = &self.ring {
+            ui.label(egui::RichText::new(format!("Ring: {}", r.summary())).color(r.color()));
+            ui.label(format!(
+                "  inliers {:.2}, radius {:.1} µm{}",
+                r.inlier_fraction,
+                r.radius_um,
+                if r.valid_fraction < 0.98 {
+                    format!(", {:.0}% scanned", r.valid_fraction * 100.)
+                } else {
+                    String::new()
+                }
+            ));
         }
     }
     pub fn show_fit_control(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
@@ -176,6 +193,7 @@ impl LiveImage {
             forward_data: self.forward_data.clone(),
             backward_data: self.backward_data.clone(),
             unit: self.unit.clone(),
+            ring: None,
             uuid: Uuid::new_v4(),
         }
     }
@@ -219,6 +237,8 @@ const NORM_TABLE: TableDefinition<Uuid, u8> = TableDefinition::new("liveimage_no
 const DATA_TABLE: TableDefinition<Uuid, [FrameData; 2]> =
     TableDefinition::new("liveimage_data_table_v1");
 const UNIT_TABLE: TableDefinition<Uuid, &str> = TableDefinition::new("liveimage_unit_table_v1");
+/// Optional: only stamps analysed by Ring Assist have a row.
+const RING_TABLE: TableDefinition<Uuid, [f64; 10]> = TableDefinition::new("liveimage_ring_table_v1");
 
 impl Persistant for LiveImage {
     fn db_update<'t>(
@@ -258,6 +278,17 @@ impl Persistant for LiveImage {
         if norm_data.value() != Into::<u8>::into(self.norm_type) {
             norm_data.insert(&self.norm_type.into())?;
         }
+        drop(norm_data);
+
+        let mut ring_table = txn.open_table(RING_TABLE)?;
+        let stored = ring_table.get(id)?.map(|v| v.value());
+        let wanted = self.ring.map(|r| r.to_array());
+        if stored != wanted {
+            match wanted {
+                Some(a) => ring_table.insert(id, a)?,
+                None => ring_table.remove(id)?,
+            };
+        }
 
         Ok(())
     }
@@ -280,6 +311,8 @@ impl Persistant for LiveImage {
         unit_table.remove(id)?;
         let mut data_table = txn.open_table(DATA_TABLE)?;
         data_table.remove(id)?;
+        let mut ring_table = txn.open_table(RING_TABLE)?;
+        ring_table.remove(id)?;
 
         Ok(())
     }
@@ -304,6 +337,10 @@ impl Persistant for LiveImage {
         unit_table.insert(id, self.unit.as_str())?;
         let mut data_table = txn.open_table(DATA_TABLE)?;
         data_table.insert(id, [self.forward_data.clone(), self.backward_data.clone()])?;
+        if let Some(r) = &self.ring {
+            let mut ring_table = txn.open_table(RING_TABLE)?;
+            ring_table.insert(id, r.to_array())?;
+        }
         Ok(())
     }
 
@@ -326,12 +363,15 @@ impl Persistant for LiveImage {
         let unit_data = unit_table.get(id)?.unwrap().value().to_string();
         let data_table = txn.open_table(DATA_TABLE)?;
         let frame_data = data_table.get(id)?.unwrap().value();
+        let ring_table = txn.open_table(RING_TABLE)?;
+        let ring = ring_table.get(id)?.map(|v| RingStamp::from_array(v.value()));
         let mut image = Self::new(id, encoder, DAffine2::from_cols_array(&tran_data));
         image.std_dev = stddev_data;
         image.line_dir = LineDir::try_from(dir_data).unwrap();
         image.fit_type = FitType::try_from(fit_data).unwrap();
         image.norm_type = NormType::try_from(norm_data).unwrap();
         image.unit = unit_data;
+        image.ring = ring;
         [image.forward_data, image.backward_data] = frame_data;
         image.write_and_update_texture(encoder);
         Ok(image)
@@ -346,6 +386,8 @@ impl Persistant for LiveImage {
         let norm_table_len = txn.open_table(NORM_TABLE)?.len()?;
         let data_table_len = txn.open_table(DATA_TABLE)?.len()?;
         let unit_table_len = txn.open_table(UNIT_TABLE)?.len()?;
+        let ring_table_len = txn.open_table(RING_TABLE)?.len()?;
+        println!("  ring table: {ring_table_len} items");
         println!("  transform table: {transform_table_len} items");
         println!("  std_dev table: {std_dev_table_len} items");
         println!("  dir table: {dir_table_len} items");

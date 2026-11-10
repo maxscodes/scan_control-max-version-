@@ -145,13 +145,20 @@ impl Connection for NanonisConnection {
         self.update_tip_pos(scan_area);
         self.update_base_name(scan_area);
         let stamps = scan_area.stamp.drain(..).collect_vec();
+        let stamp_channel = scan_area.channel_selected.clone();
         let time = time::UtcDateTime::now();
         let time = time::PrimitiveDateTime::new(time.date(), time.time());
         let base_name = time_fmt::format::format_date_time(&scan_area.stamp_name_base, time)
             .unwrap_or_else(|_| scan_area.stamp_name_base.clone());
 
         let mut name_index = 0;
-        for stamp in stamps {
+        for mut stamp in stamps {
+            stamp.ring = self.ring_assist.stamp_result(
+                stamp_channel.as_deref(),
+                &stamp.forward_data.data,
+                stamp.forward_data.size,
+                stamp.transform,
+            );
             'try_again: loop {
                 for obj in object_list.iter() {
                     let name = obj.name();

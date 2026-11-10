@@ -284,6 +284,20 @@ impl eframe::App for MyApp {
                             new_world_transform = Some(objects[i].goto_transform());
                         }
                     }
+                    // Ring Assist results saved with stamps (works offline too).
+                    let show_rings = objects
+                        .iter()
+                        .find_map(|o| o.as_scan_area())
+                        .is_none_or(|area| area.show_stamp_rings);
+                    if show_rings {
+                        for obj in objects.iter() {
+                            if let Object::ScanImage { image, hidden: false, .. } = &**obj {
+                                if let Some(ring) = &image.ring {
+                                    crate::analysis::ring_stamp::draw(ui, image.transform, ring);
+                                }
+                            }
+                        }
+                    }
                     if let Some(object) = objects.get_hovered(ui.ctx()) {
                         if let Some(tran) = object.border_transform() {
                             BorderRectangle {

@@ -26,6 +26,8 @@ pub struct ScanArea {
     pub course_move_history: Vec<DVec2>,
     pub show_history: bool,
     pub show_history_boxes: bool,
+    /// Draw the Ring Assist result saved with each stamped image.
+    pub show_stamp_rings: bool,
 }
 impl ScanArea {
     pub fn new(uuid: Uuid, encoder: &ImageEncoder, area_size: DVec2) -> Self {
@@ -44,6 +46,7 @@ impl ScanArea {
             course_move_history: Vec::new(),
             show_history: false,
             show_history_boxes: false,
+            show_stamp_rings: true,
         }
     }
     pub fn uuid(&self) -> Uuid {
@@ -146,6 +149,7 @@ impl ScanArea {
                 ui.checkbox(&mut self.show_history_boxes, "Show boxes");
             });
         }
+        ui.checkbox(&mut self.show_stamp_rings, "Show ring results on stamps");
     }
     fn show_stamp_button(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
         let font_id = egui::TextStyle::Body.resolve(ui.style());

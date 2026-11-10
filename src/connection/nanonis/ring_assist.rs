@@ -15,7 +15,10 @@ use egui::{Align2, Color32, FontId, Id, RichText, Stroke, Ui};
 use glam::{DAffine2, DVec2};
 
 use crate::{
-    analysis::ring_center::{self, RingParams, Verdict},
+    analysis::{
+        ring_center::{self, RingParams, Verdict},
+        ring_stamp::{self, RingStamp, ARC_COLOR, ARM_COLOR, UNSURE_COLOR},
+    },
     connection::ScanArea,
     scan_view::{BorderRectangle, ScanViewCtx},
     utils::vec_interop::IntoEgui as _,
@@ -31,9 +34,6 @@ const MIN_VALID_FRACTION: f64 = 0.3;
 const HISTORY_LEN: usize = 12;
 const DEFAULT_MIN_RADIUS_UM: f64 = 1.5;
 
-const ARC_COLOR: Color32 = Color32::from_rgb(0x3c, 0xd0, 0x5a);
-const ARM_COLOR: Color32 = Color32::from_rgb(0x3c, 0xb4, 0xff);
-const UNSURE_COLOR: Color32 = Color32::from_rgb(0xff, 0x50, 0x50);
 const GOOD_COLOR: Color32 = Color32::from_rgb(0x9a, 0xe6, 0xa8);
 const FEATURE_COLOR: Color32 = Color32::from_rgb(0x00, 0xc8, 0xff);
 
@@ -92,6 +92,8 @@ pub struct RingAssistState {
     window_open: bool,
     enabled: bool,
     show_debug: bool,
+    /// Analyse each stamped image and save the result with it.
+    save_with_stamps: bool,
     params: RingParams,
     min_radius_um: f64,
     last_run: Option<Instant>,
@@ -120,7 +122,26 @@ impl RingAssistState {
             current: None,
             last_good: None,
             history: VecDeque::new(),
+            save_with_stamps: true,
         }
+    }
+
+    /// Ring result to save with a stamped image, if Ring Assist is on, set to
+    /// save with stamps, and the stamped channel is Z.
+    pub fn stamp_result(
+        &self,
+        channel: Option<&str>,
+        data: &[f32],
+        size: [u32; 2],
+        frame: DAffine2,
+    ) -> Option<RingStamp> {
+        if !self.enabled || !self.save_with_stamps {
+            return None;
+        }
+        if !channel.is_some_and(|c| c.trim_start().starts_with('Z')) {
+            return None;
+        }
+        ring_stamp::analyse_frame(data, size, frame, &self.params, self.min_radius_um)
     }
 
     /// Call once per UI update after the live image data was refreshed.
@@ -346,6 +367,8 @@ impl RingAssistState {
         }
         ui.separator();
         ui.checkbox(&mut self.show_debug, "Show edges and removed features");
+        ui.checkbox(&mut self.save_with_stamps, "Save result with stamps")
+            .on_hover_text("Each stamped image keeps its ring result in the project. Hide them with \"Show ring results on stamps\" in the Scan Region menu.");
         if ui.button("Clear trail").clicked() {
             self.history.clear();
             self.last_good = None;
