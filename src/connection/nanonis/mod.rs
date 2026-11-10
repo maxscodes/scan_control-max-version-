@@ -1,13 +1,20 @@
 mod channel_state;
 mod command_channel;
 mod course_motion;
+mod lithography;
+mod ring_assist;
 mod scan_control;
 mod scan_status;
+mod sequence;
+mod spectroscopy;
 mod worker;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 pub use channel_state::ChannelState;
@@ -25,7 +32,11 @@ use crate::{
         live_image::{FrameData, LiveImage},
         nanonis::{
             course_motion::CourseMotionState,
+            lithography::{LithographyState, LithographyWorker},
+            ring_assist::RingAssistState,
             scan_control::ScanControlState,
+            sequence::{SequenceAction, SequenceState, SequenceWorker},
+            spectroscopy::{SpectroscopyState, SpectroscopyWorker},
             worker::{FastStatusWorker, FrameWorker, LineWorker, SlowStatusWorker, Worker as _},
         },
         queue::{overwrite_queue, OverwriteQueueSender},
@@ -51,7 +62,21 @@ pub struct NanonisConnection {
     fast_status_init: Arc<AtomicBool>,
     course_menu: CourseMotionState,
     scan_control: ScanControlState,
+    sequence: SequenceState,
+    spectroscopy: SpectroscopyState,
+    lithography: LithographyState,
+    ring_assist: RingAssistState,
+    pending_stamp: Option<PendingStamp>,
 }
+
+/// A stamp requested by the sequence runner, waiting for a fresh full frame.
+struct PendingStamp {
+    since: Instant,
+    got_forward: bool,
+    got_backward: bool,
+}
+/// Stamp with whatever data is present if the fresh frame doesn't arrive.
+const STAMP_FALLBACK: Duration = Duration::from_secs(10);
 
 impl Connection for NanonisConnection {
     fn poll_connected(
@@ -112,7 +137,10 @@ impl Connection for NanonisConnection {
         self.update_channel(scan_area, encoder);
         self.update_area_size(scan_area);
         self.update_image_transform(scan_area);
-        self.update_image_data(&mut scan_area.live_image, encoder);
+        let (got_forward, got_backward) =
+            self.update_image_data(&mut scan_area.live_image, encoder);
+        self.update_sequence(scan_area, encoder, got_forward, got_backward);
+        self.ring_assist.update(scan_area, got_forward);
         self.update_scan_status(scan_area);
         self.update_tip_pos(scan_area);
         self.update_base_name(scan_area);
@@ -181,23 +209,38 @@ impl Connection for NanonisConnection {
         else {
             return;
         };
+        // Scan start/pause/resume/stop at the top of the window.
+        let scan_status = scan_area.scan_status;
+        self.scan_control
+            .show_menu(ui, &scan_status, self.sequence.is_running());
+        ui.separator();
         scan_area.show_menu(ui, encoder);
         ui.separator();
-        self.course_menu.show_menu(ui, object_list);
-    }
-    fn show_scan_control(
-        &mut self,
-        ui: &mut Ui,
-        object_list: &mut SelectableList<view_object::Object>,
-    ) {
-        let Some(scan_area) = object_list
-            .iter_mut()
-            .find_map(|entry| entry.as_scan_area_mut())
-        else {
-            return;
-        };
-        let scan_status = scan_area.scan_status;
-        self.scan_control.show_menu(ui, &scan_status);
+        // Only one tool may drive the tip at a time.
+        let sequence = self
+            .sequence
+            .is_running()
+            .then_some("A sequence is running");
+        let spectroscopy = self
+            .spectroscopy
+            .is_running()
+            .then_some("I(V) spectroscopy is running");
+        let lithography = self
+            .lithography
+            .is_running()
+            .then_some("Lithography is running");
+        let scanning = scan_status
+            .scanning
+            .then_some("A scan is running; stop it first");
+        let locked = sequence.or(spectroscopy).or(lithography).is_some();
+        self.course_menu.show_menu(ui, object_list, locked);
+        self.sequence
+            .show_menu(ui, object_list, &self.course_menu, spectroscopy.or(lithography));
+        self.spectroscopy
+            .show_menu(ui, sequence.or(lithography).or(scanning));
+        self.lithography
+            .show_menu(ui, object_list, sequence.or(spectroscopy).or(scanning));
+        self.ring_assist.show_menu(ui);
     }
     fn show_image_view_overlay(
         &mut self,
@@ -205,6 +248,14 @@ impl Connection for NanonisConnection {
         object_list: &mut SelectableList<view_object::Object>,
     ) {
         self.course_menu.show_overlay(ui, object_list);
+        if let Some(scan_area) = object_list
+            .iter_mut()
+            .find_map(|entry| entry.as_scan_area_mut())
+        {
+            self.sequence.show_overlay(ui, scan_area, &self.course_menu);
+            self.lithography.show_overlay(ui, scan_area);
+            self.ring_assist.show_overlay(ui, scan_area);
+        }
     }
 }
 
@@ -227,6 +278,15 @@ impl NanonisConnection {
         let course_menu = CourseMotionState::new(&course_voltages, &move_sender);
         let (scan_sender, scan_receiver) = command_channel::command_channel();
         let scan_control = ScanControlState::new(&scan_sender);
+        let (seq_cmd_tx, seq_cmd_rx) = crossbeam::channel::unbounded();
+        let (seq_event_tx, seq_event_rx) = crossbeam::channel::unbounded();
+        let sequence = SequenceState::new(seq_cmd_tx, seq_event_rx);
+        let (spec_cmd_tx, spec_cmd_rx) = crossbeam::channel::unbounded();
+        let (spec_event_tx, spec_event_rx) = crossbeam::channel::unbounded();
+        let spectroscopy = SpectroscopyState::new(spec_cmd_tx, spec_event_rx);
+        let (litho_cmd_tx, litho_cmd_rx) = crossbeam::channel::unbounded();
+        let (litho_event_tx, litho_event_rx) = crossbeam::channel::unbounded();
+        let lithography = LithographyState::new(litho_cmd_tx, litho_event_rx);
 
         let address = address.as_ref();
         LineWorker::new(&frame_queue_tx, &scan_status).run(address, 6500);
@@ -253,6 +313,9 @@ impl NanonisConnection {
             &slow_status_init,
         )
         .run(address, 6500);
+        SequenceWorker::new(&ctx, seq_cmd_rx, seq_event_tx).run(address, 6500);
+        SpectroscopyWorker::new(&ctx, spec_cmd_rx, spec_event_tx).run(address, 6500);
+        LithographyWorker::new(&ctx, litho_cmd_rx, litho_event_tx).run(address, 6500);
         Self {
             image_transform,
             area_size,
@@ -266,6 +329,11 @@ impl NanonisConnection {
             base_name,
             course_menu,
             scan_control,
+            sequence,
+            spectroscopy,
+            lithography,
+            ring_assist: RingAssistState::new(),
+            pending_stamp: None,
             fast_status_init,
         }
     }
@@ -279,18 +347,75 @@ impl NanonisConnection {
             scan_area.scan_status = scan_status;
         }
     }
-    fn update_image_data(&mut self, live_image: &mut LiveImage, encoder: &ImageEncoder) {
+    /// Returns whether new (forward, backward) data arrived.
+    fn update_image_data(
+        &mut self,
+        live_image: &mut LiveImage,
+        encoder: &ImageEncoder,
+    ) -> (bool, bool) {
+        let mut got = (false, false);
         if let Some(forward_data) = self.forward_data.read_new() {
+            got.0 = true;
             live_image.forward_data = forward_data.clone();
             if live_image.line_dir == LineDir::Forward {
                 live_image.write_and_update_texture(encoder);
             }
         }
         if let Some(backward_data) = self.backward_data.read_new() {
+            got.1 = true;
             live_image.backward_data = backward_data.clone();
             if live_image.line_dir == LineDir::Backward {
                 live_image.write_and_update_texture(encoder);
             }
+        }
+        got
+    }
+    /// Handle sequence runner events that touch the scan area, and finish a
+    /// pending auto-stamp once a fresh full frame has been downloaded.
+    fn update_sequence(
+        &mut self,
+        scan_area: &mut ScanArea,
+        encoder: &ImageEncoder,
+        got_forward: bool,
+        got_backward: bool,
+    ) {
+        for action in self.sequence.poll_events() {
+            match action {
+                SequenceAction::CoarseMoved(steps) => {
+                    self.course_menu.apply_completed_move(scan_area, steps);
+                }
+                SequenceAction::StampRequest => {
+                    if scan_area.channel_selected.is_none() {
+                        // Nothing displayed, nothing to stamp.
+                        self.sequence.stamp_done();
+                        continue;
+                    }
+                    Self::request_full_frame(&self.frame_queue_tx);
+                    self.pending_stamp = Some(PendingStamp {
+                        since: Instant::now(),
+                        got_forward: false,
+                        got_backward: false,
+                    });
+                    // Arrival is checked below on later frames.
+                    return;
+                }
+            }
+        }
+        let Some(pending) = &mut self.pending_stamp else {
+            return;
+        };
+        pending.got_forward |= got_forward;
+        pending.got_backward |= got_backward;
+        let fresh = pending.got_forward && pending.got_backward;
+        if fresh || pending.since.elapsed() > STAMP_FALLBACK {
+            if !fresh {
+                tracing::warn!("fresh frame not received, stamping current data");
+            }
+            scan_area
+                .stamp
+                .push_front(scan_area.live_image.stamp(encoder));
+            self.pending_stamp = None;
+            self.sequence.stamp_done();
         }
     }
     fn update_image_transform(&mut self, scan_area: &mut ScanArea) {

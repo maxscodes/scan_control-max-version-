@@ -20,6 +20,7 @@ glam = { workspace = true, features = ["mint", "bytemuck"] }
 mint = "0.5.9"
 itertools.workspace = true
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 uuid = { version = "1.18", features = ["v4"] }
 image-compute = { path = "crates/image-compute" }
 sxmfile = { path = "crates/sxmfile" }
@@ -31,12 +32,13 @@ eyre.workspace = true
 tracing.workspace = true
 smol.workspace = true
 egui-file-dialog = "0.11.0"
+egui_plot = "0.33"
 egui_extras = { version = "0.32", features = ["image"] }
 id_tree = "1.8.0"
 thiserror = "2.0.17"
 borrow = "2.0.0"
-nanonis-tcp = { git = "https://github.com/Brad-Hesson/nanonis-tcp"}
-# nanonis-tcp = { path = "../nanonis-tcp" }
+# nanonis-tcp = { git = "https://github.com/Brad-Hesson/nanonis-tcp"}
+nanonis-tcp = { path = "../nanonis-tcp" }
 parking_lot = "0.12.5"
 image.workspace = true
 nalgebra = { version = "0.34.2", features = ["convert-glam032"]}

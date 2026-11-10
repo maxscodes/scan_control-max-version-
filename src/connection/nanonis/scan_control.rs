@@ -1,4 +1,4 @@
-use egui::Ui;
+use egui::{Color32, Ui};
 use nanonis_tcp::ScanDir;
 use tracing::info;
 
@@ -27,7 +27,9 @@ impl ScanControlState {
         }
     }
 
-    pub fn show_menu(&mut self, ui: &mut Ui, scan_status: &ScanStatus) {
+    /// `sequence_active` only adds a marker; the buttons stay usable so a
+    /// sequence scan can be paused/stopped/restarted by hand.
+    pub fn show_menu(&mut self, ui: &mut Ui, scan_status: &ScanStatus, sequence_active: bool) {
         if self.sender.poll_complete().is_some() {
             self.pending = false;
         }
@@ -71,6 +73,9 @@ impl ScanControlState {
                 "Idle".to_string()
             };
             ui.label(status);
+            if sequence_active {
+                ui.colored_label(Color32::ORANGE, "(sequence)");
+            }
             if self.pending {
                 ui.spinner();
             }

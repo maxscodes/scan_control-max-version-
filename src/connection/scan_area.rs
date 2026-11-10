@@ -254,14 +254,13 @@ impl Persistant for ScanArea {
         }
         let mut history_table = txn.open_table(HISTORY_TABLE)?;
         let mut history_data = history_table.get_mut(id)?.expect("");
-        if history_data.value().len() != self.course_move_history.len() {
-            history_data.insert(
-                &self
-                    .course_move_history
-                    .iter()
-                    .map(|v| v.to_array())
-                    .collect(),
-            )?;
+        let history: Vec<[f64; 2]> = self
+            .course_move_history
+            .iter()
+            .map(|v| v.to_array())
+            .collect();
+        if history_data.value() != history {
+            history_data.insert(&history)?;
         }
 
         Ok(())

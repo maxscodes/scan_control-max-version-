@@ -123,9 +123,20 @@ impl SlowStatusWorker {
         Ok(())
     }
     fn update_signal_names(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
-        let resp = conn.signals_names_get()?;
-        if self.channel_state.peek().signal_names() != resp.names {
-            let names = Arc::new(resp.names.into_boxed_slice());
+        // In V5e the scan buffer channel indexes are signal slot indexes
+        // (0-23), so names must come from the slot list, not the full
+        // 128-signal list (which would label Z as e.g. "Input 15 (V)").
+        // Older controllers without Signals.InSlotsGet use full-list indexes.
+        let resp_names = match conn.signals_in_slots_get() {
+            Ok(resp) => resp.names,
+            Err(NanonisTcpError::Api(e)) => {
+                tracing::warn!("Signals.InSlotsGet unavailable ({e}), using Signals.NamesGet");
+                conn.signals_names_get()?.names
+            }
+            Err(e) => return Err(e),
+        };
+        if self.channel_state.peek().signal_names() != resp_names {
+            let names = Arc::new(resp_names.into_boxed_slice());
             self.channel_state
                 .modify(|prev| prev.write_signal_names(names));
         }
@@ -236,7 +247,7 @@ impl Worker for SlowStatusWorker {
     }
 }
 
-fn move_args_from_steps(steps: IVec2) -> [Option<(MotorDir, u16)>; 2] {
+pub(crate) fn move_args_from_steps(steps: IVec2) -> [Option<(MotorDir, u16)>; 2] {
     let x_args = match steps.x {
         0 => None,
         steps @ 1..=i32::MAX => Some((MotorDir::XPos, steps.abs() as u16)),

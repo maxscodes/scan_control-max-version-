@@ -12,6 +12,7 @@ use nanonis_tcp::{
     blocking::NanonisTcp,
     error::{NanonisTcpError, NanonisTcpResult},
 };
+pub(crate) use slow_status_worker::move_args_from_steps;
 pub use slow_status_worker::SlowStatusWorker;
 use tracing::{error, info, instrument};
 

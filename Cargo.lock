@@ -1322,6 +1322,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_plot"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "524318041a8ea90c81c738e8985f8ad9e3f9bed636b03c2ff37b218113ed5121"
+dependencies = [
+ "ahash",
+ "egui",
+ "emath",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2907,7 +2918,6 @@ dependencies = [
 [[package]]
 name = "nanonis-tcp"
 version = "0.1.0"
-source = "git+https://github.com/Brad-Hesson/nanonis-tcp#622e68bf04b0aedb7d1aa57bc37883ecd81bb728"
 dependencies = [
  "macro_rules_attribute",
  "num_enum",
@@ -4141,6 +4151,7 @@ dependencies = [
  "egui",
  "egui-file-dialog",
  "egui_extras",
+ "egui_plot",
  "env_logger",
  "eyre",
  "filetree",
@@ -4161,6 +4172,7 @@ dependencies = [
  "redb",
  "rfd",
  "serde",
+ "serde_json",
  "smol",
  "sxmfile",
  "tempfile",

@@ -11,6 +11,7 @@ use wgpu::{
     RequestAdapterOptions,
 };
 
+mod analysis;
 mod app;
 mod components;
 mod connection;

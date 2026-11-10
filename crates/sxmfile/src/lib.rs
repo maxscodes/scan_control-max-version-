@@ -72,9 +72,7 @@ impl SXM {
                     channel: channel
                         .parse()
                         .with_context(|| format!("invalid `Channel` value in row `{i}`"))?,
-                    unit: unit
-                        .parse()
-                        .with_context(|| format!("invalid `Unit` value in row `{i}`"))?,
+                    unit: unit.to_string(),
                     calibration: cal
                         .parse()
                         .with_context(|| format!("invalid `Calibration` value in row `{i}`"))?,
@@ -233,7 +231,7 @@ impl SXM {
 #[derive(Debug)]
 pub struct ChannelInfo {
     channel: u32,
-    unit: char,
+    unit: String,
     calibration: f32,
     offset: f32,
 }

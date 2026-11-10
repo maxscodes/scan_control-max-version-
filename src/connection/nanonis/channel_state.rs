@@ -13,13 +13,13 @@ impl ChannelState {
             .selection
             .is_none_or(|selection| !self.opts.contains(&selection))
         {
-            if self.opts.contains(&30) {
-                self.selection = Some(30);
-            } else if self.opts.len() > 0 {
-                self.selection = Some(self.opts[0]);
-            } else {
-                self.selection = None;
-            }
+            // Prefer the topography channel (Z) when it is recorded.
+            let z = self.opts.iter().copied().find(|&i| {
+                self.names
+                    .get(i)
+                    .is_some_and(|n| n.trim_start().starts_with('Z'))
+            });
+            self.selection = z.or(self.opts.first().copied());
         }
     }
     pub fn options(&self) -> &[usize] {
@@ -32,14 +32,24 @@ impl ChannelState {
         &self.names
     }
     pub fn channel_opts_names<'s>(&'s self) -> impl Iterator<Item = String> + 's {
-        self.opts.iter().map(|opt| self.names[*opt].clone())
+        self.opts.iter().map(|&opt| self.name(opt))
     }
     pub fn selected_as_string(&self) -> Option<String> {
-        self.selection.map(|sel| self.names[sel].to_string())
+        self.selection.map(|sel| self.name(sel))
+    }
+    /// Name of a signal index, or a placeholder if the name list is stale.
+    fn name(&self, idx: usize) -> String {
+        self.names
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("Signal {idx}"))
     }
     pub fn set_selection_by_name(&mut self, name: &str) {
-        let idx = self.names.iter().position(|n| n == name).unwrap();
-        self.selection = Some(idx)
+        self.selection = self
+            .opts
+            .iter()
+            .copied()
+            .find(|&i| self.name(i) == name);
     }
     pub fn unit(&self) -> Option<String> {
         self.selected_as_string()

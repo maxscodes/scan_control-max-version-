@@ -67,8 +67,12 @@ impl ProjectOpenDialog {
         let channel = self.channel_tx.clone();
         std::thread::spawn(move || {
             if let Some(path) = dialog.pick_file() {
-                let project = ProjectDb::open(path).unwrap();
-                channel.send(project).unwrap();
+                match ProjectDb::open(path.clone()) {
+                    Ok(project) => {
+                        let _ = channel.send(project);
+                    }
+                    Err(e) => tracing::error!("could not open {}: {e}", path.display()),
+                }
             }
         });
     }

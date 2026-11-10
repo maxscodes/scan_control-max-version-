@@ -21,7 +21,7 @@ use egui::{
 };
 use glam::{DAffine2, DVec2};
 use itertools::{izip, Itertools};
-use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -82,13 +82,47 @@ impl MyApp {
         self.undo_queue.push(&mut self.app_state, modifier);
     }
 
+    /// Commit the current objects (GDS, images, scan area and its history)
+    /// to the open project database.
+    fn write_project(&mut self) -> Result<(), Box<dyn Error>> {
+        let txn = self.project.db().begin_write()?;
+        self.app_state.object_list.db_update(&txn)?;
+        txn.commit()?;
+        Ok(())
+    }
     fn save_project(&mut self) {
-        let txn = self.project.db().begin_write().unwrap();
-        self.app_state.object_list.db_update(&txn).unwrap();
-        txn.commit().unwrap();
-
+        if let Err(e) = self.write_project() {
+            error!("saving project failed: {e}");
+            return;
+        }
         if self.project.is_temp() {
             self.project_save_dialog.select_path();
+        } else {
+            self.verify_saved();
+        }
+    }
+    /// Save As / first save: write the latest state (it may have changed while
+    /// the dialog was open), then copy the database to `path`.
+    fn save_project_as(&mut self, path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+        self.write_project()?;
+        self.project.save_as(path)?;
+        self.verify_saved();
+        Ok(())
+    }
+    /// Check that the saved file lists every object currently loaded.
+    fn verify_saved(&self) {
+        let expected = self.app_state.object_list.len() as u64;
+        let saved = self
+            .project
+            .db()
+            .begin_read()
+            .map_err(Box::<dyn Error>::from)
+            .and_then(|txn| Ok(txn.open_table(OBJECT_LIST_TABLE)?.len()?));
+        let path = self.project.current_path().display();
+        match saved {
+            Ok(n) if n == expected => info!("saved {n} objects to {path}"),
+            Ok(n) => error!("project {path} holds {n} objects, expected {expected}"),
+            Err(e) => error!("could not verify project {path}: {e}"),
         }
     }
 }
@@ -120,26 +154,43 @@ impl eframe::App for MyApp {
             self.save_project();
         }
         if let Some(path) = self.project_save_dialog.try_recv_path() {
-            self.project.save_as(path).unwrap();
-            let file_name = self.project.current_path().file_name().unwrap().display();
-            let new_title = format!("Scan Control - {file_name}");
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_title));
+            match self.save_project_as(path) {
+                Ok(()) => {
+                    let file_name = self.project.current_path().file_name().unwrap().display();
+                    let new_title = format!("Scan Control - {file_name}");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_title));
+                }
+                Err(e) => error!("save as failed: {e}"),
+            }
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, egui::Key::O)) {
             self.project_open_dialog.pick_file();
         }
         if let Some(project) = self.project_open_dialog.try_recv_project() {
-            self.project = project;
-            let txn = self.project.db().begin_write().unwrap();
-            self.app_state.object_list =
-                SelectableList::<Object>::db_read(Uuid::new_v4(), &txn, &self.image_encoder)
-                    .unwrap();
-            if let Some(conn) = self.active_connection.take() {
-                self.pending_connections.push(conn);
+            // Read before switching, so a bad file doesn't replace the
+            // current project with an empty one.
+            let loaded = project
+                .db()
+                .begin_write()
+                .map_err(Box::<dyn Error>::from)
+                .and_then(|txn| {
+                    SelectableList::<Object>::db_read(Uuid::new_v4(), &txn, &self.image_encoder)
+                });
+            let path = project.current_path().display().to_string();
+            match loaded {
+                Ok(list) => {
+                    info!("opened {path}: {} objects", list.len());
+                    self.project = project;
+                    self.app_state.object_list = list;
+                    if let Some(conn) = self.active_connection.take() {
+                        self.pending_connections.push(conn);
+                    }
+                    let file_name = self.project.current_path().file_name().unwrap().display();
+                    let new_title = format!("Scan Control - {file_name}");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_title));
+                }
+                Err(e) => error!("could not open project {path}: {e}"),
             }
-            let file_name = self.project.current_path().file_name().unwrap().display();
-            let new_title = format!("Scan Control - {file_name}");
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_title));
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
             let is_fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -295,7 +346,7 @@ impl eframe::App for MyApp {
                     });
                 let mut new_top = ui.clip_rect().top();
                 if let Some(conn) = &mut self.active_connection {
-                    new_top = egui::Window::new("Scan Region")
+                    new_top = egui::Window::new("Scan Control")
                         .frame(
                             Frame::window(&ctx.style())
                                 .multiply_with_opacity(0.5)
@@ -317,35 +368,6 @@ impl eframe::App for MyApp {
                         .response
                         .rect
                         .bottom();
-                }
-                let scan_region_selected = self
-                    .app_state
-                    .object_list
-                    .iter_selected()
-                    .any(|entry| entry.as_scan_area().is_some());
-                if let Some(conn) = &mut self.active_connection {
-                    if scan_region_selected {
-                        let mut rect = ui.min_rect();
-                        rect.set_top(new_top);
-                        new_top = egui::Window::new("Scan Control")
-                            .frame(
-                                Frame::window(&ctx.style())
-                                    .multiply_with_opacity(0.5)
-                                    .shadow(Shadow::NONE),
-                            )
-                            .constrain_to(rect)
-                            .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
-                            .resizable(false)
-                            .show(ctx, |ui| {
-                                let vis = &mut ui.style_mut().visuals.widgets.inactive;
-                                vis.weak_bg_fill = vis.weak_bg_fill.gamma_multiply(0.5);
-                                conn.show_scan_control(ui, &mut self.app_state.object_list);
-                            })
-                            .unwrap()
-                            .response
-                            .rect
-                            .bottom();
-                    }
                 }
                 let selected = self
                     .app_state
@@ -401,6 +423,7 @@ fn file_menu_button(ui: &mut Ui, app: &mut MyApp) {
             app.save_project();
         }
         if ui.button("Save As").clicked() {
+            // The current state is written when the path comes back.
             app.project_save_dialog.select_path();
         }
         if ui.add(Button::new("Import Files")).clicked() {

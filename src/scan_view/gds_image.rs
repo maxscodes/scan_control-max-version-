@@ -109,6 +109,11 @@ impl GDSImage {
     pub fn uuid(&self) -> Uuid {
         self.uuid
     }
+    /// Polygons per GDS layer, in this image's local nm (apply `transform`
+    /// for world coordinates).
+    pub fn polygons(&self) -> &BTreeMap<u16, Vec<Vec<Vec2>>> {
+        &self.polys
+    }
     pub fn show(&self, ui: &mut Ui) {
         let ctx = ui
             .data(|map| map.get_temp::<ScanViewCtx>(Id::new(())))

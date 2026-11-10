@@ -243,19 +243,19 @@ impl Persistant for LiveImage {
 
         let mut dir_table = txn.open_table(DIR_TABLE)?;
         let mut dir_data = dir_table.get_mut(id)?.expect("");
-        if dir_data.value() != self.line_dir.into() {
+        if dir_data.value() != Into::<u32>::into(self.line_dir) {
             dir_data.insert(&self.line_dir.into())?;
         }
 
         let mut fit_table = txn.open_table(FIT_TABLE)?;
         let mut fit_data = fit_table.get_mut(id)?.expect("");
-        if fit_data.value() != self.fit_type.into() {
+        if fit_data.value() != Into::<u8>::into(self.fit_type) {
             fit_data.insert(&self.fit_type.into())?;
         }
 
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         let mut norm_data = norm_table.get_mut(id)?.expect("");
-        if norm_data.value() != self.norm_type.into() {
+        if norm_data.value() != Into::<u8>::into(self.norm_type) {
             norm_data.insert(&self.norm_type.into())?;
         }
 

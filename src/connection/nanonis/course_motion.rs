@@ -86,7 +86,33 @@ impl CourseMotionState {
             auto_approach: true
         }
     }
-    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+    /// Record a finished coarse move: update the calibration bookkeeping, the
+    /// move history, and shift the scan area on the map. Used both by this
+    /// menu and by the sequence runner.
+    pub fn apply_completed_move(&mut self, scan_area: &mut ScanArea, steps: IVec2) {
+        if steps.y == 0 {
+            let last_pos = scan_area.world_transform.translation;
+            self.last_x_move = Some((last_pos, steps));
+        } else {
+            self.last_x_move = None;
+        }
+        if steps.x == 0 {
+            let last_pos = scan_area.world_transform.translation;
+            self.last_y_move = Some((last_pos, steps));
+        } else {
+            self.last_y_move = None;
+        }
+        let real_world_move = self.steps2real_world() * steps.as_dvec2();
+        scan_area.course_move_history.push(real_world_move);
+        scan_area.world_transform =
+            scan_area.world_transform * DAffine2::from_translation(real_world_move);
+    }
+    /// Motor group index (0-based) as sent to Motor.StartMove.
+    pub fn group_index(&self) -> u32 {
+        self.group - 1
+    }
+    /// `locked` disables starting a move (e.g. while a sequence is running).
+    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>, locked: bool) {
         if self.menu_active {
             object_list.clear_selected();
         }
@@ -97,22 +123,7 @@ impl CourseMotionState {
                 .find_map(|entry| entry.as_scan_area_mut())
             {
                 let steps = self.get_steps();
-                if steps.y == 0 {
-                    let last_pos = scan_area.world_transform.translation;
-                    self.last_x_move = Some((last_pos, steps));
-                } else {
-                    self.last_x_move = None;
-                }
-                if steps.x == 0 {
-                    let last_pos = scan_area.world_transform.translation;
-                    self.last_y_move = Some((last_pos, steps));
-                } else {
-                    self.last_y_move = None;
-                }
-                let real_world_move = self.steps2real_world() * steps.as_dvec2();
-                scan_area.course_move_history.push(real_world_move);
-                scan_area.world_transform =
-                    scan_area.world_transform * DAffine2::from_translation(real_world_move);
+                self.apply_completed_move(scan_area, steps);
             };
             self.move_target = DVec2::ZERO;
         }
@@ -155,7 +166,7 @@ impl CourseMotionState {
                 ui.horizontal(|ui| {
                     let steps = self.get_steps();
                     if ui
-                        .add_enabled_ui(steps.x.abs() > 0 || steps.y.abs() > 0, |ui| {
+                        .add_enabled_ui(!locked && (steps.x.abs() > 0 || steps.y.abs() > 0), |ui| {
                             ui.put(button_rect, Button::new("Execute Move"))
                         })
                         .inner
@@ -174,6 +185,9 @@ impl CourseMotionState {
                         ui.spinner();
                     }
                 });
+                if locked {
+                    ui.colored_label(Color32::ORANGE, "Sequence running");
+                }
                 ui.separator();
                 CollapsingHeader::new("Config")
                     .default_open(false)
@@ -316,15 +330,23 @@ impl CourseMotionState {
         }
         .show(ui);
     }
-    fn steps2real_world(&self) -> DMat2 {
+    pub fn steps2real_world(&self) -> DMat2 {
         let voltages = *self.voltages.peek();
         self.calib_matrix * DMat2::from_diagonal(voltages) * 1e9
     }
-    fn get_steps(&self) -> IVec2 {
+    pub fn get_steps(&self) -> IVec2 {
+        self.real_to_steps(self.move_target)
+    }
+    /// Nearest whole number of motor steps for a real-world (nm) move.
+    pub fn real_to_steps(&self, real: DVec2) -> IVec2 {
         let m = self.steps2real_world();
         let mat = nalgebra::Matrix2::<f64>::from(m);
         let inv = DMat2::from(mat.pseudo_inverse(f64::EPSILON * 10.).unwrap());
-        (inv * self.move_target).round().as_ivec2()
+        (inv * real).round().as_ivec2()
+    }
+    /// The Course Motion window is open (it owns ctrl+drag on the map).
+    pub fn menu_open(&self) -> bool {
+        self.menu_active
     }
     fn write_steps(&mut self, steps: IVec2) {
         let change = steps - self.get_steps();
