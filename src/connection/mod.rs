@@ -28,6 +28,13 @@ pub trait Connection {
         object_list: &mut SelectableList<view_object::Object>,
         encoder: &ImageEncoder,
     );
+    /// Scan start/pause/resume/stop controls, shown in their own window
+    /// while the scan region is selected.
+    fn show_scan_control(
+        &mut self,
+        ui: &mut Ui,
+        object_list: &mut SelectableList<view_object::Object>,
+    );
     fn show_image_view_overlay(
         &mut self,
         ui: &mut Ui,

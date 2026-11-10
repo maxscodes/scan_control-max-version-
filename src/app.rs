@@ -318,6 +318,35 @@ impl eframe::App for MyApp {
                         .rect
                         .bottom();
                 }
+                let scan_region_selected = self
+                    .app_state
+                    .object_list
+                    .iter_selected()
+                    .any(|entry| entry.as_scan_area().is_some());
+                if let Some(conn) = &mut self.active_connection {
+                    if scan_region_selected {
+                        let mut rect = ui.min_rect();
+                        rect.set_top(new_top);
+                        new_top = egui::Window::new("Scan Control")
+                            .frame(
+                                Frame::window(&ctx.style())
+                                    .multiply_with_opacity(0.5)
+                                    .shadow(Shadow::NONE),
+                            )
+                            .constrain_to(rect)
+                            .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
+                            .resizable(false)
+                            .show(ctx, |ui| {
+                                let vis = &mut ui.style_mut().visuals.widgets.inactive;
+                                vis.weak_bg_fill = vis.weak_bg_fill.gamma_multiply(0.5);
+                                conn.show_scan_control(ui, &mut self.app_state.object_list);
+                            })
+                            .unwrap()
+                            .response
+                            .rect
+                            .bottom();
+                    }
+                }
                 let selected = self
                     .app_state
                     .object_list

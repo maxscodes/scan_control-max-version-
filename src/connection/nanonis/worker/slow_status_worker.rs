@@ -13,14 +13,14 @@ use itertools::Itertools as _;
 use nanonis_tcp::{
     blocking::NanonisTcp,
     error::{NanonisTcpError, NanonisTcpResult},
-    MotorAxis, MotorDir,
+    ActionType, MotorAxis, MotorDir,
 };
 use tracing::debug;
 
 use crate::connection::{
     nanonis::{
         channel_state::ChannelState, command_channel::CommandChannelReciever,
-        course_motion::CourseMoveCommand, worker::Worker, ScanStatus,
+        course_motion::CourseMoveCommand, scan_control::ScanCommand, worker::Worker, ScanStatus,
     },
     shared_state::SharedState,
 };
@@ -35,6 +35,7 @@ pub struct SlowStatusWorker {
     base_name: SharedState<String>,
     course_voltages: SharedState<DVec2>,
     course_reciever: CommandChannelReciever<CourseMoveCommand, ()>,
+    scan_reciever: CommandChannelReciever<ScanCommand, ()>,
     init: Arc<AtomicBool>,
 }
 impl SlowStatusWorker {
@@ -46,6 +47,7 @@ impl SlowStatusWorker {
         base_name: &SharedState<String>,
         course_voltages: &SharedState<DVec2>,
         course_reciever: &CommandChannelReciever<CourseMoveCommand, ()>,
+        scan_reciever: &CommandChannelReciever<ScanCommand, ()>,
         init: &Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -56,8 +58,34 @@ impl SlowStatusWorker {
             base_name: base_name.clone(),
             course_voltages: course_voltages.clone(),
             course_reciever: course_reciever.clone(),
+            scan_reciever: scan_reciever.clone(),
             init: init.clone(),
         }
+    }
+    fn execute_scan_command(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
+        let Some(cmd) = self.scan_reciever.try_recv() else {
+            return Ok(());
+        };
+        let current_dir = self.scan_status.peek().scan_dir;
+        let (action, dir) = match cmd {
+            ScanCommand::Start(dir) => (ActionType::Start, dir),
+            ScanCommand::Pause => (ActionType::Pause, current_dir),
+            ScanCommand::Resume => (ActionType::Resume, current_dir),
+            ScanCommand::Stop => (ActionType::Stop, current_dir),
+        };
+        debug!("Executing scan action {action:?} {dir:?}");
+        let result = conn.scan_action(action, dir).and_then(|_| {
+            if let ScanCommand::Start(dir) = cmd {
+                self.scan_status.modify_conditional(
+                    |prev| prev.scan_dir != dir,
+                    |prev| prev.scan_dir = dir,
+                );
+            }
+            self.update_scan_status(conn)
+        });
+        self.scan_reciever.send_response(());
+        self.ctx.request_repaint();
+        result
     }
     fn execute_course_move(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
         if let Some(CourseMoveCommand {
@@ -180,6 +208,8 @@ impl Worker for SlowStatusWorker {
             .context("failed update_base_name")?;
         self.update_course_voltages(conn)
             .context("failed update_course_voltages")?;
+        self.execute_scan_command(conn)
+            .context("failed execute_scan_command")?;
         self.execute_course_move(conn)
             .context("failed execute_course_move")?;
         Ok(())

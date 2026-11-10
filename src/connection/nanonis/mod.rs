@@ -1,6 +1,7 @@
 mod channel_state;
 mod command_channel;
 mod course_motion;
+mod scan_control;
 mod scan_status;
 mod worker;
 
@@ -24,6 +25,7 @@ use crate::{
         live_image::{FrameData, LiveImage},
         nanonis::{
             course_motion::CourseMotionState,
+            scan_control::ScanControlState,
             worker::{FastStatusWorker, FrameWorker, LineWorker, SlowStatusWorker, Worker as _},
         },
         queue::{overwrite_queue, OverwriteQueueSender},
@@ -48,6 +50,7 @@ pub struct NanonisConnection {
     slow_status_init: Arc<AtomicBool>,
     fast_status_init: Arc<AtomicBool>,
     course_menu: CourseMotionState,
+    scan_control: ScanControlState,
 }
 
 impl Connection for NanonisConnection {
@@ -179,7 +182,22 @@ impl Connection for NanonisConnection {
             return;
         };
         scan_area.show_menu(ui, encoder);
+        ui.separator();
         self.course_menu.show_menu(ui, object_list);
+    }
+    fn show_scan_control(
+        &mut self,
+        ui: &mut Ui,
+        object_list: &mut SelectableList<view_object::Object>,
+    ) {
+        let Some(scan_area) = object_list
+            .iter_mut()
+            .find_map(|entry| entry.as_scan_area_mut())
+        else {
+            return;
+        };
+        let scan_status = scan_area.scan_status;
+        self.scan_control.show_menu(ui, &scan_status);
     }
     fn show_image_view_overlay(
         &mut self,
@@ -207,6 +225,8 @@ impl NanonisConnection {
         let (move_sender, move_receiver) = command_channel::command_channel();
 
         let course_menu = CourseMotionState::new(&course_voltages, &move_sender);
+        let (scan_sender, scan_receiver) = command_channel::command_channel();
+        let scan_control = ScanControlState::new(&scan_sender);
 
         let address = address.as_ref();
         LineWorker::new(&frame_queue_tx, &scan_status).run(address, 6500);
@@ -229,6 +249,7 @@ impl NanonisConnection {
             &base_name,
             &course_voltages,
             &move_receiver,
+            &scan_receiver,
             &slow_status_init,
         )
         .run(address, 6500);
@@ -244,6 +265,7 @@ impl NanonisConnection {
             slow_status_init,
             base_name,
             course_menu,
+            scan_control,
             fast_status_init,
         }
     }
