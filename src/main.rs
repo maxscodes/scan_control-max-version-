@@ -21,6 +21,7 @@ mod utils;
 mod view_object;
 mod project;
 mod theme;
+mod version;
 
 fn main() -> Result<(), Box<dyn Error>> {
     attach_parent_console();
@@ -33,6 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_title(format!("Scan Control v{} - Untitled project", version::version()))
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([640.0, 420.0])
             .with_icon(

@@ -123,7 +123,7 @@ impl MyApp {
         }
     }
     fn window_title(&self) -> String {
-        format!("Scan Control - {}", self.project_name())
+        format!("Scan Control v{} - {}", crate::version::version(), self.project_name())
     }
     fn show_status_bar(&self, ui: &mut Ui) {
         ui.horizontal(|ui| {
@@ -289,6 +289,15 @@ impl eframe::App for MyApp {
                     {
                         theme::toggle_theme(ui.ctx());
                     }
+                    ui.label(
+                        RichText::new(format!(
+                            "v{} \u{b7} updated {}",
+                            crate::version::version(),
+                            crate::version::UPDATED
+                        ))
+                        .small()
+                        .weak(),
+                    );
                 });
             });
         });
