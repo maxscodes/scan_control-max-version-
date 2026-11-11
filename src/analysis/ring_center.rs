@@ -12,7 +12,8 @@
 
 use glam::{DMat2, DVec2};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RingParams {
     /// Subtract each scan line's mean before the plane fit. This removes
     /// line-to-line offsets (tip changes, z drift), but it also erases any ring
@@ -708,7 +709,7 @@ mod tests {
 /// The printed direction is a compass angle in the displayed image: 0° = up
 /// (+y), 90° = right (+x), measured in the scan frame (scan angle not applied).
 #[cfg(test)]
-mod sxm_harness {
+pub(crate) mod sxm_harness {
     use super::*;
 
     fn env_opt<T: std::str::FromStr>(key: &str) -> Option<Option<T>> {
@@ -732,7 +733,7 @@ mod sxm_harness {
     }
 
     /// Load the forward Z channel with row 0 at the top of the displayed image.
-    pub(super) fn load_z(path: &std::path::Path) -> Result<(Vec<f32>, usize, usize, [f32; 2]), String> {
+    pub(crate) fn load_z(path: &std::path::Path) -> Result<(Vec<f32>, usize, usize, [f32; 2]), String> {
         let sxm = sxmfile::SXM::parse_file(path).map_err(|e| format!("parse error: {e:#}"))?;
         let [w, h] = sxm.get_image_size().map_err(|e| e.to_string())?;
         let range = sxm.get_scan_range().map_err(|e| e.to_string())?;

@@ -4,8 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use glam::DAffine2;
-use redb::{Database, TableHandle, WriteTransaction, backends::InMemoryBackend};
+use redb::{Database, WriteTransaction, backends::InMemoryBackend};
 use uuid::Uuid;
 
 use crate::scan_view::ImageEncoder;

@@ -20,6 +20,7 @@ mod undo_queue;
 mod utils;
 mod view_object;
 mod project;
+mod theme;
 
 fn main() -> Result<(), Box<dyn Error>> {
     attach_parent_console();
@@ -32,8 +33,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 300.0])
-            .with_min_inner_size([300.0, 220.0])
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([640.0, 420.0])
             .with_icon(
                 // NOTE: Adding an icon is optional
                 eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon-256.png")[..])
@@ -55,26 +56,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         multisampling: 4,
         ..Default::default()
     };
-    // let runtime = tokio::runtime::Runtime::new()?;
-    // runtime.block_on(async {
-    //     tokio::task::block_in_place(|| {
-    //         eframe::run_native(
-    //             "Scan Control",
-    //             native_options,
-    //             Box::new(|cc| {
-    //                 egui_extras::install_image_loaders(&cc.egui_ctx);
-    //                 cc.egui_ctx
-    //                     .tessellation_options_mut(|opt| opt.feathering = false);
-    //                 Ok(Box::new(app::MyApp::new(cc)))
-    //             }),
-    //         )
-    //     })
-    // })?;
     eframe::run_native(
         "Scan Control",
         native_options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx);
             cc.egui_ctx
                 .tessellation_options_mut(|opt| opt.feathering = false);
             Ok(Box::new(app::MyApp::new(cc)))

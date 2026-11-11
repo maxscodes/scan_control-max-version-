@@ -33,4 +33,21 @@ pub trait Connection {
         ui: &mut Ui,
         object_list: &mut SelectableList<view_object::Object>,
     );
+    /// Summary for the status bar.
+    fn status(&self) -> StatusInfo {
+        StatusInfo::default()
+    }
+}
+
+/// What the status bar shows about a live connection.
+#[derive(Clone, Debug, Default)]
+pub struct StatusInfo {
+    /// e.g. "Scanning ⬇", "Paused", "Idle".
+    pub scan: String,
+    /// Volts.
+    pub bias: Option<f32>,
+    /// Amps.
+    pub current: Option<f32>,
+    /// Tip position in nm (map coordinates).
+    pub tip_nm: Option<glam::DVec2>,
 }

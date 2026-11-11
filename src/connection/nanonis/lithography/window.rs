@@ -174,6 +174,7 @@ impl LithographyState {
         }
         let mut open = self.window_open;
         egui::Window::new("Lithography")
+            .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(380.)
             .resizable(true)
             .collapsible(true)

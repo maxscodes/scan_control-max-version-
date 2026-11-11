@@ -1,12 +1,10 @@
 use core::f32;
-use std::fmt::Display;
 
 use egui::{DragValue, Response, Ui};
 use glam::DAffine2;
 use image_compute::image_compute::{FitData, FitType, NormalizationType};
 use itertools::izip;
 use nanonis_tcp::LineDir;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::{

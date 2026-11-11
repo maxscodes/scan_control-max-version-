@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use eyre::Context;
 use nanonis_tcp::{
-    blocking::NanonisTcp, commands::scan::FrameDataGrabResponse, error::NanonisTcpResult, LineDir,
+    blocking::NanonisTcp, commands::scan::FrameDataGrabResponse, LineDir,
 };
 use tracing::trace;
 

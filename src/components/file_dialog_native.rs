@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use crossbeam::channel::TryRecvError;
 use glam::DAffine2;
 
 use crate::{project::ProjectDb, scan_view::ImageEncoder, view_object};

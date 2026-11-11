@@ -24,9 +24,9 @@ impl ScanView {
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> Response {
         let fill = if ui.style().visuals.dark_mode {
-            Color32::BLACK
+            Color32::from_rgb(0x0e, 0x10, 0x13)
         } else {
-            Color32::LIGHT_GRAY
+            Color32::from_rgb(0xdf, 0xe3, 0xe8)
         };
         egui::Frame::canvas(ui.style())
             .fill(fill)

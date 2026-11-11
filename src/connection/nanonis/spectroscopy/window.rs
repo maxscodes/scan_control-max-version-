@@ -166,6 +166,7 @@ impl SpectroscopyState {
         });
         let mut open = self.window_open;
         egui::Window::new("I(V) Spectroscopy")
+            .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(1100.)
             .resizable(true)
             .collapsible(true)

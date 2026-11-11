@@ -1,9 +1,9 @@
-use crate::analysis::ring_stamp::RingStamp;
+use crate::analysis::ring_stamp::{RingLabel, RingStamp};
 use core::f32;
-use std::{fmt::Debug, io::Write, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
-use egui::{Color32, DragValue, Id, Response, Ui, WidgetText};
-use glam::{DAffine2, DVec2};
+use egui::{DragValue, Response, Ui, WidgetText};
+use glam::DAffine2;
 use image_compute::image_compute::{FitData, FitType};
 use itertools::Itertools;
 use nanonis_tcp::LineDir;
@@ -18,9 +18,8 @@ use crate::{
     },
     project::Persistant,
     scan_view::{
-        static_image::NormType, BorderRectangle, ImageEncoder, ScanViewCtx, ScanViewImage,
+        static_image::NormType, ImageEncoder, ScanViewImage,
     },
-    utils::vec_interop::IntoEgui,
 };
 
 pub struct LiveImage {
@@ -35,6 +34,8 @@ pub struct LiveImage {
     pub unit: String,
     /// Ring Assist result recorded when this image was stamped.
     pub ring: Option<RingStamp>,
+    /// The user's training label for this stamp.
+    pub ring_label: Option<RingLabel>,
     uuid: Uuid,
 }
 
@@ -60,6 +61,7 @@ impl LiveImage {
             transform,
             unit: "".into(),
             ring: None,
+            ring_label: None,
             uuid,
         }
     }
@@ -194,6 +196,7 @@ impl LiveImage {
             backward_data: self.backward_data.clone(),
             unit: self.unit.clone(),
             ring: None,
+            ring_label: None,
             uuid: Uuid::new_v4(),
         }
     }
@@ -239,6 +242,9 @@ const DATA_TABLE: TableDefinition<Uuid, [FrameData; 2]> =
 const UNIT_TABLE: TableDefinition<Uuid, &str> = TableDefinition::new("liveimage_unit_table_v1");
 /// Optional: only stamps analysed by Ring Assist have a row.
 const RING_TABLE: TableDefinition<Uuid, [f64; 10]> = TableDefinition::new("liveimage_ring_table_v1");
+/// Optional: only stamps the user labelled have a row.
+const RING_LABEL_TABLE: TableDefinition<Uuid, [f64; 3]> =
+    TableDefinition::new("liveimage_ringlabel_table_v1");
 
 impl Persistant for LiveImage {
     fn db_update<'t>(
@@ -289,6 +295,17 @@ impl Persistant for LiveImage {
                 None => ring_table.remove(id)?,
             };
         }
+        drop(ring_table);
+
+        let mut label_table = txn.open_table(RING_LABEL_TABLE)?;
+        let stored = label_table.get(id)?.map(|v| v.value());
+        let wanted = self.ring_label.map(|l| l.to_array());
+        if stored != wanted {
+            match wanted {
+                Some(a) => label_table.insert(id, a)?,
+                None => label_table.remove(id)?,
+            };
+        }
 
         Ok(())
     }
@@ -313,6 +330,8 @@ impl Persistant for LiveImage {
         data_table.remove(id)?;
         let mut ring_table = txn.open_table(RING_TABLE)?;
         ring_table.remove(id)?;
+        let mut label_table = txn.open_table(RING_LABEL_TABLE)?;
+        label_table.remove(id)?;
 
         Ok(())
     }
@@ -341,6 +360,10 @@ impl Persistant for LiveImage {
             let mut ring_table = txn.open_table(RING_TABLE)?;
             ring_table.insert(id, r.to_array())?;
         }
+        if let Some(l) = &self.ring_label {
+            let mut label_table = txn.open_table(RING_LABEL_TABLE)?;
+            label_table.insert(id, l.to_array())?;
+        }
         Ok(())
     }
 
@@ -365,6 +388,8 @@ impl Persistant for LiveImage {
         let frame_data = data_table.get(id)?.unwrap().value();
         let ring_table = txn.open_table(RING_TABLE)?;
         let ring = ring_table.get(id)?.map(|v| RingStamp::from_array(v.value()));
+        let label_table = txn.open_table(RING_LABEL_TABLE)?;
+        let ring_label = label_table.get(id)?.map(|v| RingLabel::from_array(v.value()));
         let mut image = Self::new(id, encoder, DAffine2::from_cols_array(&tran_data));
         image.std_dev = stddev_data;
         image.line_dir = LineDir::try_from(dir_data).unwrap();
@@ -372,6 +397,7 @@ impl Persistant for LiveImage {
         image.norm_type = NormType::try_from(norm_data).unwrap();
         image.unit = unit_data;
         image.ring = ring;
+        image.ring_label = ring_label;
         [image.forward_data, image.backward_data] = frame_data;
         image.write_and_update_texture(encoder);
         Ok(image)
@@ -388,6 +414,8 @@ impl Persistant for LiveImage {
         let unit_table_len = txn.open_table(UNIT_TABLE)?.len()?;
         let ring_table_len = txn.open_table(RING_TABLE)?.len()?;
         println!("  ring table: {ring_table_len} items");
+        let label_table_len = txn.open_table(RING_LABEL_TABLE)?.len()?;
+        println!("  ring label table: {label_table_len} items");
         println!("  transform table: {transform_table_len} items");
         println!("  std_dev table: {std_dev_table_len} items");
         println!("  dir table: {dir_table_len} items");

@@ -106,6 +106,56 @@ impl RingStamp {
     }
 }
 
+/// The user's label for a stamp, used to train Ring Assist.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RingLabel {
+    /// The model's direction was right (stored as that direction, quad space).
+    Good(DVec2),
+    /// The model was wrong; the tip should go this way (unit, quad space).
+    Direction(DVec2),
+    /// No move wanted here (centre, electrodes).
+    Stop,
+}
+
+impl RingLabel {
+    pub fn to_array(&self) -> [f64; 3] {
+        match *self {
+            RingLabel::Good(d) => [0., d.x, d.y],
+            RingLabel::Direction(d) => [1., d.x, d.y],
+            RingLabel::Stop => [2., 0., 0.],
+        }
+    }
+    pub fn from_array(a: [f64; 3]) -> Self {
+        let d = DVec2::new(a[1], a[2]);
+        match a[0] as u8 {
+            0 => RingLabel::Good(d),
+            1 => RingLabel::Direction(d),
+            _ => RingLabel::Stop,
+        }
+    }
+    pub fn describe(&self) -> &'static str {
+        match self {
+            RingLabel::Good(_) => "good",
+            RingLabel::Direction(_) => "corrected",
+            RingLabel::Stop => "should stop",
+        }
+    }
+}
+
+/// Convert a quad-space direction to frame pixel axes (+x right, +y down rows).
+pub fn quad_to_px_dir(d: DVec2, size: [u32; 2]) -> DVec2 {
+    DVec2::new(d.x * size[0] as f64, d.y * size[1] as f64).normalize_or_zero()
+}
+
+/// A quad-to-world transform with the right scale for analysing a frame of
+/// `size` pixels at `nm_per_px` (position and orientation don't matter).
+pub fn frame_for(size: [u32; 2], nm_per_px: f64) -> DAffine2 {
+    DAffine2::from_scale(DVec2::new(
+        size[0] as f64 * nm_per_px,
+        -(size[1] as f64) * nm_per_px,
+    ))
+}
+
 /// Run the ring estimator on one frame. `frame` maps quad space to world nm
 /// (only its scale is used here, to convert radii to µm).
 pub fn analyse_frame(
@@ -162,19 +212,48 @@ pub fn analyse_frame(
     })
 }
 
-/// Draw a stamp's ring result on the map: an arrow from the stamp centre, or
-/// a red X when unsure, with a short label.
-pub fn draw(ui: &Ui, stamp_transform: DAffine2, r: &RingStamp) {
+pub const LABEL_COLOR: Color32 = Color32::WHITE;
+
+/// Draw a stamp's ring result and/or the user's label on the map.
+pub fn draw(ui: &Ui, stamp_transform: DAffine2, r: Option<&RingStamp>, label: Option<&RingLabel>) {
     let Some(ctx) = ui.data(|map| map.get_temp::<ScanViewCtx>(Id::new(()))) else {
         return;
     };
     let w2s = ctx.world2egui();
     let to_screen = |p: DVec2| w2s.transform_point2(p).to_egui_pos2();
     let painter = ui.painter();
-    let color = r.color();
     let c = stamp_transform.translation;
     let width = stamp_transform.matrix2.x_axis.length();
     let p = to_screen(c);
+    match label {
+        Some(RingLabel::Good(_)) => {
+            painter.text(
+                p + egui::vec2(-10., -6.),
+                Align2::RIGHT_BOTTOM,
+                "\u{2714}",
+                FontId::proportional(16.),
+                ARC_COLOR,
+            );
+        }
+        Some(RingLabel::Direction(d)) => {
+            let dir = stamp_transform.transform_vector2(*d).normalize_or_zero();
+            let b = to_screen(c + dir * width * 0.4);
+            let stroke = Stroke::new(2., LABEL_COLOR);
+            painter.extend(egui::Shape::dashed_line(&[p, b], stroke, 6., 4.));
+            let tip = (b - p).normalized() * 10.;
+            painter.arrow(b - tip, tip, stroke);
+        }
+        Some(RingLabel::Stop) => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(p + egui::vec2(-14., -14.), egui::vec2(9., 9.)),
+                1.,
+                LABEL_COLOR,
+            );
+        }
+        None => {}
+    }
+    let Some(r) = r else { return };
+    let color = r.color();
     match r.verdict {
         StampVerdict::Unsure(_) => {
             let k = 7.;

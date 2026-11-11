@@ -11,14 +11,15 @@ use crate::{
     },
     connection::{nanonis::NanonisConnection, Connection},
     project::{Persistant, ProjectDb},
-    scan_view::{world_delta_transform, BorderRectangle, ImageEncoder, ScaleBar, ScanView},
+    scan_view::{
+        world_delta_transform, BorderRectangle, ImageEncoder, ScaleBar, ScanView, ScanViewCtx,
+    },
+    theme::{self, ThemeChoice},
+    utils::vec_interop::{IntoEgui as _, IntoGlam as _},
     undo_queue::{StateModify, UndoQueue},
     view_object::Object,
 };
-use egui::{
-    widgets, Align2, Button, Color32, Frame, Layout, MenuBar, Modifiers, Shadow, ThemePreference,
-    Ui,
-};
+use egui::{Align2, Button, Color32, Layout, MenuBar, Modifiers, RichText, Stroke, Ui};
 use glam::{DAffine2, DVec2};
 use itertools::{izip, Itertools};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
@@ -37,7 +38,8 @@ pub struct MyApp {
     app_state: AppState,
     image_encoder: ImageEncoder,
     undo_queue: UndoQueue<AppState>,
-    current_theme: ThemePreference,
+    /// Map position (nm) under the mouse, for the status bar.
+    cursor_world: Option<DVec2>,
     import_file_dialog: ObjectImportDialog,
     project_save_dialog: ProjectSaveDialog,
     project_open_dialog: ProjectOpenDialog,
@@ -70,7 +72,7 @@ impl MyApp {
             import_file_dialog,
             image_encoder,
             undo_queue: UndoQueue::new(),
-            current_theme: cc.egui_ctx.theme().into(),
+            cursor_world: None,
             pending_connections: vec![nanonis_connection],
             active_connection: None,
             project,
@@ -108,6 +110,54 @@ impl MyApp {
         self.project.save_as(path)?;
         self.verify_saved();
         Ok(())
+    }
+    fn project_name(&self) -> String {
+        if self.project.is_temp() {
+            "Untitled project".into()
+        } else {
+            self.project
+                .current_path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".into())
+        }
+    }
+    fn window_title(&self) -> String {
+        format!("Scan Control - {}", self.project_name())
+    }
+    fn show_status_bar(&self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let status = self.active_connection.as_ref().map(|c| c.status());
+            let (color, text) = match (&status, self.pending_connections.is_empty()) {
+                (Some(_), _) => (theme::OK, "Connected"),
+                (None, false) => (theme::WARN, "Connecting\u{2026}"),
+                (None, true) => (theme::IDLE, "Offline"),
+            };
+            theme::status_pill(ui, color, text, false);
+            if let Some(s) = &status {
+                ui.separator();
+                ui.label(&s.scan);
+                if let Some(b) = s.bias {
+                    ui.separator();
+                    ui.label(format!("Bias {b:.3} V"));
+                }
+                if let Some(i) = s.current {
+                    ui.separator();
+                    ui.label(format!("I {:.1} pA", i * 1e12));
+                }
+                if let Some(t) = s.tip_nm {
+                    ui.separator();
+                    ui.label(format!("Tip ({:.3}, {:.3}) \u{b5}m", t.x * 1e-3, t.y * 1e-3));
+                }
+            }
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(self.project_name()).weak());
+                if let Some(p) = self.cursor_world {
+                    ui.separator();
+                    ui.monospace(format!("{:>9.3}, {:>9.3} \u{b5}m", p.x * 1e-3, p.y * 1e-3));
+                }
+            });
+        });
     }
     /// Check that the saved file lists every object currently loaded.
     fn verify_saved(&self) {
@@ -156,9 +206,7 @@ impl eframe::App for MyApp {
         if let Some(path) = self.project_save_dialog.try_recv_path() {
             match self.save_project_as(path) {
                 Ok(()) => {
-                    let file_name = self.project.current_path().file_name().unwrap().display();
-                    let new_title = format!("Scan Control - {file_name}");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_title));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
                 }
                 Err(e) => error!("save as failed: {e}"),
             }
@@ -185,9 +233,7 @@ impl eframe::App for MyApp {
                     if let Some(conn) = self.active_connection.take() {
                         self.pending_connections.push(conn);
                     }
-                    let file_name = self.project.current_path().file_name().unwrap().display();
-                    let new_title = format!("Scan Control - {file_name}");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_title));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
                 }
                 Err(e) => error!("could not open project {path}: {e}"),
             }
@@ -227,33 +273,44 @@ impl eframe::App for MyApp {
             self.mod_state(DeleteObjectsModifier::new(idxs));
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, egui::Key::T)) {
-            let new_theme = match self.current_theme {
-                ThemePreference::Dark => ThemePreference::Light,
-                ThemePreference::Light => ThemePreference::Dark,
-                ThemePreference::System => unreachable!(),
-            };
-            ctx.set_theme(new_theme);
-            self.current_theme = new_theme;
+            theme::toggle_theme(ctx);
         }
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             MenuBar::new().ui(ui, |ui| {
                 file_menu_button(ui, self);
+                view_menu_button(ui, self);
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::global_theme_preference_switch(ui);
+                    let dark = ui.visuals().dark_mode;
+                    let icon = if dark { "\u{2600}" } else { "\u{1F319}" };
+                    if ui
+                        .button(icon)
+                        .on_hover_text("Switch light / dark (T)")
+                        .clicked()
+                    {
+                        theme::toggle_theme(ui.ctx());
+                    }
                 });
             });
         });
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            let tr = self.app_state.scan_view.world_transform.inverse();
-            let (scale, _, translation) = tr.to_scale_angle_translation();
-            ui.label(format!("scale: {scale}, translation: {translation}"));
+            self.show_status_bar(ui);
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
                 let mut new_world_transform = None;
 
+                let mut cursor_world = None;
                 let scan_view_resp = self.app_state.scan_view.show(ui, |ui| {
+                    if let Some(ctx) = ui.data(|m| m.get_temp::<ScanViewCtx>(egui::Id::new(()))) {
+                        cursor_world = ctx
+                            .screen_response
+                            .hover_pos()
+                            .map(|p| ctx.world2egui().inverse().transform_point2(p.to_glam()));
+                        if theme::prefs().show_grid {
+                            draw_grid(ui, &ctx);
+                        }
+                    }
                     let objects = &mut self.app_state.object_list;
                     transform_objects(ui, objects);
                     for i in 0..objects.len() {
@@ -292,8 +349,13 @@ impl eframe::App for MyApp {
                     if show_rings {
                         for obj in objects.iter() {
                             if let Object::ScanImage { image, hidden: false, .. } = &**obj {
-                                if let Some(ring) = &image.ring {
-                                    crate::analysis::ring_stamp::draw(ui, image.transform, ring);
+                                if image.ring.is_some() || image.ring_label.is_some() {
+                                    crate::analysis::ring_stamp::draw(
+                                        ui,
+                                        image.transform,
+                                        image.ring.as_ref(),
+                                        image.ring_label.as_ref(),
+                                    );
                                 }
                             }
                         }
@@ -323,6 +385,7 @@ impl eframe::App for MyApp {
                     }
                     ScaleBar.show(ui);
                 });
+                self.cursor_world = cursor_world;
                 if let Some(tf) = new_world_transform {
                     let tf = DAffine2::from_scale(DVec2 {
                         x: 0.5e3,
@@ -334,19 +397,13 @@ impl eframe::App for MyApp {
                     self.app_state.object_list.clear_selected();
                 };
                 egui::Window::new("Layers")
-                    .frame(
-                        Frame::window(&ctx.style())
-                            .multiply_with_opacity(0.5)
-                            .shadow(Shadow::NONE),
-                    )
+                    .frame(theme::overlay_frame(ctx))
                     .constrain_to(ui.min_rect())
                     .anchor(Align2::LEFT_TOP, egui::Vec2::new(5., 5.))
                     .default_size([200., 400.])
                     .resizable(true)
                     .scroll([false, true])
                     .show(ctx, |ui| {
-                        let vis = &mut ui.style_mut().visuals.widgets.inactive;
-                        vis.weak_bg_fill = vis.weak_bg_fill.gamma_multiply(0.5);
                         self.app_state.object_list.show(ui);
                     })
                     .map(|resp| {
@@ -360,28 +417,22 @@ impl eframe::App for MyApp {
                     });
                 let mut new_top = ui.clip_rect().top();
                 if let Some(conn) = &mut self.active_connection {
-                    new_top = egui::Window::new("Scan Control")
-                        .frame(
-                            Frame::window(&ctx.style())
-                                .multiply_with_opacity(0.5)
-                                .shadow(Shadow::NONE),
-                        )
+                    if let Some(resp) = egui::Window::new("Scan Control")
+                        .frame(theme::overlay_frame(ctx))
                         .constrain_to(ui.min_rect())
                         .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
                         .resizable(false)
                         .show(ctx, |ui| {
-                            let vis = &mut ui.style_mut().visuals.widgets.inactive;
-                            vis.weak_bg_fill = vis.weak_bg_fill.gamma_multiply(0.5);
+                            ui.set_width(230.);
                             conn.show_menu(
                                 ui,
                                 &mut self.app_state.object_list,
                                 &self.image_encoder,
                             );
                         })
-                        .unwrap()
-                        .response
-                        .rect
-                        .bottom();
+                    {
+                        new_top = resp.response.rect.bottom();
+                    }
                 }
                 let selected = self
                     .app_state
@@ -397,18 +448,17 @@ impl eframe::App for MyApp {
                     let name = self.app_state.object_list[i].name();
                     let mut rect = ui.min_rect();
                     rect.set_top(new_top);
-                    new_top = egui::Window::new(name)
-                        .frame(Frame::window(&ctx.style()).multiply_with_opacity(0.5))
+                    if let Some(resp) = egui::Window::new(name)
+                        .frame(theme::overlay_frame(ctx))
                         .constrain_to(rect)
                         .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
                         .resizable(false)
                         .show(ctx, |ui| {
                             self.app_state.object_list[i].show_menu(ui, &mut self.image_encoder);
                         })
-                        .unwrap()
-                        .response
-                        .rect
-                        .bottom();
+                    {
+                        new_top = resp.response.rect.bottom();
+                    }
                 }
             });
     }
@@ -425,6 +475,102 @@ fn transform_objects(ui: &mut Ui, object_list: &mut SelectableList<Object>) {
         for i in object_list.iter_selected_indexes().collect_vec() {
             object_list[i].apply_transform(tf);
         }
+    }
+}
+
+fn view_menu_button(ui: &mut Ui, app: &mut MyApp) {
+    ui.menu_button("View", |ui| {
+        let current = theme::prefs().theme;
+        for (choice, label) in [
+            (ThemeChoice::Dark, "Dark theme"),
+            (ThemeChoice::Light, "Light theme"),
+            (ThemeChoice::System, "Follow system"),
+        ] {
+            if ui.radio(current == choice, label).clicked() {
+                theme::set_theme(ui.ctx(), choice);
+            }
+        }
+        ui.separator();
+        let mut grid = theme::prefs().show_grid;
+        if ui.checkbox(&mut grid, "Show grid").changed() {
+            theme::update_prefs(|p| p.show_grid = grid);
+        }
+        if let Some(area) = app
+            .app_state
+            .object_list
+            .iter_mut()
+            .find_map(|o| o.as_scan_area_mut())
+        {
+            ui.checkbox(&mut area.show_stamp_rings, "Show ring results on stamps");
+        }
+    });
+}
+
+/// Faint world grid with labels at a "nice" spacing for the current zoom.
+fn draw_grid(ui: &Ui, ctx: &ScanViewCtx) {
+    let w2s = ctx.world2egui();
+    let px_per_nm = w2s.matrix2.x_axis.length();
+    if !(px_per_nm > 0.) {
+        return;
+    }
+    // Aim for lines about 120 px apart: 1, 2 or 5 x 10^n nm.
+    let raw = 120. / px_per_nm;
+    let pow = 10f64.powf(raw.log10().floor());
+    let step = [1., 2., 5., 10.]
+        .into_iter()
+        .map(|m| m * pow)
+        .find(|s| *s >= raw)
+        .unwrap_or(10. * pow);
+    let s2w = w2s.inverse();
+    let r = ctx.rect;
+    let corners = [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()]
+        .map(|p| s2w.transform_point2(p.to_glam()));
+    let min = corners.iter().fold(DVec2::INFINITY, |a, &b| a.min(b));
+    let max = corners.iter().fold(DVec2::NEG_INFINITY, |a, &b| a.max(b));
+    let color = if ui.visuals().dark_mode {
+        Color32::from_white_alpha(22)
+    } else {
+        Color32::from_black_alpha(28)
+    };
+    let label = ui.visuals().weak_text_color();
+    let painter = ui.painter_at(r);
+    let stroke = Stroke::new(1., color);
+    let fmt = |v: f64| {
+        let um = v * 1e-3;
+        if step >= 1000. { format!("{um:.0} \u{b5}m") } else { format!("{um:.2} \u{b5}m") }
+    };
+    let (x0, x1) = ((min.x / step).floor() as i64, (max.x / step).ceil() as i64);
+    let (y0, y1) = ((min.y / step).floor() as i64, (max.y / step).ceil() as i64);
+    if (x1 - x0) > 400 || (y1 - y0) > 400 {
+        return;
+    }
+    for k in x0..=x1 {
+        let x = k as f64 * step;
+        let a = w2s.transform_point2(DVec2::new(x, min.y)).to_egui_pos2();
+        let b = w2s.transform_point2(DVec2::new(x, max.y)).to_egui_pos2();
+        painter.line_segment([a, b], stroke);
+        let top = if a.y < b.y { a } else { b };
+        painter.text(
+            egui::pos2(top.x + 3., r.top() + 2.),
+            Align2::LEFT_TOP,
+            fmt(x),
+            egui::FontId::proportional(10.),
+            label,
+        );
+    }
+    for k in y0..=y1 {
+        let y = k as f64 * step;
+        let a = w2s.transform_point2(DVec2::new(min.x, y)).to_egui_pos2();
+        let b = w2s.transform_point2(DVec2::new(max.x, y)).to_egui_pos2();
+        painter.line_segment([a, b], stroke);
+        let left = if a.x < b.x { a } else { b };
+        painter.text(
+            egui::pos2(r.left() + 3., left.y - 2.),
+            Align2::LEFT_BOTTOM,
+            fmt(y),
+            egui::FontId::proportional(10.),
+            label,
+        );
     }
 }
 
@@ -545,16 +691,16 @@ impl Persistant for SelectableList<Object> {
         Ok(())
     }
 
-    fn db_remove<'t>(id: Uuid, txn: &'t WriteTransaction) -> Result<(), Box<dyn Error>> {
+    fn db_remove<'t>(_id: Uuid, _txn: &'t WriteTransaction) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 
-    fn db_insert<'t>(&self, txn: &'t WriteTransaction) -> Result<(), Box<dyn Error>> {
+    fn db_insert<'t>(&self, _txn: &'t WriteTransaction) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 
     fn db_read<'t>(
-        id: Uuid,
+        _id: Uuid,
         txn: &'t WriteTransaction,
         encoder: &ImageEncoder,
     ) -> Result<Self, Box<dyn Error>> {

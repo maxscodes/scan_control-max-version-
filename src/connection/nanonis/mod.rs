@@ -34,7 +34,7 @@ use crate::{
             course_motion::CourseMotionState,
             lithography::{LithographyState, LithographyWorker},
             ring_assist::RingAssistState,
-            scan_control::ScanControlState,
+            scan_control::{PanelInput, Readback, ScanControlState},
             sequence::{SequenceAction, SequenceState, SequenceWorker},
             spectroscopy::{SpectroscopyState, SpectroscopyWorker},
             worker::{FastStatusWorker, FrameWorker, LineWorker, SlowStatusWorker, Worker as _},
@@ -42,9 +42,10 @@ use crate::{
         queue::{overwrite_queue, OverwriteQueueSender},
         scan_area::ScanArea,
         shared_state::SharedState,
-        Connection,
+        Connection, StatusInfo,
     },
     scan_view::ImageEncoder,
+    theme,
     view_object::{self, Object},
 };
 
@@ -58,6 +59,9 @@ pub struct NanonisConnection {
     base_name: SharedState<String>,
     frame_queue_tx: OverwriteQueueSender<LineDir>,
     tip_pos: SharedState<DVec2>,
+    readback: SharedState<Readback>,
+    /// Scan-area world transform as of the last update, for the status bar.
+    last_world_transform: DAffine2,
     slow_status_init: Arc<AtomicBool>,
     fast_status_init: Arc<AtomicBool>,
     course_menu: CourseMotionState,
@@ -93,23 +97,11 @@ impl Connection for NanonisConnection {
             .iter_mut()
             .find_map(|obj| obj.as_scan_area_mut())
         {
-            scan_area.channel_opts = self.channel_state.read().channel_opts_names().collect();
-            scan_area.area_size = *self.area_size.read();
-            scan_area.image_transform = Some(*self.image_transform.read());
-            scan_area.tip_pos = Some(*self.tip_pos.read());
-            scan_area.stamp_name_base = self.base_name.read().clone();
-            scan_area.channel_opts = self.channel_state.peek().channel_opts_names().collect();
-            scan_area.scan_status = *self.scan_status.read();
+            self.sync_scan_area(scan_area);
             return true;
         }
         let mut scan_area = ScanArea::new(Uuid::new_v4(), encoder, *self.area_size.read());
-        scan_area.channel_opts = self.channel_state.read().channel_opts_names().collect();
-        scan_area.area_size = *self.area_size.read();
-        scan_area.image_transform = Some(*self.image_transform.read());
-        scan_area.tip_pos = Some(*self.tip_pos.read());
-        scan_area.stamp_name_base = self.base_name.read().clone();
-        scan_area.channel_opts = self.channel_state.peek().channel_opts_names().collect();
-        scan_area.scan_status = *self.scan_status.read();
+        self.sync_scan_area(&mut scan_area);
         object_list.push(SelectableEntry::new(
             "area",
             Object::ScanArea {
@@ -134,6 +126,7 @@ impl Connection for NanonisConnection {
         else {
             return;
         };
+        self.last_world_transform = scan_area.world_transform;
         self.update_channel(scan_area, encoder);
         self.update_area_size(scan_area);
         self.update_image_transform(scan_area);
@@ -216,13 +209,7 @@ impl Connection for NanonisConnection {
         else {
             return;
         };
-        // Scan start/pause/resume/stop at the top of the window.
         let scan_status = scan_area.scan_status;
-        self.scan_control
-            .show_menu(ui, &scan_status, self.sequence.is_running());
-        ui.separator();
-        scan_area.show_menu(ui, encoder);
-        ui.separator();
         // Only one tool may drive the tip at a time.
         let sequence = self
             .sequence
@@ -239,7 +226,41 @@ impl Connection for NanonisConnection {
         let scanning = scan_status
             .scanning
             .then_some("A scan is running; stop it first");
-        let locked = sequence.or(spectroscopy).or(lithography).is_some();
+        let locked_by = sequence.or(spectroscopy).or(lithography);
+        let locked = locked_by.is_some();
+
+        // Status, scan buttons, bias/setpoint/current and progress: always shown.
+        let was_compact = theme::prefs().scan_compact;
+        let mut compact = was_compact;
+        let rows = frame_rows(&scan_area.live_image.forward_data);
+        self.scan_control.show_menu(
+            ui,
+            PanelInput {
+                status: &scan_status,
+                sequence_active: self.sequence.is_running(),
+                locked: locked_by,
+                readback: Some(*self.readback.peek()).filter(|_| self.slow_status_init.load(Ordering::SeqCst)),
+                rows,
+            },
+            &mut compact,
+        );
+        if compact != was_compact {
+            theme::update_prefs(|p| p.scan_compact = compact);
+        }
+
+        // Full mode: image settings, stamp, history and the tool launchers.
+        // The tools are always updated (their windows stay open); only their
+        // launch buttons are hidden in compact mode.
+        let show_tools = !compact;
+        if show_tools {
+            ui.separator();
+            scan_area.show_menu(ui, encoder);
+            ui.separator();
+            ui.label(egui::RichText::new("Tools").small().weak());
+        }
+        let mut tools_ui = ui.new_child(egui::UiBuilder::new().invisible().sizing_pass());
+        let tools_ui: &mut Ui = if show_tools { ui } else { &mut tools_ui };
+        let ui = tools_ui;
         self.course_menu.show_menu(ui, object_list, locked);
         self.sequence
             .show_menu(ui, object_list, &self.course_menu, spectroscopy.or(lithography));
@@ -247,7 +268,23 @@ impl Connection for NanonisConnection {
             .show_menu(ui, sequence.or(lithography).or(scanning));
         self.lithography
             .show_menu(ui, object_list, sequence.or(spectroscopy).or(scanning));
-        self.ring_assist.show_menu(ui);
+        self.ring_assist.show_menu(ui, object_list);
+    }
+    fn status(&self) -> StatusInfo {
+        let status = *self.scan_status.peek();
+        let rb = self
+            .slow_status_init
+            .load(Ordering::SeqCst)
+            .then(|| *self.readback.peek());
+        StatusInfo {
+            scan: self.scan_control.status_text(&status),
+            bias: rb.map(|r| r.bias),
+            current: rb.map(|r| r.current),
+            tip_nm: self
+                .fast_status_init
+                .load(Ordering::SeqCst)
+                .then(|| self.last_world_transform.transform_point2(*self.tip_pos.peek())),
+        }
     }
     fn show_image_view_overlay(
         &mut self,
@@ -255,6 +292,7 @@ impl Connection for NanonisConnection {
         object_list: &mut SelectableList<view_object::Object>,
     ) {
         self.course_menu.show_overlay(ui, object_list);
+        self.ring_assist.show_label_overlay(ui, object_list);
         if let Some(scan_area) = object_list
             .iter_mut()
             .find_map(|entry| entry.as_scan_area_mut())
@@ -267,6 +305,15 @@ impl Connection for NanonisConnection {
 }
 
 impl NanonisConnection {
+    /// Copy the current Nanonis state into a (new or reloaded) scan area.
+    fn sync_scan_area(&mut self, scan_area: &mut ScanArea) {
+        scan_area.channel_opts = self.channel_state.read().channel_opts_names().collect();
+        scan_area.area_size = *self.area_size.read();
+        scan_area.image_transform = Some(*self.image_transform.read());
+        scan_area.tip_pos = Some(*self.tip_pos.read());
+        scan_area.stamp_name_base = self.base_name.read().clone();
+        scan_area.scan_status = *self.scan_status.read();
+    }
     pub fn new(ctx: egui::Context, address: impl AsRef<str>) -> Self {
         let image_transform = SharedState::new_default();
         let area_size = SharedState::new_default();
@@ -276,6 +323,7 @@ impl NanonisConnection {
         let scan_status = SharedState::new_default();
         let base_name = SharedState::new_default();
         let tip_pos = SharedState::new_default();
+        let readback = SharedState::new_default();
         let course_voltages = SharedState::new_default();
         let (frame_queue_tx, frame_queue_rx) = overwrite_queue(2);
         let slow_status_init = Arc::new(AtomicBool::new(false));
@@ -317,6 +365,7 @@ impl NanonisConnection {
             &course_voltages,
             &move_receiver,
             &scan_receiver,
+            &readback,
             &slow_status_init,
         )
         .run(address, 6500);
@@ -332,6 +381,8 @@ impl NanonisConnection {
             frame_queue_tx,
             scan_status,
             tip_pos,
+            readback,
+            last_world_transform: DAffine2::IDENTITY,
             slow_status_init,
             base_name,
             course_menu,
@@ -487,4 +538,15 @@ impl NanonisConnection {
             }
         }
     }
+}
+
+/// (rows received, total rows) of a frame being scanned: rows whose middle
+/// pixel already has data.
+fn frame_rows(data: &FrameData) -> Option<(usize, usize)> {
+    let [w, h] = data.size.map(|v| v as usize);
+    if w == 0 || h == 0 || data.data.len() != w * h {
+        return None;
+    }
+    let done = (0..h).filter(|&r| data.data[r * w + w / 2].is_finite()).count();
+    Some((done, h))
 }

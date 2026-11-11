@@ -76,6 +76,10 @@ impl Worker for FastStatusWorker {
     fn name(&self) -> String {
         "Fast Status Worker".to_string()
     }
+    fn interval(&self) -> std::time::Duration {
+        // ~33 Hz is plenty for the tip marker and frame outline.
+        std::time::Duration::from_millis(30)
+    }
 }
 
 fn transform_from_frame(frame: &FrameGetResponse) -> DAffine2 {

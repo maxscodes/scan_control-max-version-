@@ -17,12 +17,23 @@ use glam::{DAffine2, DVec2};
 use crate::{
     analysis::{
         ring_center::{self, RingParams, Verdict},
-        ring_stamp::{self, RingStamp, ARC_COLOR, ARM_COLOR, UNSURE_COLOR},
+        ring_stamp::{
+            self, quad_to_px_dir, RingLabel, RingStamp, StampVerdict, ARC_COLOR, ARM_COLOR,
+            LABEL_COLOR, UNSURE_COLOR,
+        },
+        ring_training::{self, Dataset, LabelKind, Record, Report, TuneParams},
     },
-    connection::ScanArea,
+    components::selectable_list::SelectableList,
+    connection::{LiveImage, ScanArea},
     scan_view::{BorderRectangle, ScanViewCtx},
-    utils::vec_interop::IntoEgui as _,
+    utils::vec_interop::{IntoEgui as _, IntoGlam as _},
+    view_object::Object,
 };
+
+/// Retrain automatically after this many new labels...
+const RETRAIN_EVERY: usize = 5;
+/// ...once the dataset has at least this many labels.
+const RETRAIN_MIN_LABELS: usize = 10;
 
 /// Don't analyse more often than this while a scan is streaming in.
 const MIN_INTERVAL: Duration = Duration::from_millis(1000);
@@ -105,16 +116,36 @@ pub struct RingAssistState {
     current: Option<Reading>,
     last_good: Option<Reading>,
     history: VecDeque<Reading>,
+    /// Labelled frames shared by all projects.
+    dataset: Dataset,
+    /// Stamp waiting for a map click to set its corrected direction.
+    picking: Option<uuid::Uuid>,
+    labels_since_train: usize,
+    training: Option<crossbeam::channel::Receiver<Report>>,
+    report: Option<Report>,
+    label_error: Option<String>,
+    /// Analysis of the selected stamp, so the Teach panel doesn't re-run it
+    /// on every repaint. Cleared when the settings change.
+    teach_cache: Option<(uuid::Uuid, Option<RingStamp>)>,
 }
 
 impl RingAssistState {
     pub fn new() -> Self {
+        // Settings accepted from earlier retraining, or the defaults.
+        let tune = TuneParams::load();
         Self {
             window_open: false,
             enabled: false,
             show_debug: false,
-            params: RingParams::default(),
-            min_radius_um: DEFAULT_MIN_RADIUS_UM,
+            params: tune.params,
+            min_radius_um: tune.min_radius_um,
+            dataset: Dataset::load(Dataset::default_dir()),
+            picking: None,
+            labels_since_train: 0,
+            training: None,
+            report: None,
+            label_error: None,
+            teach_cache: None,
             last_run: None,
             pending: false,
             last_data: None,
@@ -268,7 +299,7 @@ impl RingAssistState {
         ((to - from).length() > 1.).then_some((from, to))
     }
 
-    pub fn show_menu(&mut self, ui: &mut Ui) {
+    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!self.window_open, egui::Button::new("Ring Assist"))
@@ -287,15 +318,16 @@ impl RingAssistState {
         }
         let mut open = self.window_open;
         egui::Window::new("Ring Assist")
+            .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(320.)
             .resizable(true)
             .collapsible(true)
             .open(&mut open)
-            .show(ui.ctx(), |ui| self.show_window(ui));
+            .show(ui.ctx(), |ui| self.show_window(ui, object_list));
         self.window_open = open;
     }
 
-    fn show_window(&mut self, ui: &mut Ui) {
+    fn show_window(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
         ui.label(
             RichText::new(
                 "Analyses each Z frame and shows where it would move. Display only: it never \
@@ -374,6 +406,9 @@ impl RingAssistState {
             self.last_good = None;
         }
 
+        self.show_teach(ui, object_list);
+        self.show_training(ui);
+
         let mut changed = false;
         egui::CollapsingHeader::new("Settings").show(ui, |ui| {
             egui::Grid::new("ring_assist_settings").num_columns(2).show(ui, |ui| {
@@ -412,12 +447,296 @@ impl RingAssistState {
             }
         });
         if changed {
+            self.save_tune();
             self.rerun();
+        }
+    }
+
+    fn tune(&self) -> TuneParams {
+        TuneParams { params: self.params, min_radius_um: self.min_radius_um }
+    }
+
+    fn save_tune(&self) {
+        if let Err(e) = self.tune().save() {
+            tracing::error!("could not save Ring Assist settings: {e}");
+        }
+    }
+
+    /// Label the selected stamp: Good / Correct (click on map) / Should stop.
+    fn show_teach(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+        ui.separator();
+        ui.label(RichText::new("Teach").strong());
+        let (g, c, s) = self.dataset.counts();
+        ui.label(format!(
+            "{} labels ({g} good, {c} corrected, {s} stop)",
+            self.dataset.len()
+        ));
+        let selected = object_list
+            .iter_selected_indexes()
+            .find(|&i| matches!(&*object_list[i], Object::ScanImage { .. }));
+        let Some(i) = selected else {
+            ui.label(RichText::new("Select a stamped Z image to label it.").weak());
+            return;
+        };
+        let Object::ScanImage { image, name, .. } = &mut *object_list[i] else {
+            return;
+        };
+        if image.unit != "m" {
+            ui.label(RichText::new("Only Z images can be labelled.").weak());
+            return;
+        }
+        let name = name.clone();
+        // The stamp's saved result, or analyse it now with the current settings.
+        let model = match image.ring {
+            Some(r) => Some(r),
+            None => match self.teach_cache {
+                Some((id, r)) if id == image.uuid() => r,
+                _ => {
+                    let r = self.analyse_stamp(image);
+                    self.teach_cache = Some((image.uuid(), r));
+                    r
+                }
+            },
+        };
+        match &model {
+            Some(m) => ui.label(
+                RichText::new(format!("{name}: {}", m.summary())).color(m.color()),
+            ),
+            None => ui.label(format!("{name}: no result")),
+        };
+        if let Some(l) = &image.ring_label {
+            ui.label(format!("Your label: {}", l.describe()));
+        }
+        let good_dir = model
+            .filter(|m| !matches!(m.verdict, StampVerdict::Unsure(_)))
+            .map(|m| m.dir_quad);
+        let picking = self.picking == Some(image.uuid());
+        let mut label = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(good_dir.is_some(), egui::Button::new("\u{2714} Good"))
+                .on_hover_text("The arrow points the right way")
+                .on_disabled_hover_text("The model was unsure here: use Correct or Should stop")
+                .clicked()
+            {
+                label = good_dir.map(RingLabel::Good);
+            }
+            if ui
+                .selectable_label(picking, "Correct\u{2026}")
+                .on_hover_text("Then click on the map where the tip should go")
+                .clicked()
+            {
+                self.picking = if picking { None } else { Some(image.uuid()) };
+            }
+            if ui
+                .button("\u{25A0} Should stop")
+                .on_hover_text("No move wanted here (centre, electrodes)")
+                .clicked()
+            {
+                label = Some(RingLabel::Stop);
+            }
+        });
+        if self.picking == Some(image.uuid()) {
+            ui.label(
+                RichText::new("Click on the map where the tip should go (Esc cancels).")
+                    .color(LABEL_COLOR),
+            );
+        }
+        if let Some(l) = label {
+            self.picking = None;
+            self.apply_label(image, &name, l, ui.ctx());
+        }
+        if let Some(e) = &self.label_error {
+            ui.label(RichText::new(e).color(UNSURE_COLOR));
+        }
+    }
+
+    fn analyse_stamp(&self, image: &LiveImage) -> Option<RingStamp> {
+        ring_stamp::analyse_frame(
+            &image.forward_data.data,
+            image.forward_data.size,
+            image.transform,
+            &self.params,
+            self.min_radius_um,
+        )
+    }
+
+    fn apply_label(
+        &mut self,
+        image: &mut LiveImage,
+        name: &str,
+        label: RingLabel,
+        ctx: &egui::Context,
+    ) {
+        let size = image.forward_data.size;
+        if size[0] == 0 || size[1] == 0 {
+            self.label_error = Some("This image has no data.".into());
+            return;
+        }
+        let nm_per_px = image.transform.matrix2.x_axis.length() / size[0] as f64;
+        let (kind, dir) = match label {
+            RingLabel::Good(d) => (LabelKind::Good, quad_to_px_dir(d, size)),
+            RingLabel::Direction(d) => (LabelKind::Direction, quad_to_px_dir(d, size)),
+            RingLabel::Stop => (LabelKind::Stop, DVec2::ZERO),
+        };
+        let record = Record {
+            id: image.uuid().to_string(),
+            kind,
+            dir: dir.to_array(),
+            w: size[0],
+            h: size[1],
+            nm_per_px,
+            source: name.to_string(),
+            time: format!("{:?}", time::UtcDateTime::now()),
+        };
+        match self.dataset.add(record, &image.forward_data.data) {
+            Ok(()) => {
+                image.ring_label = Some(label);
+                self.label_error = None;
+                self.labels_since_train += 1;
+                if self.training.is_none()
+                    && self.labels_since_train >= RETRAIN_EVERY
+                    && self.dataset.len() >= RETRAIN_MIN_LABELS
+                {
+                    self.start_training(ctx);
+                }
+            }
+            Err(e) => self.label_error = Some(format!("Could not save label: {e}")),
+        }
+    }
+
+    fn start_training(&mut self, ctx: &egui::Context) {
+        let dir = self.dataset.dir().to_path_buf();
+        let current = self.tune();
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let samples = Dataset::load(dir).samples();
+            let report = ring_training::evaluate(&samples, current);
+            let _ = tx.send(report);
+            ctx.request_repaint();
+        });
+        self.training = Some(rx);
+        self.labels_since_train = 0;
+        self.report = None;
+    }
+
+    /// Retraining status, and the before/after report with Accept/Dismiss.
+    fn show_training(&mut self, ui: &mut Ui) {
+        if let Some(rx) = &self.training {
+            if let Ok(report) = rx.try_recv() {
+                self.report = Some(report);
+                self.training = None;
+            }
+        }
+        ui.horizontal(|ui| {
+            if self.training.is_some() {
+                ui.spinner();
+                ui.label("Retraining\u{2026}");
+            } else if ui
+                .add_enabled(self.dataset.len() >= 3, egui::Button::new("Retrain now"))
+                .on_hover_text(format!(
+                    "Also runs by itself after every {RETRAIN_EVERY} new labels \
+                     (once there are {RETRAIN_MIN_LABELS})"
+                ))
+                .clicked()
+            {
+                self.start_training(ui.ctx());
+            }
+        });
+        let Some(r) = &self.report else { return };
+        let pct = |n: usize| if r.n > 0 { 100. * n as f64 / r.n as f64 } else { 0. };
+        ui.label(format!(
+            "Current settings: {}/{} right ({:.0}%)",
+            r.current_correct,
+            r.n,
+            pct(r.current_correct)
+        ));
+        ui.label(format!(
+            "New settings: {}/{} on held-out scans ({:.0}%), {}/{} on all",
+            r.cv_correct,
+            r.n,
+            pct(r.cv_correct),
+            r.new_correct,
+            r.n
+        ));
+        let mut accept = false;
+        let mut dismiss = false;
+        if r.is_improvement() {
+            for c in &r.changes {
+                ui.label(format!("  \u{2022} {c}"));
+            }
+            ui.horizontal(|ui| {
+                accept = ui.button("Accept").clicked();
+                dismiss = ui.button("Dismiss").clicked();
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("No better settings found.").weak());
+                dismiss = ui.button("OK").clicked();
+            });
+        }
+        if accept {
+            let new = r.new;
+            self.params = new.params;
+            self.min_radius_um = new.min_radius_um;
+            self.save_tune();
+            self.rerun();
+            self.report = None;
+        } else if dismiss {
+            self.report = None;
+        }
+    }
+
+    /// While picking a corrected direction: draw a guide line from the stamp
+    /// to the pointer and take the next click on the map as the label.
+    pub fn show_label_overlay(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+        let Some(id) = self.picking else { return };
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.picking = None;
+            return;
+        }
+        let Some(i) = object_list.iter().position(
+            |o| matches!(&**o, Object::ScanImage { image, .. } if image.uuid() == id),
+        ) else {
+            self.picking = None;
+            return;
+        };
+        let Some(ctx) = ui.data(|map| map.get_temp::<ScanViewCtx>(Id::new(()))) else {
+            return;
+        };
+        let w2s = ctx.world2egui();
+        let Object::ScanImage { image, name, .. } = &mut *object_list[i] else {
+            return;
+        };
+        let p0 = w2s.transform_point2(image.transform.translation).to_egui_pos2();
+        let stroke = Stroke::new(2., LABEL_COLOR);
+        if let Some(hover) = ctx.screen_response.hover_pos() {
+            ui.painter().extend(egui::Shape::dashed_line(&[p0, hover], stroke, 6., 4.));
+            ui.painter().text(
+                hover + egui::vec2(10., 10.),
+                Align2::LEFT_TOP,
+                "click where the tip should go",
+                FontId::proportional(12.),
+                LABEL_COLOR,
+            );
+        }
+        if ctx.screen_response.clicked() {
+            if let Some(pos) = ctx.screen_response.interact_pointer_pos() {
+                let world = w2s.inverse().transform_point2(pos.to_glam());
+                let q = image.transform.inverse().transform_point2(world);
+                if q.length() > 1e-6 {
+                    let name = name.clone();
+                    self.picking = None;
+                    self.apply_label(image, &name, RingLabel::Direction(q.normalize()), ui.ctx());
+                }
+            }
         }
     }
 
     /// Re-analyse the current frame on the next update.
     fn rerun(&mut self) {
+        self.teach_cache = None;
         self.last_data = None;
         self.last_run = None;
         self.pending = true;

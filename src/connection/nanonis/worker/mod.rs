@@ -3,14 +3,17 @@ mod frame_downloader;
 mod line_worker;
 mod slow_status_worker;
 
-use std::{thread::JoinHandle, time::Duration};
+use std::{
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 pub use fast_status_worker::FastStatusWorker;
 pub use frame_downloader::FrameWorker;
 pub use line_worker::LineWorker;
 use nanonis_tcp::{
     blocking::NanonisTcp,
-    error::{NanonisTcpError, NanonisTcpResult},
+    error::NanonisTcpError,
 };
 pub(crate) use slow_status_worker::move_args_from_steps;
 pub use slow_status_worker::SlowStatusWorker;
@@ -20,6 +23,12 @@ pub trait Worker: Sized + Send + 'static {
     fn name(&self) -> String;
     fn init(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()>;
     fn work(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()>;
+    /// Minimum time between `work` calls. Polling workers set this so they
+    /// don't hammer Nanonis (and trigger UI repaints) in a tight loop;
+    /// workers that block on Nanonis waits keep the default of zero.
+    fn interval(&self) -> Duration {
+        Duration::ZERO
+    }
     fn run(mut self, addr: impl AsRef<str>, port: u16) -> JoinHandle<()> {
         let addr = addr.as_ref().to_string();
         std::thread::Builder::new()
@@ -35,6 +44,7 @@ pub trait Worker: Sized + Send + 'static {
                 if let Ok(conn) = NanonisTcp::new((addr.as_str(), port)) {
                     break conn;
                 }
+                std::thread::sleep(Duration::from_millis(500));
             };
             info!("connected");
             'retry: loop {
@@ -59,8 +69,13 @@ pub trait Worker: Sized + Send + 'static {
             info!("initialized");
             let mut num_retries = 0;
             'retry: loop {
-                match self
-                    .work(&mut conn)
+                let started = Instant::now();
+                let result = self.work(&mut conn);
+                let rest = self.interval().saturating_sub(started.elapsed());
+                if !rest.is_zero() {
+                    std::thread::sleep(rest);
+                }
+                match result
                     .inspect_err(|e| error!("failed working: {:#}", e))
                 {
                     Ok(_) => {

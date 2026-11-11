@@ -2,11 +2,10 @@ use core::f64;
 use std::{
     fs::File,
     io::{Read, Seek, Write},
-    path::Path,
 };
 
 use egui::{
-    epaint::PathStroke, Button, CollapsingHeader, Color32, DragValue, Frame, Id, Shadow, Shape,
+    Button, CollapsingHeader, Color32, DragValue, Id,
     Stroke, Ui, Vec2,
 };
 use glam::{DAffine2, DMat2, DVec2, IVec2};
@@ -136,11 +135,7 @@ impl CourseMotionState {
         }
         let mut menu_active = self.menu_active;
         egui::Window::new("Course Motion")
-            .frame(
-                Frame::window(&ui.ctx().style())
-                    .multiply_with_opacity(0.5)
-                    .shadow(Shadow::NONE),
-            )
+            .frame(crate::theme::overlay_frame(ui.ctx()))
             .auto_sized()
             .collapsible(false)
             .enabled(!self.currently_moving)
@@ -294,9 +289,9 @@ impl CourseMotionState {
         }
     }
     fn show_current_move(&self, ui: &mut Ui, scan_area: &ScanArea) {
-        let ctx = ui
-            .data(|map| map.get_temp::<ScanViewCtx>(Id::new(())))
-            .unwrap();
+        let Some(ctx) = ui.data(|map| map.get_temp::<ScanViewCtx>(Id::new(()))) else {
+            return;
+        };
 
         let world2screen = ctx.world2egui();
         let course_world2screen = |p: DVec2| {

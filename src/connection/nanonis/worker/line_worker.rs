@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use eyre::Context;
-use nanonis_tcp::{blocking::NanonisTcp, error::NanonisTcpResult, LineDir, ScanMovementType};
+use nanonis_tcp::{blocking::NanonisTcp, LineDir, ScanMovementType};
 use tracing::trace;
 
 use crate::connection::{
@@ -43,7 +43,7 @@ impl LineWorker {
         self.queue.send(dir);
         Ok(())
     }
-    pub fn dumb_line_wait(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()> {
+    pub fn dumb_line_wait(&mut self, _conn: &mut NanonisTcp) -> eyre::Result<()> {
         if self.scan_status.peek().scanning {
             for _ in 0..5{
                 std::thread::sleep(Duration::from_millis(100));
@@ -66,5 +66,9 @@ impl Worker for LineWorker {
     }
     fn name(&self) -> String {
         "Line Waiter".to_string()
+    }
+    fn interval(&self) -> Duration {
+        // Without this the loop spins a CPU core while no scan is running.
+        Duration::from_millis(100)
     }
 }

@@ -1,10 +1,9 @@
 use std::{
-    f64, i32,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eyre::Context;
@@ -15,17 +14,22 @@ use nanonis_tcp::{
     error::{NanonisTcpError, NanonisTcpResult},
     ActionType, MotorAxis, MotorDir,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::connection::{
     nanonis::{
         channel_state::ChannelState, command_channel::CommandChannelReciever,
-        course_motion::CourseMoveCommand, scan_control::ScanCommand, worker::Worker, ScanStatus,
+        course_motion::CourseMoveCommand,
+        scan_control::{Readback, ScanCommand},
+        worker::Worker,
+        ScanStatus,
     },
     shared_state::SharedState,
 };
 
 const DEBUG_COURSE: bool = false;
+/// How often bias, setpoint and current are read back for the UI.
+const READBACK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct SlowStatusWorker {
     ctx: egui::Context,
@@ -36,6 +40,8 @@ pub struct SlowStatusWorker {
     course_voltages: SharedState<DVec2>,
     course_reciever: CommandChannelReciever<CourseMoveCommand, ()>,
     scan_reciever: CommandChannelReciever<ScanCommand, ()>,
+    readback: SharedState<Readback>,
+    last_readback: Option<Instant>,
     init: Arc<AtomicBool>,
 }
 impl SlowStatusWorker {
@@ -48,6 +54,7 @@ impl SlowStatusWorker {
         course_voltages: &SharedState<DVec2>,
         course_reciever: &CommandChannelReciever<CourseMoveCommand, ()>,
         scan_reciever: &CommandChannelReciever<ScanCommand, ()>,
+        readback: &SharedState<Readback>,
         init: &Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -59,6 +66,8 @@ impl SlowStatusWorker {
             course_voltages: course_voltages.clone(),
             course_reciever: course_reciever.clone(),
             scan_reciever: scan_reciever.clone(),
+            readback: readback.clone(),
+            last_readback: None,
             init: init.clone(),
         }
     }
@@ -72,6 +81,26 @@ impl SlowStatusWorker {
             ScanCommand::Pause => (ActionType::Pause, current_dir),
             ScanCommand::Resume => (ActionType::Resume, current_dir),
             ScanCommand::Stop => (ActionType::Stop, current_dir),
+            ScanCommand::Save | ScanCommand::SetBias(_) | ScanCommand::SetSetpoint(_) => {
+                let result = match cmd {
+                    ScanCommand::Save => conn
+                        .scan_save(true, Some(Duration::from_secs(20)))
+                        .map(|timed_out| {
+                            if timed_out {
+                                warn!("Scan.Save timed out");
+                            }
+                        }),
+                    ScanCommand::SetBias(v) => conn.bias_set(v),
+                    ScanCommand::SetSetpoint(v) => conn.zctrl_setpnt_set(v),
+                    _ => Ok(()),
+                };
+                // Show the new values straight away.
+                self.last_readback = None;
+                let result = result.and_then(|_| self.update_readback(conn));
+                self.scan_reciever.send_response(());
+                self.ctx.request_repaint();
+                return result;
+            }
         };
         debug!("Executing scan action {action:?} {dir:?}");
         let result = conn.scan_action(action, dir).and_then(|_| {
@@ -142,6 +171,21 @@ impl SlowStatusWorker {
         }
         Ok(())
     }
+    fn update_readback(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
+        if self.last_readback.is_some_and(|t| t.elapsed() < READBACK_INTERVAL) {
+            return Ok(());
+        }
+        self.last_readback = Some(Instant::now());
+        let new = Readback {
+            bias: conn.bias_get()?,
+            setpoint: conn.zctrl_setpnt_get()?,
+            current: conn.current_get()?,
+        };
+        if self.readback.modify_conditional(|prev| *prev != new, |prev| *prev = new) {
+            self.ctx.request_repaint();
+        }
+        Ok(())
+    }
     fn update_area_transform(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
         let piezo_range = conn.piezo_range_get()?;
         let area_transform = DVec2::new(
@@ -208,6 +252,9 @@ impl SlowStatusWorker {
     }
 }
 impl Worker for SlowStatusWorker {
+    fn interval(&self) -> Duration {
+        Duration::from_millis(150)
+    }
     fn work(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()> {
         self.update_area_transform(conn)
             .context("failed update_area_transform")?;
@@ -223,6 +270,8 @@ impl Worker for SlowStatusWorker {
             .context("failed execute_scan_command")?;
         self.execute_course_move(conn)
             .context("failed execute_course_move")?;
+        self.update_readback(conn)
+            .context("failed update_readback")?;
         Ok(())
     }
     fn init(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()> {

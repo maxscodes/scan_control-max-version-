@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossbeam::channel::{Receiver, Sender};
-use egui::{Color32, DragValue, Frame, RichText, ScrollArea, Shadow, Ui};
+use egui::{Color32, DragValue, RichText, ScrollArea, Ui};
 use glam::{DVec2, IVec2};
 use tracing::{error, info};
 
@@ -247,13 +247,11 @@ impl SequenceState {
             .find_map(|entry| entry.as_scan_area_mut());
         let mut open = self.window_open;
         egui::Window::new("Sequence")
-            .frame(
-                Frame::window(&ui.ctx().style())
-                    .multiply_with_opacity(0.85)
-                    .shadow(Shadow::NONE),
-            )
+            .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(720.)
-            .resizable(true)
+            // Width is adjustable; height follows the content, so the window
+            // shrinks when entry details are hidden.
+            .resizable([true, false])
             .collapsible(true)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
@@ -287,14 +285,24 @@ impl SequenceState {
         ui.separator();
         self.show_entry_table(ui, editable, last_dir);
         ui.separator();
-        ui.columns(2, |cols| {
-            cols[0].add_enabled_ui(editable, |ui| {
-                self.show_details(ui, current_frame, course);
+        // Entry details, steps and the bias sweep can be folded away so the
+        // window only shows the scan list and the run controls.
+        let mut details = crate::theme::prefs().sequence_details;
+        let label = if details { "⏶ Hide entry details" } else { "⏷ Show entry details" };
+        if ui.small_button(label).clicked() {
+            details = !details;
+            crate::theme::update_prefs(|p| p.sequence_details = details);
+        }
+        if details {
+            ui.columns(2, |cols| {
+                cols[0].add_enabled_ui(editable, |ui| {
+                    self.show_details(ui, current_frame, course);
+                });
+                self.show_steps(&mut cols[1], last_dir);
             });
-            self.show_steps(&mut cols[1], last_dir);
-        });
-        ui.separator();
-        ui.add_enabled_ui(editable, |ui| self.show_sweep(ui));
+            ui.separator();
+            ui.add_enabled_ui(editable, |ui| self.show_sweep(ui));
+        }
         ui.separator();
         self.show_run_controls(ui, course, last_dir, blocked_by);
     }
