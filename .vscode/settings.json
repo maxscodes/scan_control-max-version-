@@ -1,0 +1,21 @@
+{
+    // --- Keep rust-analyzer's memory down ---
+    // Don't pre-index every dependency at startup; index lazily on demand.
+    "rust-analyzer.cachePriming.enable": false,
+    // Smaller parse cache (default 128). Lower = less RAM, slightly slower jumps.
+    "rust-analyzer.lru.capacity": 64,
+    // Run `cargo check` into a separate target dir so it doesn't fight the
+    // real build for the lock (and doesn't trigger full rebuilds).
+    "rust-analyzer.cargo.targetDir": true,
+    // Only check the current crate's targets, not every bench/example.
+    "rust-analyzer.check.allTargets": false,
+
+    // --- Stop VS Code watching/searching the huge build folder ---
+    "files.watcherExclude": {
+        "**/target/**": true,
+        "**/.git/objects/**": true
+    },
+    "search.exclude": {
+        "**/target": true
+    }
+}

@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run scan_control",
+            "cargo": {
+                "args": ["build", "--bin=scan_control", "--package=scan_control"],
+                "filter": { "name": "scan_control", "kind": "bin" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run scan_control (v5e)",
+            "cargo": {
+                "args": ["build", "--bin=scan_control", "--package=scan_control", "--features=v5e"],
+                "filter": { "name": "scan_control", "kind": "bin" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

@@ -1,11 +1,18 @@
 [package]
 name = "scan_control"
-version = "0.4.0"
+version = "0.8.0"
 edition = "2021"
 
 [profile.dev]
 incremental = true  # default, but set explicitly
 codegen-units = 256 # faster recompile, slower runtime
+# Light optimisation of our own code keeps rebuilds quick but makes the
+# image analysis and drawing many times faster than opt-level 0.
+opt-level = 1
+
+# Dependencies (egui, wgpu, image code) are built once, so optimise them fully.
+[profile.dev.package."*"]
+opt-level = 3
 
 [features]
 v5e = ["nanonis-tcp/v5e"]
@@ -38,7 +45,7 @@ id_tree = "1.8.0"
 thiserror = "2.0.17"
 borrow = "2.0.0"
 # nanonis-tcp = { git = "https://github.com/Brad-Hesson/nanonis-tcp"}
-nanonis-tcp = { path = "../nanonis-tcp" }
+nanonis-tcp = { path = "crates/nanonis-tcp" }
 parking_lot = "0.12.5"
 image.workspace = true
 nalgebra = { version = "0.34.2", features = ["convert-glam032"]}
@@ -69,6 +76,7 @@ members = [
     "crates/image-compute",
     "crates/notify-typed",
     "crates/filetree",
+    "crates/nanonis-tcp",
 ]
 
 [workspace.dependencies]
