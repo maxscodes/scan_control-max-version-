@@ -181,6 +181,8 @@ pub struct UiPrefs {
     pub scan_compact: bool,
     pub sequence_details: bool,
     pub show_grid: bool,
+    /// Draw the GDS-predicted direction on stamps.
+    pub show_gds_prior: bool,
 }
 impl Default for UiPrefs {
     fn default() -> Self {
@@ -189,6 +191,7 @@ impl Default for UiPrefs {
             scan_compact: false,
             sequence_details: true,
             show_grid: false,
+            show_gds_prior: true,
         }
     }
 }

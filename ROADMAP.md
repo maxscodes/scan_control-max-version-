@@ -32,6 +32,7 @@ These are in rough dependency order.
 | I(V) series at stepped Z, with plots and `.dat` export | 1, 2 | Done (`spectroscopy/`) | **No** |
 | GDS lithography: 5 path planners, Ramp or Z-lift moves, STOP, map overlay | 6 | Done (`lithography/`) | **No** |
 | Ring auto-centering: estimator and display-only Ring Assist overlay | 5 | Steps 1 and 2 done (`analysis/ring_center.rs`, `ring_assist.rs`) | Overlay is not yet live-checked |
+| Ring Assist GDS prior (v0.6): direction to the ring centre from the GDS, scan band check, alignment estimate with Shift GDS, warning when the GDS moves | 5 | Done (`analysis/gds_prior.rs`); GDS direction matched 12/12 labels on 20261110 | Not yet live-checked |
 
 Only one tool can drive the tip at a time: a sequence, spectroscopy, lithography or a running scan.
 

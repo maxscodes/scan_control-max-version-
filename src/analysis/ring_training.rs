@@ -31,6 +31,9 @@ pub enum LabelKind {
     Direction,
     /// No move wanted here.
     Stop,
+    /// The smallest ring is in the frame (stage 1 reached). `dir` is the
+    /// direction of the final step into the middle, or zero if not given.
+    SmallestRing,
 }
 
 /// One labelled frame, as stored in `labels.jsonl`.
@@ -47,6 +50,18 @@ pub struct Record {
     pub source: String,
     #[serde(default)]
     pub time: String,
+    /// What the GDS predicted for this frame, if it was on a GDS ring system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gds: Option<GdsInfo>,
+}
+
+/// The GDS prediction stored with a label.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GdsInfo {
+    /// Unit direction to the ring centre, frame pixel axes.
+    pub dir: [f64; 2],
+    /// The innermost ring should be in the frame.
+    pub smallest: bool,
 }
 
 impl Record {
@@ -146,9 +161,15 @@ impl Dataset {
     pub fn len(&self) -> usize {
         self.records.len()
     }
-    pub fn counts(&self) -> (usize, usize, usize) {
+    /// (good, corrected, stop, smallest ring)
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
         let n = |k| self.records.iter().filter(|r| r.kind == k).count();
-        (n(LabelKind::Good), n(LabelKind::Direction), n(LabelKind::Stop))
+        (
+            n(LabelKind::Good),
+            n(LabelKind::Direction),
+            n(LabelKind::Stop),
+            n(LabelKind::SmallestRing),
+        )
     }
     /// Add or replace the label for frame `id`.
     pub fn add(&mut self, record: Record, data: &[f32]) -> Result<(), String> {
@@ -170,6 +191,41 @@ impl Dataset {
             None => self.records.push(record),
         }
         Ok(())
+    }
+    pub fn gds_of(&self, id: &str) -> Option<Option<GdsInfo>> {
+        self.records.iter().find(|r| r.id == id).map(|r| r.gds)
+    }
+    /// Set the GDS prediction of existing labels (e.g. after the GDS was
+    /// placed or moved). Rewrites `labels.jsonl` once if anything changed.
+    pub fn update_gds(&mut self, updates: &[(String, Option<GdsInfo>)]) -> Result<usize, String> {
+        let mut changed = 0;
+        for (id, g) in updates {
+            if let Some(r) = self.records.iter_mut().find(|r| &r.id == id) {
+                let differs = match (r.gds, g) {
+                    (Some(a), Some(b)) => {
+                        a.smallest != b.smallest
+                            || DVec2::from_array(a.dir).dot(DVec2::from_array(b.dir)) < 0.9998
+                    }
+                    (None, None) => false,
+                    _ => true,
+                };
+                if differs {
+                    r.gds = *g;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            let mut text = String::new();
+            for r in &self.records {
+                text += &serde_json::to_string(r).map_err(|e| e.to_string())?;
+                text.push('\n');
+            }
+            let tmp = self.dir.join("labels.jsonl.tmp");
+            std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, self.dir.join("labels.jsonl")).map_err(|e| e.to_string())?;
+        }
+        Ok(changed)
     }
     /// Read every labelled frame. Frames whose data file is missing are skipped.
     pub fn samples(&self) -> Vec<Sample> {
@@ -201,12 +257,23 @@ pub fn score(sample: &Sample, tune: &TuneParams) -> bool {
         &tune.params,
         tune.min_radius_um,
     ) else {
-        return r.kind == LabelKind::Stop;
+        return r.kind == LabelKind::Stop
+            || (r.kind == LabelKind::SmallestRing && r.dir() == DVec2::ZERO);
     };
     let label = r.dir();
     match (r.kind, res.verdict) {
         (LabelKind::Stop, StampVerdict::Unsure(_)) => true,
         (LabelKind::Stop, _) => false,
+        // At the smallest ring the ring centre is the middle: right if the
+        // model points at the middle (when the user gave that direction), or
+        // stops when no direction was given.
+        (LabelKind::SmallestRing, StampVerdict::Unsure(_)) => label == DVec2::ZERO,
+        (LabelKind::SmallestRing, StampVerdict::Arc) => {
+            label != DVec2::ZERO
+                && quad_to_px_dir(res.dir_quad, size).dot(label)
+                    >= MAX_ANGLE_DEG.to_radians().cos()
+        }
+        (LabelKind::SmallestRing, StampVerdict::ArmEnd) => false,
         (_, StampVerdict::Unsure(_)) => false,
         (_, StampVerdict::Arc) => {
             let pred = quad_to_px_dir(res.dir_quad, size);
@@ -218,6 +285,20 @@ pub fn score(sample: &Sample, tune: &TuneParams) -> bool {
             label.x.abs() > 0.5 && pred.x.signum() == label.x.signum()
         }
     }
+}
+
+/// Does the GDS prediction agree with this label? `None` without a GDS.
+pub fn score_gds(r: &Record) -> Option<bool> {
+    let g = r.gds?;
+    let gd = DVec2::from_array(g.dir);
+    let cos = MAX_ANGLE_DEG.to_radians().cos();
+    Some(match r.kind {
+        LabelKind::Good | LabelKind::Direction => gd.dot(r.dir()) >= cos,
+        LabelKind::Stop => g.smallest,
+        LabelKind::SmallestRing => {
+            g.smallest && (r.dir() == DVec2::ZERO || gd.dot(r.dir()) >= cos)
+        }
+    })
 }
 
 /// Number of samples the settings get right, scored in parallel.
@@ -294,6 +375,11 @@ pub struct Report {
     pub new: TuneParams,
     pub new_correct: usize,
     pub changes: Vec<String>,
+    /// Labels with a GDS prediction, and how many it gets right.
+    pub gds_n: usize,
+    pub gds_correct: usize,
+    /// GDS where available, the current settings elsewhere.
+    pub combined_correct: usize,
 }
 
 impl Report {
@@ -324,7 +410,21 @@ pub fn evaluate(samples: &[Sample], current: TuneParams) -> Report {
         cv_correct = current_correct;
     }
     let (new, new_correct) = search(&all, current);
-    Report { n, current_correct, cv_correct, changes: new.changes_from(&current), new, new_correct }
+    let gds: Vec<bool> = all.iter().filter_map(|s| score_gds(&s.record)).collect();
+    let no_gds: Vec<&Sample> = all.iter().copied().filter(|s| s.record.gds.is_none()).collect();
+    let gds_correct = gds.iter().filter(|&&b| b).count();
+    let combined_correct = gds_correct + correct(&no_gds, &current);
+    Report {
+        n,
+        current_correct,
+        cv_correct,
+        changes: new.changes_from(&current),
+        new,
+        new_correct,
+        gds_n: gds.len(),
+        gds_correct,
+        combined_correct,
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +453,7 @@ mod tests {
                 nm_per_px: 3000. / w as f64,
                 source: String::new(),
                 time: String::new(),
+                gds: None,
             },
             data,
         }
@@ -377,7 +478,13 @@ mod tests {
         assert!(!score(&sample(LabelKind::Stop, DVec2::ZERO, data, w as u32), &base()));
         // Flat frame: the detector is unsure, which matches a Stop label.
         let flat = vec![0.5f32; w * w];
-        assert!(score(&sample(LabelKind::Stop, DVec2::ZERO, flat, w as u32), &base()));
+        assert!(score(&sample(LabelKind::Stop, DVec2::ZERO, flat.clone(), w as u32), &base()));
+        // Smallest ring without a direction: right when the model stops...
+        assert!(score(&sample(LabelKind::SmallestRing, DVec2::ZERO, flat, w as u32), &base()));
+        // ...and with a direction to the middle: right when it points there.
+        let data = rings(w, DVec2::new(-60., -40.));
+        assert!(score(&sample(LabelKind::SmallestRing, toward, data.clone(), w as u32), &base()));
+        assert!(!score(&sample(LabelKind::SmallestRing, -toward, data, w as u32), &base()));
     }
 
     #[test]
@@ -394,11 +501,27 @@ mod tests {
 
         let ds = Dataset::load(dir.clone());
         assert_eq!(ds.len(), 2);
-        assert_eq!(ds.counts(), (0, 1, 1));
+        assert_eq!(ds.counts(), (0, 1, 1, 0));
         let samples = ds.samples();
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].record.kind, LabelKind::Stop);
         assert_eq!(samples[0].data, data);
+
+        // GDS predictions can be added later and survive a reload.
+        let mut ds = ds;
+        let id = samples[1].record.id.clone();
+        let g = GdsInfo { dir: [0., 1.], smallest: false };
+        assert_eq!(ds.update_gds(&[(id.clone(), Some(g))]).unwrap(), 1);
+        assert_eq!(ds.update_gds(&[(id.clone(), Some(g))]).unwrap(), 0);
+        let ds = Dataset::load(dir.clone());
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds.gds_of(&id), Some(Some(g)));
+        // That label points along +y, as does the GDS: right.
+        let rec = ds.samples().into_iter().find(|s| s.record.id == id).unwrap().record;
+        assert_eq!(score_gds(&rec), Some(true));
+        let mut wrong = rec.clone();
+        wrong.gds = Some(GdsInfo { dir: [0., -1.], smallest: false });
+        assert_eq!(score_gds(&wrong), Some(false));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -491,6 +614,7 @@ mod tests {
                 nm_per_px: range[0] as f64 * 1e9 / w as f64,
                 source: path.file_name().unwrap().to_string_lossy().into(),
                 time: "seed".into(),
+                gds: None,
             };
             ds.add(rec, &z).unwrap();
             println!("{stem}: added");

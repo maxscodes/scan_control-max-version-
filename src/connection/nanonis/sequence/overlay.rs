@@ -28,6 +28,13 @@ impl SequenceState {
         if !self.window_open && self.run.is_none() {
             return;
         }
+        // Hidden after finishing, until the sequence or selection changes.
+        if let Some((seq, sel)) = &self.plan_hidden {
+            if self.run.is_none() && *seq == self.seq && *sel == self.selected {
+                return;
+            }
+            self.plan_hidden = None;
+        }
         let Some(transform) = scan_area.image_transform else {
             return;
         };

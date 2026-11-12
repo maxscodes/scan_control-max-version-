@@ -34,6 +34,15 @@ pub static CONFIG_DIR: LazyLock<directories::ProjectDirs> = LazyLock::new(|| {
     base_dir
 });
 
+/// For background work (e.g. stamp analysis) to ask for a repaint when done.
+static REPAINT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+pub fn request_repaint() {
+    if let Some(ctx) = REPAINT.get() {
+        ctx.request_repaint();
+    }
+}
+
 pub struct MyApp {
     app_state: AppState,
     image_encoder: ImageEncoder,
@@ -46,6 +55,10 @@ pub struct MyApp {
     pending_connections: Vec<Box<dyn Connection>>,
     active_connection: Option<Box<dyn Connection>>,
     project: ProjectDb,
+    /// Zoom the map to this "goto" transform on the next frame.
+    pending_goto: Option<DAffine2>,
+    /// GDS position before the last "Shift GDS", for Undo.
+    gds_shift_undo: Option<(Uuid, DAffine2)>,
 }
 
 pub struct AppState {
@@ -55,6 +68,7 @@ pub struct AppState {
 
 impl MyApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let _ = REPAINT.set(cc.egui_ctx.clone());
         let project = ProjectDb::new_temp().unwrap();
         let wgpu = cc.wgpu_render_state.as_ref().unwrap();
         let image_encoder = ImageEncoder::new(wgpu);
@@ -73,6 +87,8 @@ impl MyApp {
             image_encoder,
             undo_queue: UndoQueue::new(),
             cursor_world: None,
+            pending_goto: None,
+            gds_shift_undo: None,
             pending_connections: vec![nanonis_connection],
             active_connection: None,
             project,
@@ -275,11 +291,21 @@ impl eframe::App for MyApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, egui::Key::T)) {
             theme::toggle_theme(ctx);
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, egui::Key::Home)) {
+            self.pending_goto = self.scan_frame_goto();
+        }
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             MenuBar::new().ui(ui, |ui| {
                 file_menu_button(ui, self);
                 view_menu_button(ui, self);
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.scan_frame_goto().is_some(), Button::new("\u{26F6} Fit scan"))
+                        .on_hover_text("Zoom the map to the current scan frame (Home)")
+                        .clicked()
+                    {
+                        self.pending_goto = self.scan_frame_goto();
+                    }
                     let dark = ui.visuals().dark_mode;
                     let icon = if dark { "\u{2600}" } else { "\u{1F319}" };
                     if ui
@@ -307,7 +333,7 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                let mut new_world_transform = None;
+                let mut new_world_transform = self.pending_goto.take();
 
                 let mut cursor_world = None;
                 let scan_view_resp = self.app_state.scan_view.show(ui, |ui| {
@@ -348,6 +374,30 @@ impl eframe::App for MyApp {
                         }
                         if maybe_resp.is_some_and(|resp| resp.double_clicked()) {
                             new_world_transform = Some(objects[i].goto_transform());
+                        }
+                    }
+                    // Stamps taken before the GDS reference existed: remember
+                    // the GDS as it is now, so later moves can be detected.
+                    let gds = crate::analysis::gds_prior::collect(objects);
+                    if !gds.is_empty() {
+                        for obj in objects.iter_mut() {
+                            if let Object::ScanImage { image, .. } = &mut **obj {
+                                if image.gds_ref.is_none() {
+                                    image.gds_ref = crate::analysis::gds_prior::predict_any(&gds, image.transform)
+                                        .map(|(gi, _)| (gds[gi].uuid, gds[gi].transform));
+                                }
+                            }
+                        }
+                    }
+                    if theme::prefs().show_gds_prior && !gds.is_empty() {
+                        for obj in objects.iter() {
+                            if let Object::ScanImage { image, hidden: false, .. } = &**obj {
+                                if image.unit == "m" {
+                                    if let Some(p) = crate::analysis::gds_prior::stamp_prior(&gds, image) {
+                                        crate::analysis::gds_prior::draw_stamp(ui, image.transform, &p);
+                                    }
+                                }
+                            }
                         }
                     }
                     // Ring Assist results saved with stamps (works offline too).
@@ -424,6 +474,7 @@ impl eframe::App for MyApp {
                             }
                         })
                     });
+                self.show_gds_moved_warning(ctx, ui.min_rect());
                 let mut new_top = ui.clip_rect().top();
                 if let Some(conn) = &mut self.active_connection {
                     if let Some(resp) = egui::Window::new("Scan Control")
@@ -464,12 +515,221 @@ impl eframe::App for MyApp {
                         .resizable(false)
                         .show(ctx, |ui| {
                             self.app_state.object_list[i].show_menu(ui, &mut self.image_encoder);
+                            if matches!(&*self.app_state.object_list[i], Object::Gds { .. }) {
+                                gds_ring_check_ui(
+                                    ui,
+                                    &mut self.app_state.object_list,
+                                    i,
+                                    &mut self.gds_shift_undo,
+                                );
+                            }
                         })
                     {
                         new_top = resp.response.rect.bottom();
                     }
                 }
             });
+    }
+}
+
+impl MyApp {
+    /// "Goto" transform for the current scan frame (or the whole scan range
+    /// when no frame is known), for zooming the map to it.
+    fn scan_frame_goto(&self) -> Option<DAffine2> {
+        self.app_state.object_list.iter().find_map(|o| {
+            let area = o.as_scan_area()?;
+            Some(match area.image_transform {
+                Some(image) => {
+                    area.world_transform * image * DAffine2::from_scale(DVec2::new(1., -1.))
+                }
+                None => o.goto_transform(),
+            })
+        })
+    }
+
+    /// Warn when the GDS has moved (or been replaced) since stamps were
+    /// taken, with a way to put it back or accept the new position.
+    fn show_gds_moved_warning(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        let st = crate::analysis::gds_prior::ref_status(&self.app_state.object_list);
+        if st.moved.is_empty() && st.replaced.is_empty() {
+            return;
+        }
+        let objects = &mut self.app_state.object_list;
+        egui::Window::new("GDS moved")
+            .frame(theme::overlay_frame(ctx))
+            .title_bar(false)
+            .resizable(false)
+            .constrain_to(rect)
+            .anchor(Align2::CENTER_TOP, egui::Vec2::new(0., 5.))
+            .show(ctx, |ui| {
+                ui.set_max_width(360.);
+                if let Some(c) = st.worst {
+                    let mut what = format!("by up to {:.2} \u{b5}m at the stamps", c.shift_nm * 1e-3);
+                    if c.rot_deg.abs() > 0.05 {
+                        what += &format!(", rotated {:+.2}\u{b0}", c.rot_deg);
+                    }
+                    if (c.scale - 1.).abs() > 1e-3 {
+                        what += &format!(", scaled \u{d7}{:.3}", c.scale);
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "\u{26A0} The GDS has moved since {} stamp{} were taken ({what}).",
+                            st.moved.len(),
+                            if st.moved.len() == 1 { "" } else { "s" }
+                        ))
+                        .color(theme::WARN),
+                    );
+                    ui.label(
+                        RichText::new("Ring predictions use the GDS where it is now.").weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        if let Some((id, old)) = st.restore {
+                            if ui.button("Move GDS back").clicked() {
+                                for o in objects.iter_mut() {
+                                    if let Object::Gds { image, .. } = &mut **o {
+                                        if image.uuid() == id {
+                                            image.transform = old;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ui
+                            .button("Keep new position")
+                            .on_hover_text("The stamps now refer to the GDS where it is")
+                            .clicked()
+                        {
+                            set_gds_refs(objects, &st.moved);
+                        }
+                    });
+                }
+                if !st.replaced.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "\u{26A0} {} stamp{} were taken with a GDS that is no longer in the project.",
+                            st.replaced.len(),
+                            if st.replaced.len() == 1 { "" } else { "s" }
+                        ))
+                        .color(theme::WARN),
+                    );
+                    if ui.button("Use the current GDS").clicked() {
+                        set_gds_refs(objects, &st.replaced);
+                    }
+                }
+            });
+    }
+}
+
+/// Point these stamps' GDS reference at the GDS as it is now.
+fn set_gds_refs(objects: &mut SelectableList<Object>, stamps: &[usize]) {
+    let gds = crate::analysis::gds_prior::collect(objects);
+    for &i in stamps {
+        if let Object::ScanImage { image, .. } = &mut *objects[i] {
+            image.gds_ref = crate::analysis::gds_prior::predict_any(&gds, image.transform)
+                .map(|(gi, _)| (gds[gi].uuid, gds[gi].transform));
+        }
+    }
+}
+
+/// Ring check for a GDS: how its predictions compare with the stamps' scan
+/// bands, and a suggested shift if the stamps say it is off.
+fn gds_ring_check_ui(
+    ui: &mut Ui,
+    objects: &mut SelectableList<Object>,
+    i: usize,
+    undo: &mut Option<(Uuid, DAffine2)>,
+) {
+    use crate::analysis::gds_prior::{self, GDS_COLOR};
+    let Object::Gds { image, .. } = &*objects[i] else { return };
+    let id = image.uuid();
+    let systems = image.ring_systems();
+    ui.separator();
+    ui.label(RichText::new("Ring check").strong());
+    if systems.is_empty() {
+        ui.label(RichText::new("No ring pattern found in this GDS.").weak());
+        return;
+    }
+    let gds = gds_prior::collect(objects);
+    let check = gds_prior::alignment_check(objects, &gds, id);
+    ui.label(format!(
+        "{} ring system{} found; {} Z stamp{} on them.",
+        systems.len(),
+        if systems.len() == 1 { "" } else { "s" },
+        check.stamps,
+        if check.stamps == 1 { "" } else { "s" }
+    ));
+    if check.with_bands > 0 {
+        ui.label(format!(
+            "Scan bands agree with the GDS on {}/{} stamps (median {:.0}\u{b0}).",
+            check.agree, check.with_bands, check.median_deg
+        ));
+    }
+    let mut shift = None;
+    match check.estimate {
+        Some(e) if e.significant() => {
+            ui.label(
+                RichText::new(format!(
+                    "The scans suggest moving the GDS by ({:+.2}, {:+.2}) \u{b5}m, \u{b1}{:.1} \u{b5}m (from {} stamps).",
+                    e.offset.x * 1e-3,
+                    e.offset.y * 1e-3,
+                    e.sigma.max_element() * 1e-3,
+                    e.used
+                ))
+                .color(GDS_COLOR),
+            );
+            if ui
+                .button("Shift GDS")
+                .on_hover_text("Move the GDS by this amount. Undo puts it back.")
+                .clicked()
+            {
+                shift = Some(e.offset);
+            }
+        }
+        Some(e) => {
+            ui.label(
+                RichText::new(format!(
+                    "No clear offset (best guess ({:+.2}, {:+.2}) \u{b1}{:.1} \u{b5}m from {} stamps).",
+                    e.offset.x * 1e-3,
+                    e.offset.y * 1e-3,
+                    e.sigma.max_element() * 1e-3,
+                    e.used
+                ))
+                .weak(),
+            );
+        }
+        None => {
+            ui.label(
+                RichText::new("Needs 3 or more stamps with clear bands to estimate an offset.")
+                    .weak(),
+            );
+        }
+    }
+    let can_undo = undo.is_some_and(|(u, _)| u == id);
+    let mut restore = None;
+    if can_undo && ui.button("Undo shift").clicked() {
+        restore = undo.take().map(|(_, t)| t);
+    }
+    let new = {
+        let Object::Gds { image, .. } = &mut *objects[i] else { return };
+        let before = image.transform;
+        if let Some(off) = shift {
+            *undo = Some((id, before));
+            image.transform.translation += off;
+        }
+        if let Some(t) = restore {
+            image.transform = t;
+        }
+        (image.transform != before).then_some(image.transform)
+    };
+    // A deliberate move: the stamps follow it, so no "GDS moved" warning.
+    if let Some(t) = new {
+        for o in objects.iter_mut() {
+            if let Object::ScanImage { image, .. } = &mut **o {
+                if image.gds_ref.is_some_and(|(u, _)| u == id) {
+                    image.gds_ref = Some((id, t));
+                }
+            }
+        }
     }
 }
 
@@ -503,6 +763,21 @@ fn view_menu_button(ui: &mut Ui, app: &mut MyApp) {
         let mut grid = theme::prefs().show_grid;
         if ui.checkbox(&mut grid, "Show grid").changed() {
             theme::update_prefs(|p| p.show_grid = grid);
+        }
+        let mut gds = theme::prefs().show_gds_prior;
+        if ui
+            .checkbox(&mut gds, "Show GDS prediction on stamps")
+            .on_hover_text("Dashed violet arrow: direction to the ring centre from where the GDS sits on the map")
+            .changed()
+        {
+            theme::update_prefs(|p| p.show_gds_prior = gds);
+        }
+        if ui
+            .add_enabled(app.scan_frame_goto().is_some(), Button::new("Fit scan frame  (Home)"))
+            .clicked()
+        {
+            app.pending_goto = app.scan_frame_goto();
+            ui.close();
         }
         if let Some(area) = app
             .app_state

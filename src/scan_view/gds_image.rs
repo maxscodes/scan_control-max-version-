@@ -23,6 +23,8 @@ pub struct GDSImage {
     buffers: BTreeMap<u16, GDSImageBuffers>,
     colors: BTreeMap<u16, Color32>,
     polys: BTreeMap<u16, Vec<Vec<Vec2>>>,
+    /// Ring systems found in the polygons (computed on first use).
+    rings: std::sync::OnceLock<std::sync::Arc<Vec<crate::analysis::gds_prior::RingSystem>>>,
 }
 
 impl GDSImage {
@@ -104,6 +106,7 @@ impl GDSImage {
             scale,
             uuid,
             polys,
+            rings: std::sync::OnceLock::new(),
         }
     }
     pub fn uuid(&self) -> Uuid {
@@ -113,6 +116,12 @@ impl GDSImage {
     /// for world coordinates).
     pub fn polygons(&self) -> &BTreeMap<u16, Vec<Vec<Vec2>>> {
         &self.polys
+    }
+    /// Concentric ring systems in this GDS (for the Ring Assist prior).
+    pub fn ring_systems(&self) -> std::sync::Arc<Vec<crate::analysis::gds_prior::RingSystem>> {
+        self.rings
+            .get_or_init(|| std::sync::Arc::new(crate::analysis::gds_prior::find_ring_systems(&self.polys)))
+            .clone()
     }
     pub fn show(&self, ui: &mut Ui) {
         let ctx = ui

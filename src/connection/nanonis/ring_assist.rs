@@ -16,12 +16,13 @@ use glam::{DAffine2, DVec2};
 
 use crate::{
     analysis::{
+        gds_prior::{self, BandCheck, Bands, GdsPrediction, GdsRings},
         ring_center::{self, RingParams, Verdict},
         ring_stamp::{
             self, quad_to_px_dir, RingLabel, RingStamp, StampVerdict, ARC_COLOR, ARM_COLOR,
             LABEL_COLOR, UNSURE_COLOR,
         },
-        ring_training::{self, Dataset, LabelKind, Record, Report, TuneParams},
+        ring_training::{self, Dataset, GdsInfo, LabelKind, Record, Report, TuneParams},
     },
     components::selectable_list::SelectableList,
     connection::{LiveImage, ScanArea},
@@ -29,6 +30,15 @@ use crate::{
     utils::vec_interop::{IntoEgui as _, IntoGlam as _},
     view_object::Object,
 };
+
+/// What a map click sets while picking.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// Corrected direction (the stamp's arrow was wrong).
+    Correct,
+    /// Optional direction from the smallest ring into the middle.
+    Middle,
+}
 
 /// Retrain automatically after this many new labels...
 const RETRAIN_EVERY: usize = 5;
@@ -46,6 +56,8 @@ const HISTORY_LEN: usize = 12;
 const DEFAULT_MIN_RADIUS_UM: f64 = 1.5;
 
 const GOOD_COLOR: Color32 = Color32::from_rgb(0x9a, 0xe6, 0xa8);
+use crate::analysis::gds_prior::GDS_COLOR;
+const WARN_COLOR: Color32 = Color32::from_rgb(0xff, 0xb3, 0x47);
 const FEATURE_COLOR: Color32 = Color32::from_rgb(0x00, 0xc8, 0xff);
 
 #[derive(Clone)]
@@ -65,6 +77,12 @@ pub struct Reading {
     features_world: Vec<(DVec2, f64)>,
     /// Edge pixels of the final fit (world), for the debug view.
     edges_world: Vec<DVec2>,
+    size: [u32; 2],
+    /// Broad band direction measured in the frame.
+    bands: Option<Bands>,
+    /// What the GDS predicts here (refreshed when the GDS moves).
+    gds: Option<GdsPrediction>,
+    band_check: Option<BandCheck>,
 }
 
 impl Reading {
@@ -97,6 +115,29 @@ impl Reading {
             Verdict::Unsure(_) => UNSURE_COLOR,
         }
     }
+    fn refresh_gds(&mut self, gds: &[GdsRings]) {
+        self.gds = gds_prior::predict_any(gds, self.frame).map(|(_, p)| p);
+        self.band_check = self.gds.map(|p| gds_prior::check(self.bands, self.size, self.frame, &p));
+    }
+}
+
+/// One line on how the GDS prediction and the image analysis compare.
+fn image_vs_gds(move_dir_world: Option<DVec2>, gds: &GdsPrediction) -> Option<(String, Color32)> {
+    let d = move_dir_world?;
+    let a = d.dot(gds.dir_world).clamp(-1., 1.).acos().to_degrees();
+    Some(if a <= 45. {
+        (format!("Image analysis agrees ({a:.0}\u{b0})"), ARC_COLOR)
+    } else {
+        (format!("Image analysis points {a:.0}\u{b0} away from the GDS"), WARN_COLOR)
+    })
+}
+
+fn band_check_color(c: &BandCheck) -> Color32 {
+    match c {
+        BandCheck::Agree(_) => ARC_COLOR,
+        BandCheck::Disagree(_) => WARN_COLOR,
+        BandCheck::NoBands => Color32::GRAY,
+    }
 }
 
 pub struct RingAssistState {
@@ -118,8 +159,9 @@ pub struct RingAssistState {
     history: VecDeque<Reading>,
     /// Labelled frames shared by all projects.
     dataset: Dataset,
-    /// Stamp waiting for a map click to set its corrected direction.
-    picking: Option<uuid::Uuid>,
+    /// Stamp waiting for a map click: a corrected direction, or the
+    /// direction to the middle for a smallest-ring label.
+    picking: Option<(uuid::Uuid, Pick)>,
     labels_since_train: usize,
     training: Option<crossbeam::channel::Receiver<Report>>,
     report: Option<Report>,
@@ -127,6 +169,12 @@ pub struct RingAssistState {
     /// Analysis of the selected stamp, so the Teach panel doesn't re-run it
     /// on every repaint. Cleared when the settings change.
     teach_cache: Option<(uuid::Uuid, Option<RingStamp>)>,
+    /// GDS placement and labelled stamps the dataset's GDS predictions were
+    /// last brought up to date for.
+    gds_sync_key: Vec<(uuid::Uuid, [f64; 6])>,
+    show_gds: bool,
+    /// Live frame being analysed on a background thread.
+    job: Option<crossbeam::channel::Receiver<(Arc<Box<[f32]>>, Option<Reading>)>>,
 }
 
 impl RingAssistState {
@@ -154,6 +202,9 @@ impl RingAssistState {
             last_good: None,
             history: VecDeque::new(),
             save_with_stamps: true,
+            gds_sync_key: Vec::new(),
+            show_gds: true,
+            job: None,
         }
     }
 
@@ -176,12 +227,25 @@ impl RingAssistState {
     }
 
     /// Call once per UI update after the live image data was refreshed.
-    pub fn update(&mut self, scan_area: &ScanArea, got_forward: bool) {
+    pub fn update(&mut self, scan_area: &ScanArea, got_forward: bool, gds: &[GdsRings]) {
         if !self.enabled {
             return;
         }
+        // GDS predictions are cheap: keep them current if the GDS is moved.
+        for r in self
+            .current
+            .iter_mut()
+            .chain(self.last_good.iter_mut())
+            .chain(self.history.iter_mut())
+        {
+            r.refresh_gds(gds);
+        }
+        self.poll_job(gds);
         self.pending |= got_forward;
-        if !self.pending || self.last_run.is_some_and(|t| t.elapsed() < MIN_INTERVAL) {
+        if self.job.is_some()
+            || !self.pending
+            || self.last_run.is_some_and(|t| t.elapsed() < MIN_INTERVAL)
+        {
             return;
         }
         self.pending = false;
@@ -211,20 +275,50 @@ impl RingAssistState {
             return;
         }
         let frame = scan_area.world_transform * image_transform;
-        if let Some(reading) = self.analyse(&data.data, data.size, frame) {
-            self.last_data = Some(data.data.clone());
-            if reading.complete() && reading.good() {
-                self.last_good = Some(reading.clone());
-            }
-            if reading.complete() {
-                self.history.push_front(reading.clone());
-                self.history.truncate(HISTORY_LEN);
-            }
-            self.current = Some(reading);
-        }
+        // Analyse off the UI thread; the result is picked up by `poll_job`.
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (data, size) = (data.data.clone(), data.size);
+        let (params, min_radius_um) = (self.params, self.min_radius_um);
+        std::thread::spawn(move || {
+            let reading = Self::analyse(&data, size, frame, params, min_radius_um);
+            let _ = tx.send((data, reading));
+            crate::app::request_repaint();
+        });
+        self.job = Some(rx);
     }
 
-    fn analyse(&self, data: &[f32], size: [u32; 2], frame: DAffine2) -> Option<Reading> {
+    /// Take a finished background analysis, if any.
+    fn poll_job(&mut self, gds: &[GdsRings]) {
+        let Some(rx) = &self.job else { return };
+        let (data, reading) = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam::channel::TryRecvError::Empty) => return,
+            Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                self.job = None;
+                return;
+            }
+        };
+        self.job = None;
+        let Some(mut reading) = reading else { return };
+        reading.refresh_gds(gds);
+        self.last_data = Some(data);
+        if reading.complete() && reading.good() {
+            self.last_good = Some(reading.clone());
+        }
+        if reading.complete() {
+            self.history.push_front(reading.clone());
+            self.history.truncate(HISTORY_LEN);
+        }
+        self.current = Some(reading);
+    }
+
+    fn analyse(
+        data: &[f32],
+        size: [u32; 2],
+        frame: DAffine2,
+        params: RingParams,
+        min_radius_um: f64,
+    ) -> Option<Reading> {
         let (w, h) = (size[0] as usize, size[1] as usize);
         if w < 8 || h < 8 || data.len() != w * h {
             return None;
@@ -234,8 +328,8 @@ impl RingAssistState {
             return None;
         }
         let nm_per_px = frame.matrix2.x_axis.length() / w as f64;
-        let mut params = self.params;
-        params.min_ring_radius_px = Some(self.min_radius_um * 1e3 / nm_per_px);
+        let mut params = params;
+        params.min_ring_radius_px = Some(min_radius_um * 1e3 / nm_per_px);
 
         let pre = ring_center::preprocess(data, w, h, &params);
         let res = ring_center::estimate_preprocessed(&pre.img, pre.width, pre.height, pre.scale, &params);
@@ -272,6 +366,7 @@ impl RingAssistState {
             Verdict::Arc { dir } | Verdict::ArmEnd { dir } => Some(dir_to_world(dir)),
             Verdict::Unsure(_) => None,
         };
+        let bands = gds_prior::band_orientation(data, size, nm_per_px);
         Some(Reading {
             at: Instant::now(),
             frame,
@@ -283,6 +378,10 @@ impl RingAssistState {
             move_dir_world,
             features_world,
             edges_world,
+            size,
+            bands,
+            gds: None,
+            band_check: None,
         })
     }
 
@@ -375,6 +474,7 @@ impl RingAssistState {
                 });
             }
         }
+        self.show_gds_section(ui);
         ui.separator();
         match &self.last_good {
             None => {
@@ -399,6 +499,7 @@ impl RingAssistState {
         }
         ui.separator();
         ui.checkbox(&mut self.show_debug, "Show edges and removed features");
+        ui.checkbox(&mut self.show_gds, "Show GDS prediction on the map");
         ui.checkbox(&mut self.save_with_stamps, "Save result with stamps")
             .on_hover_text("Each stamped image keeps its ring result in the project. Hide them with \"Show ring results on stamps\" in the Scan Region menu.");
         if ui.button("Clear trail").clicked() {
@@ -406,7 +507,9 @@ impl RingAssistState {
             self.last_good = None;
         }
 
-        self.show_teach(ui, object_list);
+        let gds = gds_prior::collect(object_list);
+        self.sync_dataset_gds(object_list, &gds);
+        self.show_teach(ui, object_list, &gds);
         self.show_training(ui);
 
         let mut changed = false;
@@ -452,6 +555,71 @@ impl RingAssistState {
         }
     }
 
+    /// The GDS prediction for the current frame, next to the image analysis.
+    fn show_gds_section(&self, ui: &mut Ui) {
+        let Some(cur) = &self.current else { return };
+        ui.separator();
+        ui.label(RichText::new("GDS").strong());
+        let Some(p) = &cur.gds else {
+            ui.label(
+                RichText::new("Not on a GDS ring pattern (load and line up the GDS to use it).")
+                    .weak(),
+            );
+            return;
+        };
+        ui.label(
+            RichText::new(format!(
+                "Ring centre {:.1} \u{b5}m away (estimate from where the GDS sits on the map)",
+                p.dist_nm * 1e-3
+            ))
+            .color(GDS_COLOR),
+        );
+        if p.smallest_in_frame {
+            ui.label(RichText::new("The smallest ring should be in this frame.").color(GDS_COLOR));
+        }
+        if let Some(c) = &cur.band_check {
+            let mut text = c.describe();
+            if matches!(c, BandCheck::Disagree(_)) {
+                text += ": check the GDS alignment";
+            }
+            ui.label(RichText::new(text).color(band_check_color(c)));
+        }
+        if let Some((t, c)) = image_vs_gds(cur.move_dir_world, p) {
+            ui.label(RichText::new(t).color(c));
+        }
+    }
+
+    /// Bring the dataset's stored GDS predictions up to date for the labelled
+    /// stamps in this project, when the GDS or the labels change.
+    fn sync_dataset_gds(&mut self, object_list: &SelectableList<Object>, gds: &[GdsRings]) {
+        let mut key: Vec<(uuid::Uuid, [f64; 6])> =
+            gds.iter().map(|g| (g.uuid, g.transform.to_cols_array())).collect();
+        let mut labelled = Vec::new();
+        for o in object_list.iter() {
+            if let Object::ScanImage { image, .. } = &**o {
+                if image.ring_label.is_some() {
+                    labelled.push(image);
+                    key.push((image.uuid(), image.transform.to_cols_array()));
+                }
+            }
+        }
+        if key == self.gds_sync_key {
+            return;
+        }
+        self.gds_sync_key = key;
+        if gds.is_empty() {
+            return;
+        }
+        let updates: Vec<(String, Option<GdsInfo>)> = labelled
+            .into_iter()
+            .filter(|image| self.dataset.gds_of(&image.uuid().to_string()).is_some())
+            .map(|image| (image.uuid().to_string(), gds_info(gds, image)))
+            .collect();
+        if let Err(e) = self.dataset.update_gds(&updates) {
+            self.label_error = Some(format!("Could not update GDS predictions: {e}"));
+        }
+    }
+
     fn tune(&self) -> TuneParams {
         TuneParams { params: self.params, min_radius_um: self.min_radius_um }
     }
@@ -463,12 +631,17 @@ impl RingAssistState {
     }
 
     /// Label the selected stamp: Good / Correct (click on map) / Should stop.
-    fn show_teach(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+    fn show_teach(
+        &mut self,
+        ui: &mut Ui,
+        object_list: &mut SelectableList<Object>,
+        gds: &[GdsRings],
+    ) {
         ui.separator();
         ui.label(RichText::new("Teach").strong());
-        let (g, c, s) = self.dataset.counts();
+        let (g, c, s, m) = self.dataset.counts();
         ui.label(format!(
-            "{} labels ({g} good, {c} corrected, {s} stop)",
+            "{} labels ({g} good, {c} corrected, {s} stop, {m} smallest ring)",
             self.dataset.len()
         ));
         let selected = object_list
@@ -504,13 +677,23 @@ impl RingAssistState {
             ),
             None => ui.label(format!("{name}: no result")),
         };
+        if let Some(p) = gds_prior::stamp_prior(gds, image) {
+            ui.label(
+                RichText::new(format!(
+                    "GDS: ring centre {:.1} \u{b5}m away, {}",
+                    p.pred.dist_nm * 1e-3,
+                    p.check.describe()
+                ))
+                .color(GDS_COLOR),
+            );
+        }
         if let Some(l) = &image.ring_label {
             ui.label(format!("Your label: {}", l.describe()));
         }
         let good_dir = model
             .filter(|m| !matches!(m.verdict, StampVerdict::Unsure(_)))
             .map(|m| m.dir_quad);
-        let picking = self.picking == Some(image.uuid());
+        let picking = self.picking == Some((image.uuid(), Pick::Correct));
         let mut label = None;
         ui.horizontal(|ui| {
             if ui
@@ -526,7 +709,7 @@ impl RingAssistState {
                 .on_hover_text("Then click on the map where the tip should go")
                 .clicked()
             {
-                self.picking = if picking { None } else { Some(image.uuid()) };
+                self.picking = if picking { None } else { Some((image.uuid(), Pick::Correct)) };
             }
             if ui
                 .button("\u{25A0} Should stop")
@@ -536,15 +719,41 @@ impl RingAssistState {
                 label = Some(RingLabel::Stop);
             }
         });
-        if self.picking == Some(image.uuid()) {
-            ui.label(
-                RichText::new("Click on the map where the tip should go (Esc cancels).")
-                    .color(LABEL_COLOR),
-            );
+        let mut smallest = false;
+        if ui
+            .button("◎ At smallest ring")
+            .on_hover_text(
+                "The smallest middle ring is in this frame (stage 1 reached). \
+                 Then optionally click toward the middle.",
+            )
+            .clicked()
+        {
+            smallest = true;
         }
+        match self.picking {
+            Some((id, Pick::Correct)) if id == image.uuid() => {
+                ui.label(
+                    RichText::new("Click on the map where the tip should go (Esc cancels).")
+                        .color(LABEL_COLOR),
+                );
+            }
+            Some((id, Pick::Middle)) if id == image.uuid() => {
+                ui.label(
+                    RichText::new("Click toward the middle (optional, Esc to skip).")
+                        .color(LABEL_COLOR),
+                );
+            }
+            _ => {}
+        }
+        let g = gds_info(gds, image);
         if let Some(l) = label {
             self.picking = None;
-            self.apply_label(image, &name, l, ui.ctx());
+            self.apply_label(image, &name, l, g, ui.ctx());
+        }
+        if smallest {
+            // Saved now without a direction; a map click can add one.
+            self.apply_label(image, &name, RingLabel::SmallestRing(None), g, ui.ctx());
+            self.picking = Some((image.uuid(), Pick::Middle));
         }
         if let Some(e) = &self.label_error {
             ui.label(RichText::new(e).color(UNSURE_COLOR));
@@ -566,6 +775,7 @@ impl RingAssistState {
         image: &mut LiveImage,
         name: &str,
         label: RingLabel,
+        gds: Option<GdsInfo>,
         ctx: &egui::Context,
     ) {
         let size = image.forward_data.size;
@@ -578,7 +788,17 @@ impl RingAssistState {
             RingLabel::Good(d) => (LabelKind::Good, quad_to_px_dir(d, size)),
             RingLabel::Direction(d) => (LabelKind::Direction, quad_to_px_dir(d, size)),
             RingLabel::Stop => (LabelKind::Stop, DVec2::ZERO),
+            RingLabel::SmallestRing(d) => (
+                LabelKind::SmallestRing,
+                d.map_or(DVec2::ZERO, |d| quad_to_px_dir(d, size)),
+            ),
         };
+        // Adding the direction to an existing smallest-ring label is the same
+        // label, not a new one, for the retrain counter.
+        let refinement = matches!(
+            (image.ring_label, label),
+            (Some(RingLabel::SmallestRing(_)), RingLabel::SmallestRing(Some(_)))
+        );
         let record = Record {
             id: image.uuid().to_string(),
             kind,
@@ -588,12 +808,15 @@ impl RingAssistState {
             nm_per_px,
             source: name.to_string(),
             time: format!("{:?}", time::UtcDateTime::now()),
+            gds,
         };
         match self.dataset.add(record, &image.forward_data.data) {
             Ok(()) => {
                 image.ring_label = Some(label);
                 self.label_error = None;
-                self.labels_since_train += 1;
+                if !refinement {
+                    self.labels_since_train += 1;
+                }
                 if self.training.is_none()
                     && self.labels_since_train >= RETRAIN_EVERY
                     && self.dataset.len() >= RETRAIN_MIN_LABELS
@@ -660,6 +883,23 @@ impl RingAssistState {
             r.new_correct,
             r.n
         ));
+        if r.gds_n > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "GDS prediction: {}/{} right ({:.0}%) on labels with a GDS",
+                    r.gds_correct,
+                    r.gds_n,
+                    100. * r.gds_correct as f64 / r.gds_n as f64
+                ))
+                .color(GDS_COLOR),
+            );
+            ui.label(format!(
+                "GDS where available, else current settings: {}/{} ({:.0}%)",
+                r.combined_correct,
+                r.n,
+                pct(r.combined_correct)
+            ));
+        }
         let mut accept = false;
         let mut dismiss = false;
         if r.is_improvement() {
@@ -691,7 +931,8 @@ impl RingAssistState {
     /// While picking a corrected direction: draw a guide line from the stamp
     /// to the pointer and take the next click on the map as the label.
     pub fn show_label_overlay(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
-        let Some(id) = self.picking else { return };
+        let Some((id, pick)) = self.picking else { return };
+        let gds = gds_prior::collect(object_list);
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.picking = None;
             return;
@@ -716,7 +957,10 @@ impl RingAssistState {
             ui.painter().text(
                 hover + egui::vec2(10., 10.),
                 Align2::LEFT_TOP,
-                "click where the tip should go",
+                match pick {
+                    Pick::Correct => "click where the tip should go",
+                    Pick::Middle => "click toward the middle (Esc to skip)",
+                },
                 FontId::proportional(12.),
                 LABEL_COLOR,
             );
@@ -727,8 +971,13 @@ impl RingAssistState {
                 let q = image.transform.inverse().transform_point2(world);
                 if q.length() > 1e-6 {
                     let name = name.clone();
+                    let g = gds_info(&gds, image);
                     self.picking = None;
-                    self.apply_label(image, &name, RingLabel::Direction(q.normalize()), ui.ctx());
+                    let label = match pick {
+                        Pick::Correct => RingLabel::Direction(q.normalize()),
+                        Pick::Middle => RingLabel::SmallestRing(Some(q.normalize())),
+                    };
+                    self.apply_label(image, &name, label, g, ui.ctx());
                 }
             }
         }
@@ -736,6 +985,8 @@ impl RingAssistState {
 
     /// Re-analyse the current frame on the next update.
     fn rerun(&mut self) {
+        // A result from the old settings is no longer wanted.
+        self.job = None;
         self.teach_cache = None;
         self.last_data = None;
         self.last_run = None;
@@ -804,6 +1055,29 @@ impl RingAssistState {
             FontId::proportional(13.),
             color,
         );
+        if self.show_gds {
+            if let Some(p) = &cur.gds {
+                let a = to_screen(c);
+                let b = to_screen(c + p.dir_world * cur.frame_width() * 0.55);
+                let stroke = Stroke::new(2., GDS_COLOR);
+                painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 8., 4.));
+                let tip = (b - a).normalized() * 11.;
+                painter.arrow(b - tip, tip, stroke);
+                painter.text(
+                    b + egui::vec2(6., 0.),
+                    Align2::LEFT_CENTER,
+                    "GDS",
+                    FontId::proportional(12.),
+                    GDS_COLOR,
+                );
+                if p.dist_nm < 6. * cur.frame_width() {
+                    let pc = to_screen(p.center_world);
+                    painter.circle_stroke(pc, 7., stroke);
+                    painter.line_segment([pc + egui::vec2(-4., 0.), pc + egui::vec2(4., 0.)], stroke);
+                    painter.line_segment([pc + egui::vec2(0., -4.), pc + egui::vec2(0., 4.)], stroke);
+                }
+            }
+        }
         // Ring centre, when it's near enough to be worth drawing.
         if let Some(center) = cur.center_world {
             if (center - c).length() < 3. * cur.frame_width() {
@@ -827,4 +1101,14 @@ impl RingAssistState {
             }
         }
     }
+}
+
+/// The GDS prediction for a stamp, as stored with its label.
+fn gds_info(gds: &[GdsRings], image: &LiveImage) -> Option<GdsInfo> {
+    let (_, p) = gds_prior::predict_any(gds, image.transform)?;
+    let size = image.forward_data.size;
+    Some(GdsInfo {
+        dir: quad_to_px_dir(p.dir_quad(image.transform), size).to_array(),
+        smallest: p.smallest_in_frame,
+    })
 }

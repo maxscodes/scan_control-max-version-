@@ -89,6 +89,9 @@ pub struct SequenceState {
     sweep: SweepSettings,
     load_tx: Sender<Result<Sequence, String>>,
     load_rx: Receiver<Result<Sequence, String>>,
+    /// After a sequence finishes its plan is hidden from the map, until the
+    /// sequence or the selected entry changes (or "Show plan" is clicked).
+    pub(super) plan_hidden: Option<(Sequence, Option<usize>)>,
 }
 
 impl SequenceState {
@@ -116,6 +119,7 @@ impl SequenceState {
             },
             load_tx,
             load_rx,
+            plan_hidden: None,
         }
     }
 
@@ -183,6 +187,7 @@ impl SequenceState {
                 SequenceEvent::Finished => {
                     self.status = "Finished".into();
                     self.run = None;
+                    self.plan_hidden = Some((self.seq.clone(), self.selected));
                 }
                 SequenceEvent::Aborted => {
                     self.status = "Aborted".into();
@@ -207,6 +212,7 @@ impl SequenceState {
     }
 
     fn start(&mut self, from_entry: usize, group: u32, last_dir: Dir) {
+        self.plan_hidden = None;
         let steps = compile(&self.seq, from_entry, last_dir);
         if steps.is_empty() {
             self.last_error = Some("nothing to run (no enabled entries)".into());
@@ -1047,6 +1053,14 @@ impl SequenceState {
             ui.label(progress);
             if self.is_running() {
                 ui.spinner();
+            }
+            if self.plan_hidden.is_some()
+                && ui
+                    .small_button("Show plan")
+                    .on_hover_text("The plan was hidden from the map when the sequence finished")
+                    .clicked()
+            {
+                self.plan_hidden = None;
             }
         });
         if let Some(err) = &self.last_error {

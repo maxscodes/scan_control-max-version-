@@ -115,6 +115,9 @@ pub enum RingLabel {
     Direction(DVec2),
     /// No move wanted here (centre, electrodes).
     Stop,
+    /// The smallest ring is in the frame (stage 1 reached). Optionally the
+    /// direction of the final step into the middle (unit, quad space).
+    SmallestRing(Option<DVec2>),
 }
 
 impl RingLabel {
@@ -123,6 +126,10 @@ impl RingLabel {
             RingLabel::Good(d) => [0., d.x, d.y],
             RingLabel::Direction(d) => [1., d.x, d.y],
             RingLabel::Stop => [2., 0., 0.],
+            RingLabel::SmallestRing(d) => {
+                let d = d.unwrap_or(DVec2::ZERO);
+                [3., d.x, d.y]
+            }
         }
     }
     pub fn from_array(a: [f64; 3]) -> Self {
@@ -130,6 +137,7 @@ impl RingLabel {
         match a[0] as u8 {
             0 => RingLabel::Good(d),
             1 => RingLabel::Direction(d),
+            3 => RingLabel::SmallestRing((d != DVec2::ZERO).then_some(d)),
             _ => RingLabel::Stop,
         }
     }
@@ -138,6 +146,8 @@ impl RingLabel {
             RingLabel::Good(_) => "good",
             RingLabel::Direction(_) => "corrected",
             RingLabel::Stop => "should stop",
+            RingLabel::SmallestRing(Some(_)) => "smallest ring, direction to middle",
+            RingLabel::SmallestRing(None) => "smallest ring",
         }
     }
 }
@@ -250,6 +260,20 @@ pub fn draw(ui: &Ui, stamp_transform: DAffine2, r: Option<&RingStamp>, label: Op
                 LABEL_COLOR,
             );
         }
+        Some(RingLabel::SmallestRing(d)) => {
+            // Concentric-ring marker; plus the step into the middle if given.
+            let m = p + egui::vec2(-16., -16.);
+            painter.circle_stroke(m, 7., Stroke::new(2., LABEL_COLOR));
+            painter.circle_filled(m, 2.5, LABEL_COLOR);
+            if let Some(d) = d {
+                let dir = stamp_transform.transform_vector2(*d).normalize_or_zero();
+                let b = to_screen(c + dir * width * 0.25);
+                let stroke = Stroke::new(2., LABEL_COLOR);
+                painter.extend(egui::Shape::dashed_line(&[p, b], stroke, 4., 3.));
+                let tip = (b - p).normalized() * 9.;
+                painter.arrow(b - tip, tip, stroke);
+            }
+        }
         None => {}
     }
     let Some(r) = r else { return };
@@ -298,6 +322,19 @@ mod tests {
                 valid_fraction: 1.,
             };
             assert_eq!(RingStamp::from_array(r.to_array()), r);
+        }
+    }
+
+    #[test]
+    fn label_round_trip() {
+        for l in [
+            RingLabel::Good(DVec2::new(0.6, 0.8)),
+            RingLabel::Direction(DVec2::new(-1., 0.)),
+            RingLabel::Stop,
+            RingLabel::SmallestRing(None),
+            RingLabel::SmallestRing(Some(DVec2::new(0., -1.))),
+        ] {
+            assert_eq!(RingLabel::from_array(l.to_array()), l);
         }
     }
 

@@ -36,6 +36,13 @@ pub struct LiveImage {
     pub ring: Option<RingStamp>,
     /// The user's training label for this stamp.
     pub ring_label: Option<RingLabel>,
+    /// The GDS (uuid and transform) on the map when this stamp was taken or
+    /// first checked, to warn if the GDS is moved later.
+    pub gds_ref: Option<(Uuid, DAffine2)>,
+    /// Band direction in the forward frame, measured in the background on
+    /// first use.
+    bands: Arc<std::sync::OnceLock<Option<crate::analysis::gds_prior::Bands>>>,
+    bands_queued: std::sync::atomic::AtomicBool,
     uuid: Uuid,
 }
 
@@ -62,8 +69,32 @@ impl LiveImage {
             unit: "".into(),
             ring: None,
             ring_label: None,
+            gds_ref: None,
+            bands: Default::default(),
+            bands_queued: Default::default(),
             uuid,
         }
+    }
+    /// Broad band direction of a stamped Z frame. Measured once, on a
+    /// background thread so drawing never waits: `None` until it's ready.
+    pub fn bands(&self) -> Option<crate::analysis::gds_prior::Bands> {
+        if let Some(b) = self.bands.get() {
+            return *b;
+        }
+        if !self.bands_queued.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let size = self.forward_data.size;
+            if self.unit != "m" || size[0] == 0 {
+                let _ = self.bands.set(None);
+                return None;
+            }
+            let nm_per_px = self.transform.matrix2.x_axis.length() / size[0] as f64;
+            let cell = self.bands.clone();
+            let data = self.forward_data.data.clone();
+            crate::analysis::gds_prior::queue_bands(Box::new(move || {
+                let _ = cell.set(crate::analysis::gds_prior::band_orientation(&data, size, nm_per_px));
+            }));
+        }
+        None
     }
     pub fn show_image(&mut self, ui: &mut Ui) -> Response {
         self.image_view.transform = self.transform;
@@ -197,6 +228,9 @@ impl LiveImage {
             unit: self.unit.clone(),
             ring: None,
             ring_label: None,
+            gds_ref: None,
+            bands: Default::default(),
+            bands_queued: Default::default(),
             uuid: Uuid::new_v4(),
         }
     }
@@ -245,6 +279,9 @@ const RING_TABLE: TableDefinition<Uuid, [f64; 10]> = TableDefinition::new("livei
 /// Optional: only stamps the user labelled have a row.
 const RING_LABEL_TABLE: TableDefinition<Uuid, [f64; 3]> =
     TableDefinition::new("liveimage_ringlabel_table_v1");
+/// Optional: the GDS (uuid, transform) the stamp was taken with.
+const GDS_REF_TABLE: TableDefinition<Uuid, (Uuid, [f64; 6])> =
+    TableDefinition::new("liveimage_gdsref_table_v1");
 
 impl Persistant for LiveImage {
     fn db_update<'t>(
@@ -306,6 +343,17 @@ impl Persistant for LiveImage {
                 None => label_table.remove(id)?,
             };
         }
+        drop(label_table);
+
+        let mut gds_table = txn.open_table(GDS_REF_TABLE)?;
+        let stored = gds_table.get(id)?.map(|v| v.value());
+        let wanted = self.gds_ref.map(|(u, t)| (u, t.to_cols_array()));
+        if stored != wanted {
+            match wanted {
+                Some(v) => gds_table.insert(id, v)?,
+                None => gds_table.remove(id)?,
+            };
+        }
 
         Ok(())
     }
@@ -332,6 +380,8 @@ impl Persistant for LiveImage {
         ring_table.remove(id)?;
         let mut label_table = txn.open_table(RING_LABEL_TABLE)?;
         label_table.remove(id)?;
+        let mut gds_table = txn.open_table(GDS_REF_TABLE)?;
+        gds_table.remove(id)?;
 
         Ok(())
     }
@@ -364,6 +414,10 @@ impl Persistant for LiveImage {
             let mut label_table = txn.open_table(RING_LABEL_TABLE)?;
             label_table.insert(id, l.to_array())?;
         }
+        if let Some((u, t)) = self.gds_ref {
+            let mut gds_table = txn.open_table(GDS_REF_TABLE)?;
+            gds_table.insert(id, (u, t.to_cols_array()))?;
+        }
         Ok(())
     }
 
@@ -390,6 +444,11 @@ impl Persistant for LiveImage {
         let ring = ring_table.get(id)?.map(|v| RingStamp::from_array(v.value()));
         let label_table = txn.open_table(RING_LABEL_TABLE)?;
         let ring_label = label_table.get(id)?.map(|v| RingLabel::from_array(v.value()));
+        let gds_table = txn.open_table(GDS_REF_TABLE)?;
+        let gds_ref = gds_table
+            .get(id)?
+            .map(|v| v.value())
+            .map(|(u, t)| (u, DAffine2::from_cols_array(&t)));
         let mut image = Self::new(id, encoder, DAffine2::from_cols_array(&tran_data));
         image.std_dev = stddev_data;
         image.line_dir = LineDir::try_from(dir_data).unwrap();
@@ -398,6 +457,7 @@ impl Persistant for LiveImage {
         image.unit = unit_data;
         image.ring = ring;
         image.ring_label = ring_label;
+        image.gds_ref = gds_ref;
         [image.forward_data, image.backward_data] = frame_data;
         image.write_and_update_texture(encoder);
         Ok(image)

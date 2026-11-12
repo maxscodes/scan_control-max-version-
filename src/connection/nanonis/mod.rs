@@ -119,6 +119,7 @@ impl Connection for NanonisConnection {
         object_list: &mut SelectableList<view_object::Object>,
         encoder: &ImageEncoder,
     ) {
+        let gds = crate::analysis::gds_prior::collect(object_list);
         let Some((index, scan_area)) = object_list
             .iter_mut()
             .enumerate()
@@ -133,7 +134,7 @@ impl Connection for NanonisConnection {
         let (got_forward, got_backward) =
             self.update_image_data(&mut scan_area.live_image, encoder);
         self.update_sequence(scan_area, encoder, got_forward, got_backward);
-        self.ring_assist.update(scan_area, got_forward);
+        self.ring_assist.update(scan_area, got_forward, &gds);
         self.update_scan_status(scan_area);
         self.update_tip_pos(scan_area);
         self.update_base_name(scan_area);
@@ -152,6 +153,9 @@ impl Connection for NanonisConnection {
                 stamp.forward_data.size,
                 stamp.transform,
             );
+            // Remember where the GDS was, to warn if it is moved later.
+            stamp.gds_ref = crate::analysis::gds_prior::predict_any(&gds, stamp.transform)
+                .map(|(gi, _)| (gds[gi].uuid, gds[gi].transform));
             'try_again: loop {
                 for obj in object_list.iter() {
                     let name = obj.name();
