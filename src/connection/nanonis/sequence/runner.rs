@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 use eyre::Context as _;
-use glam::IVec2;
+use glam::{DVec2, IVec2};
 use nanonis_tcp::{
     blocking::NanonisTcp,
     commands,
@@ -13,6 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::connection::nanonis::{
     sequence::model::{Frame, Speed, Step},
+    spectroscopy::{
+        nanonis_saved_files, run_iv_series, save_batch, IvCurve, IvSeriesSettings, SeriesHost,
+        SeriesOutcome, SharedPlotChoice,
+    },
     worker::{move_args_from_steps, Worker},
 };
 
@@ -26,6 +30,10 @@ const STAMP_TIMEOUT: Duration = Duration::from_secs(15);
 const SLICE: Duration = Duration::from_millis(100);
 /// Timeout passed to Scan.WaitEndOfScan per poll.
 const SCAN_POLL: Duration = Duration::from_millis(500);
+/// The tip counts as arrived within this distance of its target (m).
+const TIP_TOLERANCE_M: f64 = 0.5e-9;
+/// Longest a single tip move may take.
+const TIP_MAX_TIME: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
 pub enum SequenceCommand {
@@ -52,6 +60,13 @@ pub enum SequenceEvent {
     CoarseMoved { steps: IVec2 },
     StampRequest,
     ScanDone { file_path: String },
+    /// An I(V) series started (its base name).
+    SpecStarted { base: String },
+    SpecStatus(String),
+    SpecCurve(IvCurve),
+    /// The series ended; `message` says how and where it was saved. `files`
+    /// are the .dat files Nanonis saved.
+    SpecDone { ok: bool, message: String, files: Vec<std::path::PathBuf> },
     Paused { index: usize },
     Resumed,
     Finished,
@@ -89,6 +104,8 @@ pub struct SequenceWorker {
     ctx: egui::Context,
     commands: Receiver<SequenceCommand>,
     events: Sender<SequenceEvent>,
+    /// Plots chosen in the I(V) window; saved series use the same.
+    plot_choice: SharedPlotChoice,
     state: Option<RunState>,
     abort: bool,
     stamp_done: bool,
@@ -99,11 +116,13 @@ impl SequenceWorker {
         ctx: &egui::Context,
         commands: Receiver<SequenceCommand>,
         events: Sender<SequenceEvent>,
+        plot_choice: &SharedPlotChoice,
     ) -> Self {
         Self {
             ctx: ctx.clone(),
             commands,
             events,
+            plot_choice: plot_choice.clone(),
             state: None,
             abort: false,
             stamp_done: false,
@@ -233,9 +252,12 @@ impl SequenceWorker {
                     warn!("ignoring invalid scan speed {speed} (frame width {width} m)");
                 }
             }
+            Step::MoveTip([x, y]) => return self.move_tip(conn, DVec2::new(x, y) * 1e-9),
+            Step::Spectroscopy(iv) => return self.spectroscopy(conn, &iv),
             Step::SetBias(bias) => conn.bias_set(bias)?,
             Step::SetCurrent(current) => conn.zctrl_setpnt_set(current)?,
-            Step::Scan(dir) => return self.execute_scan(conn, dir.into()),
+            Step::Scan(dir) => return self.execute_scan(conn, dir.into(), false),
+            Step::AwaitScan { dir, include } => return self.await_scan(conn, dir.into(), include),
             Step::Stamp => {
                 self.stamp_done = false;
                 self.emit(SequenceEvent::StampRequest);
@@ -262,15 +284,153 @@ impl SequenceWorker {
         Ok(Outcome::Completed)
     }
 
+    /// Follow Me to `target` (m) and wait until the tip arrives. Abort stops
+    /// the tip where it is; a pause waits for the move to finish.
+    fn move_tip(&mut self, conn: &mut NanonisTcp, target: DVec2) -> NanonisTcpResult<Outcome> {
+        if conn.scan_status_get()?.running {
+            return Err(NanonisTcpError::Api(
+                "a scan is running, so the tip can't be moved".into(),
+            ));
+        }
+        let xy = |conn: &mut NanonisTcp| -> NanonisTcpResult<DVec2> {
+            let r = conn.fol_me_xy_pos_get(true)?;
+            Ok(DVec2::new(r.x_pos, r.y_pos))
+        };
+        let distance = xy(conn)?.distance(target);
+        conn.fol_me_xy_pos_set(target.x, target.y, false)?;
+        // Generous timeout from the Follow Me speed.
+        let speed = (conn.fol_me_speed_get()?.speed as f64).max(1e-10);
+        let timeout = Duration::from_secs_f64((5. * distance / speed + 5.).min(TIP_MAX_TIME.as_secs_f64()));
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain_commands();
+            if self.abort {
+                let here = xy(conn)?;
+                conn.fol_me_xy_pos_set(here.x, here.y, false)?;
+                return Ok(Outcome::Aborted);
+            }
+            let pos = xy(conn)?;
+            if pos.distance(target) <= TIP_TOLERANCE_M {
+                return Ok(Outcome::Completed);
+            }
+            if Instant::now() >= deadline {
+                return Err(NanonisTcpError::Api(format!(
+                    "the tip did not reach ({:.1}, {:.1}) nm within {:.0} s; it is at ({:.1}, {:.1}) nm",
+                    target.x * 1e9,
+                    target.y * 1e9,
+                    timeout.as_secs_f64(),
+                    pos.x * 1e9,
+                    pos.y * 1e9
+                )));
+            }
+            std::thread::sleep(SLICE / 2);
+        }
+    }
+
+    /// Run an I(V) series where the tip is (same steps as the I(V) window),
+    /// then save it to the Nanonis session folder. A pause waits for the
+    /// series to finish; abort stops after the curve in progress.
+    fn spectroscopy(&mut self, conn: &mut NanonisTcp, iv: &IvSeriesSettings) -> NanonisTcpResult<Outcome> {
+        iv.validate().map_err(NanonisTcpError::Api)?;
+        self.emit(SequenceEvent::SpecStarted { base: iv.base_name.clone() });
+        let since = std::time::SystemTime::now();
+        let mut host = RunnerHost { worker: self, curves: Vec::new() };
+        let outcome = run_iv_series(conn, iv, &mut host);
+        let curves = host.curves;
+        if let SeriesOutcome::ConnectionLost(e) = outcome {
+            self.emit(SequenceEvent::SpecDone {
+                ok: false,
+                message: format!("I(V) series {} lost the connection: {e}", iv.base_name),
+                files: Vec::new(),
+            });
+            return Err(e);
+        }
+        // Save whatever was taken, also after an abort or error.
+        let session = conn.util_session_path_get().unwrap_or_default();
+        let files = nanonis_saved_files(&session, iv, since);
+        let saved = if curves.is_empty() {
+            Ok(String::new())
+        } else {
+            if session.trim().is_empty() {
+                Err("Nanonis reported no session folder, so the curves were not saved".to_string())
+            } else {
+                let choice = self.plot_choice.lock().clone();
+                save_batch(std::path::Path::new(&session), &iv.base_name, &curves, &choice, &files)
+                    .map(|(_, msg)| msg)
+            }
+        };
+        let (ok, mut message) = match &outcome {
+            SeriesOutcome::Finished => (true, format!("I(V) series {} done.", iv.base_name)),
+            SeriesOutcome::Aborted => (false, format!("I(V) series {} aborted; Z feedback left OFF.", iv.base_name)),
+            SeriesOutcome::Failed(msg) => (false, format!("I(V) series {} failed: {msg}. Z feedback left OFF.", iv.base_name)),
+            SeriesOutcome::ConnectionLost(_) => unreachable!(),
+        };
+        let save_failed = saved.is_err();
+        match saved {
+            Ok(msg) if !msg.is_empty() => message = format!("{message} {msg}"),
+            Ok(_) => {}
+            Err(e) => message = format!("{message} {e}"),
+        }
+        self.emit(SequenceEvent::SpecDone { ok: ok && !save_failed, message: message.clone(), files });
+        match outcome {
+            SeriesOutcome::Finished if save_failed => {
+                // Don't carry on losing data: hold after this step.
+                self.emit(SequenceEvent::Error { index: self.state.as_ref().map_or(0, |s| s.index), message });
+                if let Some(state) = &mut self.state {
+                    state.pause_requested = true;
+                }
+                Ok(Outcome::Completed)
+            }
+            SeriesOutcome::Finished => Ok(Outcome::Completed),
+            SeriesOutcome::Aborted => Ok(Outcome::Aborted),
+            _ => Err(NanonisTcpError::Api(message)),
+        }
+    }
+
     fn set_scan_phase(&mut self, phase: ScanPhase) {
         if let Some(state) = &mut self.state {
             state.scan = phase;
         }
     }
 
+    /// Wait for a scan started outside the sequence to end. Included: it is
+    /// treated like a sequence scan (Pause pauses it, Abort stops it).
+    /// Otherwise Pause/Abort only stop waiting and the scan keeps running.
+    fn await_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir, include: bool) -> NanonisTcpResult<Outcome> {
+        let phase = self.state.as_ref().map_or(ScanPhase::NotStarted, |s| s.scan);
+        if phase == ScanPhase::NotStarted {
+            if !conn.scan_status_get()?.running {
+                info!("no scan running when the sequence reached it; continuing");
+                return Ok(Outcome::Completed);
+            }
+            if include {
+                self.set_scan_phase(ScanPhase::Running(dir));
+            }
+        }
+        if include {
+            // Adopted: from here on it behaves like a scan this sequence started.
+            return self.execute_scan(conn, dir, true);
+        }
+        loop {
+            self.drain_commands();
+            if self.abort {
+                return Ok(Outcome::Aborted);
+            }
+            if self.pause_requested() {
+                return Ok(Outcome::Interrupted);
+            }
+            let resp = conn.scan_wait_end_of_scan(Some(SCAN_POLL))?;
+            if !resp.timed_out || !conn.scan_status_get()?.running {
+                return Ok(Outcome::Completed);
+            }
+        }
+    }
+
     /// Start (or resume) the scan and wait for it to end, reacting to Pause
-    /// and Abort while it runs.
-    fn execute_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir) -> NanonisTcpResult<Outcome> {
+    /// and Abort while it runs. `check_running`: also stop waiting when Nanonis
+    /// says no scan is running (for a scan the sequence didn't start, which
+    /// may already have been stopped by hand).
+    fn execute_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir, check_running: bool) -> NanonisTcpResult<Outcome> {
         let phase = self.state.as_ref().map_or(ScanPhase::NotStarted, |s| s.scan);
         let dir = match phase {
             ScanPhase::NotStarted => {
@@ -312,6 +472,11 @@ impl SequenceWorker {
                 });
                 return Ok(Outcome::Completed);
             }
+            if check_running && !conn.scan_status_get()?.running {
+                info!("scan stopped outside the sequence; continuing");
+                self.set_scan_phase(ScanPhase::NotStarted);
+                return Ok(Outcome::Completed);
+            }
         }
     }
 
@@ -332,6 +497,25 @@ impl SequenceWorker {
         self.state = None;
         self.abort = false;
         self.emit(SequenceEvent::Aborted);
+    }
+}
+
+/// Lets the shared I(V) series report to the sequence UI and see Abort.
+struct RunnerHost<'a> {
+    worker: &'a mut SequenceWorker,
+    curves: Vec<IvCurve>,
+}
+impl SeriesHost for RunnerHost<'_> {
+    fn aborted(&mut self) -> bool {
+        self.worker.drain_commands();
+        self.worker.abort
+    }
+    fn status(&mut self, text: String) {
+        self.worker.emit(SequenceEvent::SpecStatus(text));
+    }
+    fn curve(&mut self, curve: IvCurve) {
+        self.curves.push(curve.clone());
+        self.worker.emit(SequenceEvent::SpecCurve(curve));
     }
 }
 
@@ -378,12 +562,12 @@ impl Worker for SequenceWorker {
 
         let (index, step, group) = {
             let s = self.state.as_ref().unwrap();
-            (s.index, s.steps[s.index].1, s.group)
+            (s.index, s.steps[s.index].1.clone(), s.group)
         };
         self.emit(SequenceEvent::StepStarted { index });
         debug!("sequence step {index}: {step}");
 
-        match self.execute(conn, step, group) {
+        match self.execute(conn, step.clone(), group) {
             Ok(Outcome::Completed) => {
                 let state = self.state.as_mut().unwrap();
                 state.index += 1;

@@ -7,6 +7,8 @@ use nanonis_tcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::connection::nanonis::spectroscopy::IvSeriesSettings;
+
 /// A planned series of scans. Each entry is one image; it expands into a
 /// flat list of [`Step`]s which is what the runner actually executes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -40,6 +42,48 @@ pub struct ScanEntry {
     pub dir: Dir,
     /// Stamp the finished image into the layer list.
     pub stamp: bool,
+    /// Take the scan. Off: the entry only sets things up, moves the tip and
+    /// runs spectroscopy.
+    pub scan: bool,
+    /// Tip positions visited after the scan, each with an optional I(V) series.
+    pub tip: TipPlan,
+}
+
+/// Fine tip moves (Follow Me) after an entry's scan, with an optional I(V)
+/// series at each position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TipPlan {
+    /// Tip positions in piezo nm (same coordinates as the frame centre).
+    pub points: Vec<[f64; 2]>,
+    /// Run an I(V) series at each position; off just moves the tip there.
+    pub spectroscopy: bool,
+    /// Series settings. Each position gets its own base name, `<base>_P01`…
+    pub iv: IvSeriesSettings,
+    /// Wait after the tip arrives at each position, in s.
+    pub settle_s: f64,
+}
+impl Default for TipPlan {
+    fn default() -> Self {
+        Self {
+            points: Vec::new(),
+            spectroscopy: true,
+            iv: IvSeriesSettings::default(),
+            settle_s: 1.,
+        }
+    }
+}
+impl TipPlan {
+    /// Base name of the series at position `k` (0-based) of entry `name`.
+    pub fn point_base_name(&self, entry_name: &str, k: usize) -> String {
+        let base = self.iv.base_name.trim();
+        let name = entry_name.trim().replace(char::is_whitespace, "_");
+        if name.is_empty() {
+            format!("{base}_P{:02}", k + 1)
+        } else {
+            format!("{base}_{name}_P{:02}", k + 1)
+        }
+    }
 }
 impl Default for ScanEntry {
     fn default() -> Self {
@@ -57,6 +101,8 @@ impl Default for ScanEntry {
             wait_after_s: 0.,
             dir: Dir::Alternate,
             stamp: true,
+            scan: true,
+            tip: TipPlan::default(),
         }
     }
 }
@@ -274,7 +320,7 @@ fn normalize_degrees(a: f64) -> f64 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     Withdraw,
     CoarseMove { steps: [i32; 2] },
@@ -287,6 +333,47 @@ pub enum Step {
     SetCurrent(f32),
     Scan(Dir),
     Stamp,
+    /// Follow Me: move the tip to this piezo position (nm) and wait until it
+    /// arrives.
+    MoveTip([f64; 2]),
+    /// An I(V) series where the tip is; saved automatically.
+    Spectroscopy(IvSeriesSettings),
+    /// Wait for the scan already running in Nanonis (started by hand) to end,
+    /// without starting one. `include`: the scan is part of the sequence, so
+    /// Pause/Abort act on it; otherwise the sequence only queues behind it
+    /// and Abort leaves it running. Done at once if no scan is running.
+    AwaitScan { dir: Dir, include: bool },
+}
+
+/// Entry index of the steps that belong to the scan that was already
+/// running when the sequence started (see [`with_current_scan`]).
+pub const CURRENT_SCAN: usize = usize::MAX;
+
+/// What to do with a scan that is running when the sequence starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentScan {
+    /// Start the sequence once it ends.
+    After,
+    /// Make it the first scan of the sequence (stamped, pausable).
+    Include,
+}
+
+/// Put the handling of the running scan (direction `dir`) in front of
+/// `steps`. Compile `steps` with `dir` as the last direction so alternating
+/// entries follow on from it.
+pub fn with_current_scan(
+    steps: Vec<(usize, Step)>,
+    mode: CurrentScan,
+    dir: Dir,
+    stamp: bool,
+) -> Vec<(usize, Step)> {
+    let include = mode == CurrentScan::Include;
+    let mut out = vec![(CURRENT_SCAN, Step::AwaitScan { dir, include })];
+    if include && stamp {
+        out.push((CURRENT_SCAN, Step::Stamp));
+    }
+    out.extend(steps);
+    out
 }
 impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -302,6 +389,16 @@ impl fmt::Display for Step {
             Step::SetCurrent(i) => write!(f, "Set current {} pA", i * 1e12),
             Step::Scan(d) => write!(f, "Scan {} (wait for end)", d.arrow()),
             Step::Stamp => write!(f, "Stamp image"),
+            Step::MoveTip([x, y]) => write!(f, "Tip to ({x:.1}, {y:.1}) nm"),
+            Step::Spectroscopy(iv) => write!(
+                f,
+                "I(V) series {}: {} curves, {:+} pm/curve",
+                iv.base_name, iv.num_curves, iv.z_step_pm
+            ),
+            Step::AwaitScan { dir, include: true } => {
+                write!(f, "Current scan {} (wait for end)", dir.arrow())
+            }
+            Step::AwaitScan { include: false, .. } => write!(f, "Wait for the current scan to end"),
         }
     }
 }
@@ -309,7 +406,8 @@ impl fmt::Display for Step {
 /// Expand one entry into its flat step list. Order:
 /// `[Withdraw] → [CoarseMove] → [Approach] → [Wait settle] → [SetFrame] →
 /// [SetResolution] → [SetSpeed] → [SetBias] → [SetCurrent] → [Wait before] →
-/// Scan → [Stamp] → [Wait after]`
+/// [Scan → [Stamp]] → per tip position: MoveTip → [Wait settle] →
+/// [Spectroscopy] → [Wait after]`
 ///
 /// The scan direction may still be [`Dir::Alternate`]; [`compile`] resolves it.
 pub fn expand(entry: &ScanEntry) -> Vec<Step> {
@@ -349,9 +447,23 @@ pub fn expand(entry: &ScanEntry) -> Vec<Step> {
     if entry.wait_before_s > 0. {
         steps.push(Step::Wait(entry.wait_before_s));
     }
-    steps.push(Step::Scan(entry.dir));
-    if entry.stamp {
-        steps.push(Step::Stamp);
+    if entry.scan {
+        steps.push(Step::Scan(entry.dir));
+        if entry.stamp {
+            steps.push(Step::Stamp);
+        }
+    }
+    let tip = &entry.tip;
+    for (k, &p) in tip.points.iter().enumerate() {
+        steps.push(Step::MoveTip(p));
+        if tip.settle_s > 0. {
+            steps.push(Step::Wait(tip.settle_s));
+        }
+        if tip.spectroscopy {
+            let mut iv = tip.iv.clone();
+            iv.base_name = tip.point_base_name(&entry.name, k);
+            steps.push(Step::Spectroscopy(iv));
+        }
     }
     if entry.wait_after_s > 0. {
         steps.push(Step::Wait(entry.wait_after_s));
@@ -437,6 +549,50 @@ mod tests {
     }
 
     #[test]
+    fn tip_points_follow_the_scan() {
+        let mut e = ScanEntry {
+            name: "row 1".into(),
+            wait_after_s: 2.,
+            ..Default::default()
+        };
+        e.tip.points = vec![[1., 2.], [3., 4.]];
+        e.tip.settle_s = 0.5;
+        e.tip.iv.base_name = "IV".into();
+        let steps = expand(&e);
+        let mut iv1 = e.tip.iv.clone();
+        iv1.base_name = "IV_row_1_P01".into();
+        let mut iv2 = e.tip.iv.clone();
+        iv2.base_name = "IV_row_1_P02".into();
+        assert_eq!(
+            steps,
+            vec![
+                Step::Scan(Dir::Alternate),
+                Step::Stamp,
+                Step::MoveTip([1., 2.]),
+                Step::Wait(0.5),
+                Step::Spectroscopy(iv1),
+                Step::MoveTip([3., 4.]),
+                Step::Wait(0.5),
+                Step::Spectroscopy(iv2),
+                Step::Wait(2.),
+            ]
+        );
+        // No scan, tip moves only.
+        e.scan = false;
+        e.tip.spectroscopy = false;
+        e.tip.settle_s = 0.;
+        e.wait_after_s = 0.;
+        assert_eq!(expand(&e), vec![Step::MoveTip([1., 2.]), Step::MoveTip([3., 4.])]);
+    }
+
+    #[test]
+    fn old_files_load_with_a_scan_and_no_tip_moves() {
+        let seq: Sequence = serde_json::from_str(r#"{"entries":[{"name":"a"}]}"#).unwrap();
+        assert!(seq.entries[0].scan);
+        assert!(seq.entries[0].tip.points.is_empty());
+    }
+
+    #[test]
     fn compile_skips_disabled() {
         let seq = Sequence {
             entries: vec![
@@ -485,6 +641,26 @@ mod tests {
         assert_eq!(dirs, vec![Dir::Up, Dir::Down, Dir::Up, Dir::Down]);
         // Starting later only includes later entries.
         assert_eq!(compile(&seq, 2, Dir::Up)[0], (2, Step::Scan(Dir::Down)));
+    }
+
+    #[test]
+    fn current_scan_goes_first() {
+        let seq = Sequence {
+            entries: vec![ScanEntry::default()],
+        };
+        let steps = with_current_scan(compile(&seq, 0, Dir::Up), CurrentScan::Include, Dir::Up, true);
+        assert_eq!(
+            steps,
+            vec![
+                (CURRENT_SCAN, Step::AwaitScan { dir: Dir::Up, include: true }),
+                (CURRENT_SCAN, Step::Stamp),
+                (0, Step::Scan(Dir::Down)),
+                (0, Step::Stamp),
+            ]
+        );
+        let steps = with_current_scan(compile(&seq, 0, Dir::Up), CurrentScan::After, Dir::Up, true);
+        assert_eq!(steps[0], (CURRENT_SCAN, Step::AwaitScan { dir: Dir::Up, include: false }));
+        assert_eq!(steps[1], (0, Step::Scan(Dir::Down)));
     }
 
     #[test]

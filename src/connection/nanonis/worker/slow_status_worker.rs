@@ -37,6 +37,8 @@ pub struct SlowStatusWorker {
     channel_state: SharedState<ChannelState>,
     scan_status: SharedState<ScanStatus>,
     base_name: SharedState<String>,
+    session_path: SharedState<String>,
+    last_session_check: Option<Instant>,
     course_voltages: SharedState<DVec2>,
     course_reciever: CommandChannelReciever<CourseMoveCommand, ()>,
     scan_reciever: CommandChannelReciever<ScanCommand, ()>,
@@ -51,6 +53,7 @@ impl SlowStatusWorker {
         channel_state: &SharedState<ChannelState>,
         scan_status: &SharedState<ScanStatus>,
         base_name: &SharedState<String>,
+        session_path: &SharedState<String>,
         course_voltages: &SharedState<DVec2>,
         course_reciever: &CommandChannelReciever<CourseMoveCommand, ()>,
         scan_reciever: &CommandChannelReciever<ScanCommand, ()>,
@@ -63,6 +66,8 @@ impl SlowStatusWorker {
             channel_state: channel_state.clone(),
             scan_status: scan_status.clone(),
             base_name: base_name.clone(),
+            session_path: session_path.clone(),
+            last_session_check: None,
             course_voltages: course_voltages.clone(),
             course_reciever: course_reciever.clone(),
             scan_reciever: scan_reciever.clone(),
@@ -81,7 +86,11 @@ impl SlowStatusWorker {
             ScanCommand::Pause => (ActionType::Pause, current_dir),
             ScanCommand::Resume => (ActionType::Resume, current_dir),
             ScanCommand::Stop => (ActionType::Stop, current_dir),
-            ScanCommand::Save | ScanCommand::SetBias(_) | ScanCommand::SetSetpoint(_) => {
+            ScanCommand::Save
+            | ScanCommand::SetBias(_)
+            | ScanCommand::SetSetpoint(_)
+            | ScanCommand::MoveTip { .. }
+            | ScanCommand::HaltTip => {
                 let result = match cmd {
                     ScanCommand::Save => conn
                         .scan_save(true, Some(Duration::from_secs(20)))
@@ -92,6 +101,10 @@ impl SlowStatusWorker {
                         }),
                     ScanCommand::SetBias(v) => conn.bias_set(v),
                     ScanCommand::SetSetpoint(v) => conn.zctrl_setpnt_set(v),
+                    ScanCommand::MoveTip { x, y } => conn.fol_me_xy_pos_set(x, y, false),
+                    ScanCommand::HaltTip => conn
+                        .fol_me_xy_pos_get(false)
+                        .and_then(|p| conn.fol_me_xy_pos_set(p.x_pos, p.y_pos, false)),
                     _ => Ok(()),
                 };
                 // Show the new values straight away.
@@ -234,6 +247,22 @@ impl SlowStatusWorker {
         }
         Ok(())
     }
+    /// The Nanonis save folder, checked every few seconds. Older Nanonis
+    /// versions without the command just leave it empty.
+    fn update_session_path(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
+        if self.last_session_check.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+            return Ok(());
+        }
+        self.last_session_check = Some(Instant::now());
+        match conn.util_session_path_get() {
+            Ok(path) => {
+                self.session_path.modify_conditional(|prev| *prev != path, |prev| *prev = path.clone());
+                Ok(())
+            }
+            Err(NanonisTcpError::Api(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
     fn update_course_voltages(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
         let err_pred = |e: &NanonisTcpError| matches!(e, NanonisTcpError::Api(_));
         let default = if DEBUG_COURSE { 5. } else { 0. };
@@ -264,6 +293,8 @@ impl Worker for SlowStatusWorker {
             .context("failed update_channel_opts")?;
         self.update_base_name(conn)
             .context("failed update_base_name")?;
+        self.update_session_path(conn)
+            .context("failed update_session_path")?;
         self.update_course_voltages(conn)
             .context("failed update_course_voltages")?;
         self.execute_scan_command(conn)

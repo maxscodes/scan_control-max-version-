@@ -53,12 +53,14 @@ float-ord = "0.3.2"
 gdsr = "0.0.1-alpha.3"
 crossbeam = "0.8.4"
 rfd = "0.17.2"
+raw-window-handle = "0.6"
 directories = "6.0.0"
 redb = { version = "4.0.0", features = ["uuid"] }
 tempfile = "3.27.0"
 num_enum.workspace = true
 time-fmt = "0.3.8"
 time = "0.3.47"
+resvg = "0.45"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Console"] }

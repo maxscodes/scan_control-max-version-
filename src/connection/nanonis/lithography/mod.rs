@@ -3,6 +3,7 @@
 //! Ported from the Python lithography GUI v1.18.
 
 mod path;
+mod shapes;
 mod window;
 mod worker;
 

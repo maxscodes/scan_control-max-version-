@@ -1,5 +1,6 @@
 //! Ring Assist: runs the ring-centre estimator on live frames and draws what
-//! it would do on the map. Display only. It never moves the tip.
+//! it would do on the map. It only moves the tip in semi-auto centring, after
+//! the user confirms each coarse move.
 //!
 //! It also keeps the last frame that gave a confident verdict. When a frame is
 //! unsure, the planned fallback (for when movement is added) is to move half
@@ -12,16 +13,19 @@ use std::{
 };
 
 use egui::{Align2, Color32, FontId, Id, RichText, Stroke, Ui};
-use glam::{DAffine2, DVec2};
+use glam::{DAffine2, DVec2, IVec2};
 
 use crate::{
     analysis::{
         gds_prior::{self, BandCheck, Bands, GdsPrediction, GdsRings},
+        landing::{self, Track, View as LandingView},
         ring_center::{self, RingParams, Verdict},
         ring_stamp::{
             self, quad_to_px_dir, RingLabel, RingStamp, StampVerdict, ARC_COLOR, ARM_COLOR,
             LABEL_COLOR, UNSURE_COLOR,
         },
+        ring_live::{self, JointCheck, LiveMatch, MoveLimits, MovePlan, Shot},
+        ring_match::{MatchMode, MatchParams},
         ring_training::{self, Dataset, GdsInfo, LabelKind, Record, Report, TuneParams},
     },
     components::selectable_list::SelectableList,
@@ -30,6 +34,8 @@ use crate::{
     utils::vec_interop::{IntoEgui as _, IntoGlam as _},
     view_object::Object,
 };
+
+use super::course_motion::CourseMotionState;
 
 /// What a map click sets while picking.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +65,57 @@ const GOOD_COLOR: Color32 = Color32::from_rgb(0x9a, 0xe6, 0xa8);
 use crate::analysis::gds_prior::GDS_COLOR;
 const WARN_COLOR: Color32 = Color32::from_rgb(0xff, 0xb3, 0x47);
 const FEATURE_COLOR: Color32 = Color32::from_rgb(0x00, 0xc8, 0xff);
+/// Ring match direction: sure / unsure.
+const SURE_COLOR: Color32 = Color32::from_rgb(0x4c, 0xe0, 0x6a);
+const UNSURE_MATCH_COLOR: Color32 = Color32::from_rgb(0xff, 0xd8, 0x3a);
+const PLAN_COLOR: Color32 = Color32::from_rgb(0xff, 0x8c, 0x1a);
+/// Landing guesses on the map.
+const LANDING_COLOR: Color32 = Color32::from_rgb(0xff, 0x6e, 0xc7);
+/// Landing counts as sure when this share of the odds agrees on the way.
+const LANDING_SURE: f64 = 0.8;
+/// A frame this far (world nm) from the track's last one starts a new track.
+const LANDING_RESET_NM: f64 = 150_000.;
+/// Guesses listed in the window.
+const LANDING_LIST: usize = 5;
+
+/// The landing track and the GDS it is on.
+struct LandingTrack {
+    gds: uuid::Uuid,
+    track: Track,
+}
+
+/// What a background analysis sends back.
+struct JobResult {
+    data: Arc<Box<[f32]>>,
+    reading: Option<Reading>,
+    /// The landing track after this frame, and the GDS it is on.
+    landing: Option<(uuid::Uuid, LandingView)>,
+    /// The job started the landing track over.
+    reset: bool,
+}
+
+/// A coarse move waiting for the user's go-ahead.
+struct Proposal {
+    /// The reading it was made from.
+    reading_at: Instant,
+    plan: MovePlan,
+    steps: IVec2,
+    /// Frame centre (world) the move starts from.
+    from: DVec2,
+    sure: bool,
+    /// Why the move can't be made, if so.
+    problem: Option<String>,
+}
+
+/// Where semi-auto centring is.
+enum Centring {
+    Idle,
+    /// A move this module started is running.
+    Moving,
+    /// Moved; waiting for a frame scanned after the move (seen partial,
+    /// then complete).
+    AwaitingFresh { moved_at: Instant, seen_partial: bool },
+}
 
 #[derive(Clone)]
 pub struct Reading {
@@ -83,9 +140,47 @@ pub struct Reading {
     /// What the GDS predicts here (refreshed when the GDS moves).
     gds: Option<GdsPrediction>,
     band_check: Option<BandCheck>,
+    /// The analysed frame (forward), for checking it against later frames.
+    shot: Shot,
+    /// Ring match (no GDS placement needed), on complete frames.
+    live: Option<LiveMatch>,
+    /// This frame checked together with the frame before the last move.
+    joint: Option<JointCheck>,
 }
 
 impl Reading {
+    /// Where the ring match puts the centre, and whether the direction is
+    /// sure: from the check across frames when there is one, else from this
+    /// frame alone.
+    fn ring_target(&self, p: &MatchParams) -> Option<(DVec2, bool)> {
+        match (&self.joint, &self.live) {
+            (Some(j), _) => Some((j.center_world, j.agrees || j.gap >= p.sure_gap)),
+            (None, Some(m)) => Some((m.center_world, m.sure(p))),
+            _ => None,
+        }
+    }
+    /// One line on the ring match.
+    fn match_summary(&self, p: &MatchParams) -> Option<(String, Color32)> {
+        let m = self.live.as_ref()?;
+        let (_, sure) = self.ring_target(p)?;
+        let side = if m.backward { " (backward scan)" } else { "" };
+        let mut t = format!(
+            "Ring match {:.2}{side}, direction {} (gap {:.3})",
+            m.score,
+            if sure { "sure" } else { "unsure" },
+            m.gap
+        );
+        if let Some(j) = &self.joint {
+            t += if j.overrides_current {
+                "; frame before the move says the other way"
+            } else if j.agrees {
+                "; agrees with the frame before the move"
+            } else {
+                "; checked with the frame before the move"
+            };
+        }
+        Some((t, if sure { SURE_COLOR } else { UNSURE_MATCH_COLOR }))
+    }
     fn complete(&self) -> bool {
         self.valid_fraction >= COMPLETE_FRACTION
     }
@@ -148,6 +243,11 @@ pub struct RingAssistState {
     save_with_stamps: bool,
     params: RingParams,
     min_radius_um: f64,
+    /// GDS matching settings (only changed by retraining for now).
+    matching: MatchParams,
+    /// Ring kinds (band radii, world nm) of the GDS on the map, for blind
+    /// matching in retraining.
+    ring_kinds_nm: Vec<Vec<(f64, f64)>>,
     last_run: Option<Instant>,
     /// New frame data has arrived but hasn't been analysed yet.
     pending: bool,
@@ -174,7 +274,34 @@ pub struct RingAssistState {
     gds_sync_key: Vec<(uuid::Uuid, [f64; 6])>,
     show_gds: bool,
     /// Live frame being analysed on a background thread.
-    job: Option<crossbeam::channel::Receiver<(Arc<Box<[f32]>>, Option<Reading>)>>,
+    job: Option<crossbeam::channel::Receiver<JobResult>>,
+    /// GDS placement the ring kinds were last taken from.
+    kinds_key: Vec<(uuid::Uuid, [f64; 6])>,
+    /// Also match the backward scan and keep the better fit. Off by default:
+    /// on the labelled frames it fixed 3 but broke 5 (forward 26/40, better
+    /// fit 24/40).
+    use_backward: bool,
+    /// Semi-auto centring: propose a coarse move after each frame, and make
+    /// it when the user agrees.
+    semi_auto: bool,
+    limits: MoveLimits,
+    proposal: Option<Proposal>,
+    /// Reading a proposal was already made (or skipped) for.
+    proposed_for: Option<Instant>,
+    centring: Centring,
+    /// Recent centring actions, newest first.
+    centring_log: VecDeque<String>,
+    /// Guess where complete frames are on the GDS.
+    landing_on: bool,
+    /// Updated by the analysis jobs (one at a time).
+    landing: Arc<parking_lot::Mutex<Option<LandingTrack>>>,
+    /// Start the landing track over with the next complete frame.
+    landing_reset: bool,
+    landing_view: Option<(uuid::Uuid, LandingView)>,
+    /// Guess picked in the list, for the map and Shift GDS.
+    landing_pick: usize,
+    /// GDS position before the last landing shift, for Undo.
+    landing_undo: Option<(uuid::Uuid, DAffine2)>,
 }
 
 impl RingAssistState {
@@ -187,6 +314,7 @@ impl RingAssistState {
             show_debug: false,
             params: tune.params,
             min_radius_um: tune.min_radius_um,
+            matching: tune.matching,
             dataset: Dataset::load(Dataset::default_dir()),
             picking: None,
             labels_since_train: 0,
@@ -205,6 +333,21 @@ impl RingAssistState {
             gds_sync_key: Vec::new(),
             show_gds: true,
             job: None,
+            ring_kinds_nm: load_kinds(),
+            kinds_key: Vec::new(),
+            use_backward: false,
+            semi_auto: false,
+            limits: MoveLimits::default(),
+            proposal: None,
+            proposed_for: None,
+            centring: Centring::Idle,
+            centring_log: VecDeque::new(),
+            landing_on: true,
+            landing: Default::default(),
+            landing_reset: false,
+            landing_view: None,
+            landing_pick: 0,
+            landing_undo: None,
         }
     }
 
@@ -240,6 +383,7 @@ impl RingAssistState {
         {
             r.refresh_gds(gds);
         }
+        self.sync_kinds(gds);
         self.poll_job(gds);
         self.pending |= got_forward;
         if self.job.is_some()
@@ -278,10 +422,57 @@ impl RingAssistState {
         // Analyse off the UI thread; the result is picked up by `poll_job`.
         let (tx, rx) = crossbeam::channel::bounded(1);
         let (data, size) = (data.data.clone(), data.size);
+        let bwd = &scan_area.live_image.backward_data;
+        let bwd = (self.use_backward && bwd.size == size).then(|| Shot { data: bwd.data.clone(), size, frame });
         let (params, min_radius_um) = (self.params, self.min_radius_um);
+        let (kinds, matching) = (self.ring_kinds_nm.clone(), self.matching);
+        // The latest matched frame somewhere else (before a move), to check
+        // this one against.
+        let prev = self
+            .history
+            .iter()
+            .find(|r| r.live.is_some() && (r.frame_center() - frame.translation).length() > 0.2 * r.frame_width())
+            .map(|r| (r.shot.clone(), r.live.clone().unwrap()));
+        // Landing on the GDS that covers the frame, else the first with rings.
+        let land = if self.landing_on {
+            let near = gds_prior::predict_any(gds, frame).and_then(|(i, _)| gds.get(i));
+            near.filter(|g| g.landing.is_some())
+                .or_else(|| gds.iter().find(|g| g.landing.is_some()))
+                .map(|g| (g.uuid, g.transform, g.landing.clone().unwrap()))
+        } else {
+            None
+        };
+        let (track, reset, landing_p) = (self.landing.clone(), self.landing_reset, landing::params(&matching));
         std::thread::spawn(move || {
-            let reading = Self::analyse(&data, size, frame, params, min_radius_um);
-            let _ = tx.send((data, reading));
+            let mut reading = Self::analyse(&data, size, frame, params, min_radius_um);
+            if let Some(r) = reading.as_mut().filter(|r| r.complete()) {
+                r.live = ring_live::match_shot(&r.shot, bwd.as_ref(), &kinds, &matching);
+                if let (Some(m), Some((ps, pm))) = (&r.live, &prev) {
+                    r.joint = ring_live::joint_check(ps, pm, &r.shot, m, &kinds, &matching);
+                }
+            }
+            let landing = match (reading.as_ref().filter(|r| r.complete()), land) {
+                (Some(r), Some((uuid, transform, source))) => {
+                    let mut guard = track.lock();
+                    let fresh = reset
+                        || guard.as_ref().is_none_or(|t| {
+                            t.gds != uuid
+                                || !t.track.same_gds(transform)
+                                || t.track.latest().is_some_and(|l| (l.center() - r.shot.center()).length() > LANDING_RESET_NM)
+                        });
+                    if fresh {
+                        *guard = Some(LandingTrack { gds: uuid, track: Track::new(source.library(), transform) });
+                    }
+                    let t = &mut guard.as_mut().unwrap().track;
+                    if !t.has(&r.shot) {
+                        t.add(r.shot.clone(), &landing_p);
+                    }
+                    t.view().map(|v| (uuid, v))
+                }
+                _ => None,
+            };
+            let reset = reset && landing.is_some();
+            let _ = tx.send(JobResult { data, reading, landing, reset });
             crate::app::request_repaint();
         });
         self.job = Some(rx);
@@ -290,7 +481,7 @@ impl RingAssistState {
     /// Take a finished background analysis, if any.
     fn poll_job(&mut self, gds: &[GdsRings]) {
         let Some(rx) = &self.job else { return };
-        let (data, reading) = match rx.try_recv() {
+        let JobResult { data, reading, landing, reset } = match rx.try_recv() {
             Ok(r) => r,
             Err(crossbeam::channel::TryRecvError::Empty) => return,
             Err(crossbeam::channel::TryRecvError::Disconnected) => {
@@ -299,6 +490,13 @@ impl RingAssistState {
             }
         };
         self.job = None;
+        if reset {
+            self.landing_reset = false;
+        }
+        if let Some(v) = landing {
+            self.landing_view = Some(v);
+            self.landing_pick = 0;
+        }
         let Some(mut reading) = reading else { return };
         reading.refresh_gds(gds);
         self.last_data = Some(data);
@@ -313,7 +511,7 @@ impl RingAssistState {
     }
 
     fn analyse(
-        data: &[f32],
+        data: &Arc<Box<[f32]>>,
         size: [u32; 2],
         frame: DAffine2,
         params: RingParams,
@@ -382,6 +580,9 @@ impl RingAssistState {
             bands,
             gds: None,
             band_check: None,
+            shot: Shot { data: data.clone(), size, frame },
+            live: None,
+            joint: None,
         })
     }
 
@@ -398,13 +599,30 @@ impl RingAssistState {
         ((to - from).length() > 1.).then_some((from, to))
     }
 
-    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+    /// `locked` (another tool drives the tip) blocks centring moves.
+    pub fn show_menu(
+        &mut self,
+        ui: &mut Ui,
+        object_list: &mut SelectableList<Object>,
+        course: &mut CourseMotionState,
+        locked: Option<&str>,
+    ) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!self.window_open, egui::Button::new("Ring Assist"))
                 .clicked()
             {
                 self.window_open = true;
+            }
+            if ui
+                .selectable_label(self.semi_auto, "Semi-auto centring")
+                .on_hover_text(
+                    "After each complete frame, propose the coarse move toward the ring centre \
+                     and make it when you click Proceed.",
+                )
+                .clicked()
+            {
+                self.set_semi_auto(!self.semi_auto);
             }
             if self.enabled {
                 if let Some(cur) = &self.current {
@@ -424,13 +642,227 @@ impl RingAssistState {
             .open(&mut open)
             .show(ui.ctx(), |ui| self.show_window(ui, object_list));
         self.window_open = open;
+        self.update_centring(ui, object_list, course, locked);
+    }
+
+    fn set_semi_auto(&mut self, on: bool) {
+        self.semi_auto = on;
+        self.proposal = None;
+        self.centring = Centring::Idle;
+        if on {
+            // Don't act on a frame from before semi-auto was turned on.
+            self.proposed_for = self.current.as_ref().map(|c| c.at);
+            if !self.enabled {
+                self.enabled = true;
+                self.rerun();
+            }
+        }
+    }
+
+    fn log(&mut self, text: String) {
+        tracing::info!("ring centring: {text}");
+        self.centring_log.push_front(text);
+        self.centring_log.truncate(6);
+    }
+
+    /// Semi-auto centring: follow the move, propose the next one, and show
+    /// the proposal window.
+    fn update_centring(
+        &mut self,
+        ui: &mut Ui,
+        object_list: &mut SelectableList<Object>,
+        course: &mut CourseMotionState,
+        locked: Option<&str>,
+    ) {
+        if !self.semi_auto {
+            return;
+        }
+        // Follow a running move and wait for a fresh frame after it.
+        match &mut self.centring {
+            Centring::Moving if !course.is_moving() => {
+                self.centring = Centring::AwaitingFresh { moved_at: Instant::now(), seen_partial: false };
+                self.log("Move done; waiting for a frame scanned after the move.".into());
+            }
+            Centring::AwaitingFresh { moved_at, seen_partial } => {
+                if let Some(cur) = self.current.as_ref().filter(|c| c.at > *moved_at) {
+                    if !cur.complete() {
+                        *seen_partial = true;
+                    } else if *seen_partial {
+                        self.centring = Centring::Idle;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if matches!(self.centring, Centring::Idle) && self.proposal.is_none() {
+            self.make_proposal(object_list, course);
+        }
+        let mut open = true;
+        let mut proceed = false;
+        let mut decline = false;
+        let mut use_anyway = false;
+        let waiting = matches!(self.centring, Centring::AwaitingFresh { .. });
+        let screen = ui.data(|m| m.get_temp::<ScanViewCtx>(Id::new(()))).map(|c| c.world2egui());
+        egui::Window::new("Ring centring")
+            .frame(crate::theme::window_frame(ui.ctx()))
+            .default_width(340.)
+            .collapsible(true)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                match (&self.proposal, &self.centring) {
+                    (_, Centring::Moving) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Moving...");
+                        });
+                    }
+                    (_, Centring::AwaitingFresh { .. }) => {
+                        ui.label("Waiting for a new frame scanned after the move.");
+                        ui.label(
+                            RichText::new("Start a scan if it didn't restart after the approach.").weak(),
+                        );
+                    }
+                    (None, _) => {
+                        ui.label(RichText::new("Waiting for a complete frame with a ring match.").weak());
+                        if let Some(cur) = &self.current {
+                            if cur.complete() && cur.live.is_none() {
+                                ui.label(
+                                    RichText::new(if self.ring_kinds_nm.is_empty() {
+                                        "No ring kinds known yet: load the device GDS on the map once."
+                                    } else {
+                                        "The last frame didn't match the rings well enough."
+                                    })
+                                    .color(UNSURE_COLOR),
+                                );
+                            }
+                        }
+                    }
+                    (Some(pr), _) => {
+                        let reading = self.current.as_ref().filter(|c| c.at == pr.reading_at);
+                        show_proposal(ui, pr, reading, &self.matching, screen, course.withdraw_approach());
+                        ui.add_space(6.);
+                        ui.horizontal(|ui| {
+                            let can = pr.problem.is_none() && locked.is_none() && !course.is_moving();
+                            proceed = ui
+                                .add_enabled(can, egui::Button::new(RichText::new("Proceed").strong()))
+                                .clicked();
+                            decline = ui.button("Do not proceed").clicked();
+                        });
+                        if let Some(l) = locked {
+                            ui.label(RichText::new(l).color(WARN_COLOR));
+                        }
+                    }
+                }
+                if waiting {
+                    use_anyway = ui
+                        .small_button("Use the current frame anyway")
+                        .on_hover_text("Skip waiting for a fresh scan (only if this frame was taken after the move).")
+                        .clicked();
+                }
+                egui::CollapsingHeader::new("Move limits").show(ui, |ui| {
+                    egui::Grid::new("centring_limits").num_columns(2).show(ui, |ui| {
+                        ui.label("Largest move (frame widths)");
+                        ui.add(egui::DragValue::new(&mut self.limits.max_frames).speed(0.05).range(0.1..=10.));
+                        ui.end_row();
+                        ui.label("Test move when unsure");
+                        ui.add(egui::DragValue::new(&mut self.limits.test_frames).speed(0.05).range(0.1..=5.));
+                        ui.end_row();
+                    });
+                });
+                if !self.centring_log.is_empty() {
+                    ui.separator();
+                    for l in &self.centring_log {
+                        ui.label(RichText::new(l).small().weak());
+                    }
+                }
+            });
+        if proceed {
+            if let Some(pr) = self.proposal.take() {
+                self.proposed_for = Some(pr.reading_at);
+                if course.start_move(pr.steps) {
+                    self.centring = Centring::Moving;
+                    self.log(format!(
+                        "Moving {:+} x, {:+} y steps ({:.2} \u{b5}m{}).",
+                        pr.steps.x,
+                        pr.steps.y,
+                        pr.plan.world.length() * 1e-3,
+                        if pr.plan.test { ", test move" } else { "" }
+                    ));
+                }
+            }
+        }
+        if decline {
+            if let Some(pr) = self.proposal.take() {
+                self.proposed_for = Some(pr.reading_at);
+                self.log("Move declined; waiting for the next frame.".into());
+            }
+        }
+        if use_anyway {
+            self.centring = Centring::Idle;
+        }
+        if !open {
+            self.set_semi_auto(false);
+        }
+    }
+
+    /// Plan a move from the current frame, if it is complete, new and matched.
+    fn make_proposal(&mut self, object_list: &SelectableList<Object>, course: &CourseMotionState) {
+        let Some(cur) = &self.current else { return };
+        if !cur.complete() || self.proposed_for == Some(cur.at) {
+            return;
+        }
+        let Some((center, sure)) = cur.ring_target(&self.matching) else { return };
+        let Some(scan_area) = object_list.iter().find_map(|o| match &**o {
+            Object::ScanArea { image, .. } => Some(image),
+            _ => None,
+        }) else {
+            return;
+        };
+        let plan = ring_live::plan_move(&cur.shot, center, sure, self.limits);
+        // The coarse move is in the scan area's own axes.
+        let local = scan_area.world_transform.matrix2.inverse() * plan.world;
+        let per_step = course.steps2real_world();
+        let steps = course.real_to_steps(local);
+        let problem = if per_step.determinant().abs() < 1e-12 {
+            Some("Coarse motion isn't calibrated or the driver amplitudes are unknown.".to_string())
+        } else if steps == IVec2::ZERO {
+            Some(if plan.at_center {
+                "The ring centre is in this frame. Done.".to_string()
+            } else {
+                format!(
+                    "The move ({:.2} \u{b5}m) is less than one coarse step; move the scan frame instead.",
+                    plan.world.length() * 1e-3
+                )
+            })
+        } else {
+            None
+        };
+        self.proposal = Some(Proposal { reading_at: cur.at, plan, steps, from: cur.frame_center(), sure, problem });
+    }
+
+    /// Keep the ring kinds of the GDS on the map, and remember them for when
+    /// no GDS is loaded.
+    fn sync_kinds(&mut self, gds: &[GdsRings]) {
+        if gds.is_empty() {
+            return;
+        }
+        let key: Vec<(uuid::Uuid, [f64; 6])> = gds.iter().map(|g| (g.uuid, g.transform.to_cols_array())).collect();
+        if key == self.kinds_key {
+            return;
+        }
+        self.kinds_key = key;
+        let kinds = gds_prior::ring_kinds_on_map(gds);
+        if !kinds.is_empty() && kinds != self.ring_kinds_nm {
+            self.ring_kinds_nm = kinds;
+            save_kinds(&self.ring_kinds_nm);
+        }
     }
 
     fn show_window(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
         ui.label(
             RichText::new(
-                "Analyses each Z frame and shows where it would move. Display only: it never \
-                 moves the tip.",
+                "Analyses each Z frame and shows where it would move. It only moves the tip in \
+                 semi-auto centring, after you click Proceed.",
             )
             .weak(),
         );
@@ -448,6 +880,9 @@ impl RingAssistState {
             }
             Some(cur) => {
                 ui.label(RichText::new(cur.summary()).color(cur.color()).strong());
+                if let Some((t, c)) = cur.match_summary(&self.matching) {
+                    ui.label(RichText::new(t).color(c).strong());
+                }
                 egui::Grid::new("ring_assist_current").num_columns(2).show(ui, |ui| {
                     ui.label("Frame");
                     ui.label(if cur.complete() {
@@ -475,6 +910,7 @@ impl RingAssistState {
             }
         }
         self.show_gds_section(ui);
+        self.show_landing(ui, object_list);
         ui.separator();
         match &self.last_good {
             None => {
@@ -500,6 +936,13 @@ impl RingAssistState {
         ui.separator();
         ui.checkbox(&mut self.show_debug, "Show edges and removed features");
         ui.checkbox(&mut self.show_gds, "Show GDS prediction on the map");
+        if ui
+            .checkbox(&mut self.use_backward, "Also match the backward scan")
+            .on_hover_text("Keep whichever scan fits the rings better. On the labelled frames this didn't help overall.")
+            .changed()
+        {
+            self.rerun();
+        }
         ui.checkbox(&mut self.save_with_stamps, "Save result with stamps")
             .on_hover_text("Each stamped image keeps its ring result in the project. Hide them with \"Show ring results on stamps\" in the Scan Region menu.");
         if ui.button("Clear trail").clicked() {
@@ -552,6 +995,193 @@ impl RingAssistState {
         if changed {
             self.save_tune();
             self.rerun();
+        }
+    }
+
+    /// Where the frames are on the GDS: the way to the centre, how sure,
+    /// and the best places, with Shift GDS to line the GDS up with one.
+    fn show_landing(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Landing").strong());
+            if ui
+                .checkbox(&mut self.landing_on, "Guess where frames are on the GDS")
+                .on_hover_text(
+                    "Compares each complete frame with every ring structure in the GDS. \
+                     Where the GDS sits on the map isn't used, only its scale and rotation.",
+                )
+                .changed()
+                && self.landing_on
+            {
+                self.rerun();
+            }
+        });
+        if !self.landing_on {
+            return;
+        }
+        let gds = gds_prior::collect(object_list);
+        let screen = ui.data(|m| m.get_temp::<ScanViewCtx>(Id::new(()))).map(|c| c.world2egui());
+        let words = |v: DVec2| {
+            screen
+                .map(|s| s.transform_vector2(v))
+                .filter(|v| v.length() > 1e-9)
+                .map(|v| screen_words(egui::vec2(v.x as f32, v.y as f32)))
+        };
+        let busy = self.job.is_some();
+        let Some((gid, v)) = &self.landing_view else {
+            ui.horizontal(|ui| {
+                if busy {
+                    ui.spinner();
+                }
+                ui.label(
+                    RichText::new(if !gds.iter().any(|g| g.landing.is_some()) {
+                        "Load the device GDS on the map (its placement needn't be right)."
+                    } else if busy {
+                        "Working on the frame\u{2026}"
+                    } else {
+                        "Waiting for a complete Z frame."
+                    })
+                    .weak(),
+                );
+            });
+            return;
+        };
+        let gid = *gid;
+        let Some(g) = gds.iter().find(|g| g.uuid == gid) else {
+            ui.label(RichText::new("The GDS these guesses are on is hidden or gone.").color(WARN_COLOR));
+            return;
+        };
+        if let (Some((dir, a, b)), Some(c)) = (v.way_world(), v.consensus) {
+            let range = if b - a < 1000. {
+                format!("about {:.1} \u{b5}m", (a + b) / 2. * 1e-3)
+            } else {
+                format!("{:.0}\u{2013}{:.0} \u{b5}m", a * 1e-3, b * 1e-3)
+            };
+            ui.label(
+                RichText::new(format!(
+                    "Ring centre {}{range} away.",
+                    words(dir).map_or(String::new(), |w| format!("{w}, "))
+                ))
+                .color(LANDING_COLOR)
+                .strong(),
+            );
+            let (t, col) = if c.agree >= LANDING_SURE {
+                (format!("{:.0}% of the odds agree on the way: sure.", c.agree * 100.), SURE_COLOR)
+            } else {
+                (
+                    format!(
+                        "Only {:.0}% of the odds agree on the way: not sure. A move along the bands \
+                         (sideways, not toward the centre) tells the places apart.",
+                        c.agree * 100.
+                    ),
+                    UNSURE_MATCH_COLOR,
+                )
+            };
+            ui.label(RichText::new(t).color(col));
+        }
+        ui.label(
+            RichText::new(format!(
+                "From {} frame{}. Which ring and which structure are rough: one band fits a ring \
+                 further in or out about as well.",
+                v.frames,
+                if v.frames == 1 { "" } else { "s" }
+            ))
+            .weak(),
+        );
+        let mut pick = self.landing_pick.min(v.hyps.len().saturating_sub(1));
+        egui::Grid::new("landing_hyps").num_columns(5).striped(true).show(ui, |ui| {
+            ui.label("");
+            ui.label("odds");
+            ui.label("where");
+            ui.label("fit");
+            ui.label("GDS off by");
+            ui.end_row();
+            for (i, (h, o)) in v.hyps.iter().zip(&v.odds).enumerate().take(LANDING_LIST) {
+                let Some(loc) = v.locate(h, g.transform) else { continue };
+                ui.radio_value(&mut pick, i, format!("#{}", i + 1));
+                ui.label(format!("{:.0}%", o * 100.));
+                let kind = &v.library.kinds[h.kind];
+                let side = if kind.systems.len() > 1 && !loc.place.between {
+                    words(loc.target_world - loc.structure_world).map_or(String::new(), |w| format!(", {w} half"))
+                } else {
+                    String::new()
+                };
+                let place = if loc.place.between {
+                    "between the halves".to_string()
+                } else {
+                    format!("ring {}{side}", loc.place.ring)
+                };
+                ui.label(format!("{}: {place}", kind.name));
+                ui.label(format!("{:.2}", h.score()));
+                ui.label(format!("{:.1} \u{b5}m", loc.gds_shift.length() * 1e-3));
+                ui.end_row();
+            }
+        });
+        self.landing_pick = pick;
+        let shift = v.hyps.get(pick).and_then(|h| v.locate(h, g.transform)).map(|l| l.gds_shift);
+        let mut do_shift = None;
+        let mut undo = None;
+        let mut reset = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(shift.is_some(), egui::Button::new(format!("Shift GDS to #{}", pick + 1)))
+                .on_hover_text("Move the GDS on the map so its nearest copy of this structure lines up with the guess.")
+                .clicked()
+            {
+                do_shift = shift;
+            }
+            if self.landing_undo.is_some_and(|(u, _)| u == gid) && ui.button("Undo shift").clicked() {
+                undo = self.landing_undo.take().map(|(_, t)| t);
+            }
+            reset = ui
+                .button("Start over")
+                .on_hover_text("Forget the earlier frames (e.g. after moving to another structure).")
+                .clicked();
+        });
+        if reset {
+            self.landing_reset = true;
+            self.landing_view = None;
+            self.rerun();
+        }
+        if do_shift.is_some() || undo.is_some() {
+            self.move_gds(object_list, gid, do_shift, undo);
+        }
+    }
+
+    /// Shift the GDS (or put it back), updating its stamps' reference so
+    /// the "GDS moved" warning stays quiet for a deliberate move.
+    fn move_gds(
+        &mut self,
+        object_list: &mut SelectableList<Object>,
+        id: uuid::Uuid,
+        shift: Option<DVec2>,
+        restore: Option<DAffine2>,
+    ) {
+        let mut new = None;
+        for o in object_list.iter_mut() {
+            if let Object::Gds { image, .. } = &mut **o {
+                if image.uuid() == id {
+                    if let Some(s) = shift {
+                        self.landing_undo = Some((id, image.transform));
+                        image.transform.translation += s;
+                    }
+                    if let Some(t) = restore {
+                        image.transform = t;
+                    }
+                    new = Some(image.transform);
+                }
+            }
+        }
+        let Some(t) = new else { return };
+        for o in object_list.iter_mut() {
+            if let Object::ScanImage { image, .. } = &mut **o {
+                if image.gds_ref.is_some_and(|(u, _)| u == id) {
+                    image.gds_ref = Some((id, t));
+                }
+            }
+        }
+        if let Some(s) = shift {
+            self.log(format!("Shifted the GDS by ({:+.2}, {:+.2}) \u{b5}m to the landing guess.", s.x * 1e-3, s.y * 1e-3));
         }
     }
 
@@ -610,6 +1240,10 @@ impl RingAssistState {
         if gds.is_empty() {
             return;
         }
+        let kinds = gds_prior::ring_kinds_on_map(gds);
+        if !kinds.is_empty() {
+            self.ring_kinds_nm = kinds;
+        }
         let updates: Vec<(String, Option<GdsInfo>)> = labelled
             .into_iter()
             .filter(|image| self.dataset.gds_of(&image.uuid().to_string()).is_some())
@@ -620,8 +1254,15 @@ impl RingAssistState {
         }
     }
 
+    /// A stamp got its Nanonis file name: use it for its training label.
+    pub fn rename_label(&mut self, id: uuid::Uuid, name: &str) {
+        if let Err(e) = self.dataset.set_sources(&[(id.to_string(), name.to_string())]) {
+            tracing::warn!("could not rename ring label: {e}");
+        }
+    }
+
     fn tune(&self) -> TuneParams {
-        TuneParams { params: self.params, min_radius_um: self.min_radius_um }
+        TuneParams { params: self.params, min_radius_um: self.min_radius_um, matching: self.matching }
     }
 
     fn save_tune(&self) {
@@ -748,7 +1389,7 @@ impl RingAssistState {
         let g = gds_info(gds, image);
         if let Some(l) = label {
             self.picking = None;
-            self.apply_label(image, &name, l, g, ui.ctx());
+            self.apply_label(image, &name, l, g.clone(), ui.ctx());
         }
         if smallest {
             // Saved now without a direction; a map click can add one.
@@ -831,11 +1472,12 @@ impl RingAssistState {
     fn start_training(&mut self, ctx: &egui::Context) {
         let dir = self.dataset.dir().to_path_buf();
         let current = self.tune();
+        let kinds = self.ring_kinds_nm.clone();
         let (tx, rx) = crossbeam::channel::bounded(1);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let samples = Dataset::load(dir).samples();
-            let report = ring_training::evaluate(&samples, current);
+            let report = ring_training::evaluate(&samples, current, &kinds);
             let _ = tx.send(report);
             ctx.request_repaint();
         });
@@ -902,8 +1544,42 @@ impl RingAssistState {
         }
         let mut accept = false;
         let mut dismiss = false;
+        if r.match_n > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "Matching scans to the GDS rings ({} labels with ring geometry):",
+                    r.match_n
+                ))
+                .color(GDS_COLOR),
+            );
+            for (mode, n) in &r.mode_correct {
+                ui.label(format!(
+                    "  {}: {}/{} ({:.0}%)",
+                    mode.name(),
+                    n,
+                    r.match_n,
+                    100. * *n as f64 / r.match_n as f64
+                ));
+            }
+            ui.label(format!(
+                "  New match settings: {}/{} on held-out scans, {}/{} on all",
+                r.match_cv_correct, r.match_n, r.match_new_correct, r.match_n
+            ));
+        }
+        if !r.blind.is_empty() {
+            ui.label(
+                RichText::new(format!("Blind matching (no GDS placement), all {} labels:", r.n))
+                    .color(GDS_COLOR),
+            );
+            for (mode, n, conf) in &r.blind {
+                let name = if *mode == MatchMode::Off { "detector only" } else { mode.name() };
+                ui.label(format!("  {name}: {n}/{} ({:.0}%), {conf} matched", r.n, pct(*n)));
+            }
+        }
         if r.is_improvement() {
-            for c in &r.changes {
+            let detector: &[String] = if r.detector_improves() { &r.changes } else { &[] };
+            let matching: &[String] = if r.match_improves() { &r.match_changes } else { &[] };
+            for c in detector.iter().chain(matching) {
                 ui.label(format!("  \u{2022} {c}"));
             }
             ui.horizontal(|ui| {
@@ -918,8 +1594,13 @@ impl RingAssistState {
         }
         if accept {
             let new = r.new;
-            self.params = new.params;
-            self.min_radius_um = new.min_radius_um;
+            if r.detector_improves() {
+                self.params = new.params;
+                self.min_radius_um = new.min_radius_um;
+            }
+            if r.match_improves() {
+                self.matching = new.matching;
+            }
             self.save_tune();
             self.rerun();
             self.report = None;
@@ -1035,9 +1716,42 @@ impl RingAssistState {
             }
         }
 
+        self.draw_landing(painter, &to_screen);
         let Some(cur) = &self.current else { return };
-        let color = if cur.complete() { cur.color() } else { cur.color().gamma_multiply(0.6) };
+        let mut color = if cur.complete() { cur.color() } else { cur.color().gamma_multiply(0.6) };
         let c = cur.frame_center();
+        // The ring match leads; the old detector is drawn faded beside it.
+        if let Some((target, sure)) = cur.ring_target(&self.matching) {
+            color = color.gamma_multiply(0.35);
+            let mc = if sure { SURE_COLOR } else { UNSURE_MATCH_COLOR };
+            let d = target - c;
+            if d.length() > 1e-6 {
+                arrow(c, d.normalize(), (cur.frame_width() * 0.45).min(d.length()), mc, 4.);
+            }
+            if d.length() < 3. * cur.frame_width() {
+                painter.circle_stroke(to_screen(target), 7., Stroke::new(2.5, mc));
+            }
+            if let Some((t, _)) = cur.match_summary(&self.matching) {
+                painter.text(to_screen(c) + egui::vec2(10., 8.), Align2::LEFT_TOP, t, FontId::proportional(13.), mc);
+            }
+        }
+        if let Some(pr) = &self.proposal {
+            let (a, b) = (to_screen(pr.from), to_screen(pr.from + pr.plan.world));
+            painter.extend(egui::Shape::dashed_line(&[a, b], Stroke::new(2.5, PLAN_COLOR), 8., 5.));
+            BorderRectangle {
+                transform: DAffine2::from_translation(pr.plan.world) * cur.frame,
+                color: PLAN_COLOR,
+                dashed: true,
+            }
+            .show(ui);
+            painter.text(
+                b + egui::vec2(8., -8.),
+                Align2::LEFT_BOTTOM,
+                format!("planned move {:+}, {:+}", pr.steps.x, pr.steps.y),
+                FontId::proportional(13.),
+                PLAN_COLOR,
+            );
+        }
         match cur.move_dir_world {
             Some(dir) => arrow(c, dir, cur.frame_width() * 0.4, color, 3.),
             None => {
@@ -1103,12 +1817,172 @@ impl RingAssistState {
     }
 }
 
+impl RingAssistState {
+    /// The best landing guesses on the map: the centre each heads for, the
+    /// rings of the picked one, and the agreed way from the frame.
+    fn draw_landing(&self, painter: &egui::Painter, to_screen: &dyn Fn(DVec2) -> egui::Pos2) {
+        if !self.landing_on {
+            return;
+        }
+        let Some((_, v)) = &self.landing_view else { return };
+        let font = FontId::proportional(12.);
+        for (i, (h, o)) in v.hyps.iter().zip(&v.odds).enumerate().take(LANDING_LIST) {
+            let picked = i == self.landing_pick;
+            if !picked && (i >= 3 || *o < 0.02) {
+                continue;
+            }
+            let Some((place, _, target)) = v.place_world(h) else { continue };
+            let col = if picked { LANDING_COLOR } else { LANDING_COLOR.gamma_multiply(0.5) };
+            let p = to_screen(target);
+            let r = 6.;
+            let stroke = Stroke::new(if picked { 2.5 } else { 1.5 }, col);
+            painter.line_segment([p + egui::vec2(-r, -r), p + egui::vec2(r, r)], stroke);
+            painter.line_segment([p + egui::vec2(-r, r), p + egui::vec2(r, -r)], stroke);
+            painter.text(p + egui::vec2(8., -8.), Align2::LEFT_BOTTOM, format!("#{} {:.0}%", i + 1, o * 100.), font.clone(), col);
+            if picked && !place.between {
+                // The rings of the system the guess puts the frame on.
+                let ring_stroke = Stroke::new(1., LANDING_COLOR.gamma_multiply(0.45));
+                if let Some(s) = v.library.kinds[h.kind].systems.get(place.system) {
+                    for b in &s.bands {
+                        for rad in [b.0, b.1] {
+                            let sr = (to_screen(target + DVec2::new(rad * v.scale(), 0.)) - p).length();
+                            painter.circle_stroke(p, sr, ring_stroke);
+                        }
+                    }
+                }
+            }
+        }
+        if let (Some((dir, _, _)), Some(c)) = (v.way_world(), v.consensus) {
+            let col = if c.agree >= LANDING_SURE { LANDING_COLOR } else { LANDING_COLOR.gamma_multiply(0.6) };
+            let a = to_screen(v.frame_center);
+            let b = to_screen(v.frame_center + dir * v.frame_width * 0.5);
+            painter.arrow(a, b - a, Stroke::new(3., col));
+            painter.text(b + egui::vec2(6., 6.), Align2::LEFT_TOP, format!("landing {:.0}%", c.agree * 100.), font, col);
+        }
+    }
+}
+
 /// The GDS prediction for a stamp, as stored with its label.
 fn gds_info(gds: &[GdsRings], image: &LiveImage) -> Option<GdsInfo> {
     let (_, p) = gds_prior::predict_any(gds, image.transform)?;
     let size = image.forward_data.size;
+    let exp = gds_prior::expected(gds, image.transform, size);
     Some(GdsInfo {
         dir: quad_to_px_dir(p.dir_quad(image.transform), size).to_array(),
         smallest: p.smallest_in_frame,
+        center_px: exp.as_ref().map(|e| e.center_px.to_array()),
+        bands_px: exp.map_or(vec![], |e| e.bands_px.iter().map(|b| [b.0, b.1]).collect()),
     })
+}
+
+/// Where the ring kinds are remembered between sessions.
+fn kinds_path() -> std::path::PathBuf {
+    crate::app::CONFIG_DIR.config_local_dir().join("ring_kinds.json")
+}
+
+fn load_kinds() -> Vec<Vec<(f64, f64)>> {
+    std::fs::read_to_string(kinds_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_kinds(kinds: &[Vec<(f64, f64)>]) {
+    if let Ok(t) = serde_json::to_string(kinds) {
+        if let Err(e) = std::fs::write(kinds_path(), t) {
+            tracing::warn!("could not save ring kinds: {e}");
+        }
+    }
+}
+
+/// "up-left" etc. for a direction on screen (y down).
+fn screen_words(v: egui::Vec2) -> &'static str {
+    let a = (-v.y).atan2(v.x).to_degrees();
+    const NAMES: [&str; 8] = ["right", "up-right", "up", "up-left", "left", "down-left", "down", "down-right"];
+    NAMES[(((a + 360. + 22.5) % 360.) / 45.) as usize % 8]
+}
+
+/// The body of the proposal window.
+fn show_proposal(
+    ui: &mut Ui,
+    pr: &Proposal,
+    reading: Option<&Reading>,
+    p: &MatchParams,
+    screen: Option<DAffine2>,
+    (withdraw, approach): (bool, bool),
+) {
+    let words = screen
+        .map(|s| s.transform_vector2(pr.plan.world))
+        .filter(|v| v.length() > 1e-9)
+        .map(|v| screen_words(egui::vec2(v.x as f32, v.y as f32)));
+    let dist = pr.plan.dist_nm * 1e-3;
+    let headline = if pr.plan.at_center {
+        format!("The ring centre is in this frame, {dist:.2} \u{b5}m from its middle.")
+    } else {
+        format!(
+            "I think the ring centre is {}about {dist:.1} \u{b5}m away.",
+            words.map_or(String::new(), |w| format!("{w}, "))
+        )
+    };
+    ui.label(RichText::new(headline).strong());
+    if let Some(r) = reading {
+        if let Some(m) = &r.live {
+            let (text, color) = if pr.sure {
+                ("Direction: sure.".to_string(), SURE_COLOR)
+            } else {
+                (
+                    format!(
+                        "Direction: not sure. The other side fits almost as well (gap {:.3}, sure at {:.2}).",
+                        m.gap, p.sure_gap
+                    ),
+                    UNSURE_MATCH_COLOR,
+                )
+            };
+            ui.label(RichText::new(text).color(color));
+            ui.label(
+                RichText::new(format!(
+                    "Match {:.2} on the {} scan.",
+                    m.score,
+                    if m.backward { "backward" } else { "forward" }
+                ))
+                .weak(),
+            );
+        }
+        if let Some(j) = &r.joint {
+            let (t, c) = if j.overrides_current {
+                ("Checked against the frame before the move: this frame alone points the other way, but the centre that fits both frames is the one shown. The last move may have gone the wrong way.", WARN_COLOR)
+            } else if j.agrees {
+                ("Checked against the frame before the move: both agree.", SURE_COLOR)
+            } else {
+                ("Checked against the frame before the move: the centre shown fits both frames best.", UNSURE_MATCH_COLOR)
+            };
+            ui.label(RichText::new(t).color(c));
+        }
+    }
+    ui.separator();
+    if let Some(problem) = &pr.problem {
+        ui.label(RichText::new(problem).color(if pr.plan.at_center { SURE_COLOR } else { WARN_COLOR }));
+        return;
+    }
+    ui.label(format!(
+        "Coarse steps: X {:+}, Y {:+}  (\u{2248} {:.2} \u{b5}m{})",
+        pr.steps.x,
+        pr.steps.y,
+        pr.plan.world.length() * 1e-3,
+        if pr.plan.at_center { ", to centre it" } else { "" }
+    ));
+    if pr.plan.test {
+        ui.label(
+            RichText::new("Test move: the next frame will confirm the direction or turn back.")
+                .color(UNSURE_MATCH_COLOR),
+        );
+    }
+    ui.label(
+        RichText::new(format!(
+            "Auto withdraw {}, auto approach {} (set in Course Motion).",
+            if withdraw { "on" } else { "off" },
+            if approach { "on" } else { "off" }
+        ))
+        .weak(),
+    );
 }

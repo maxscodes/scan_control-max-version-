@@ -101,6 +101,10 @@ pub enum SegKind {
     FrameTravel,
     FrameReturn,
     FrameStepUp,
+    /// A drawn line written along its length.
+    DrawnLine,
+    /// Travel to the start of a drawn line.
+    DrawnLineJump,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -268,7 +272,44 @@ fn raster_intervals(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -
 }
 
 fn no_geometry() -> String {
-    "No GDS geometry intersects the lithography scan frame".into()
+    "No GDS or drawn geometry intersects the lithography scan frame".into()
+}
+
+/// Append open polylines (drawn lines, frame-local nm) written along their
+/// length. Each next line is the one with an end nearest the current
+/// position, entered from that end with a travel move.
+pub fn append_strokes(path: &mut Vec<Segment>, strokes: &[Polygon]) {
+    let mut left: Vec<&Polygon> = strokes.iter().filter(|s| s.len() >= 2).collect();
+    let mut at = path.last().map(|s| s.end);
+    while !left.is_empty() {
+        let (i, reverse) = match at {
+            None => (0, false),
+            Some(p) => left
+                .iter()
+                .enumerate()
+                .flat_map(|(i, s)| [(i, false, p.distance(s[0])), (i, true, p.distance(s[s.len() - 1]))])
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(i, r, _)| (i, r))
+                .unwrap(),
+        };
+        let stroke = left.remove(i);
+        let pts: Vec<DVec2> = if reverse {
+            stroke.iter().rev().copied().collect()
+        } else {
+            stroke.clone()
+        };
+        if let Some(p) = at {
+            if p.distance(pts[0]) > EPS {
+                path.push(Segment::new(p, pts[0], false, SegKind::DrawnLineJump));
+            }
+        }
+        for w in pts.windows(2) {
+            if w[0].distance(w[1]) > EPS {
+                path.push(Segment::new(w[0], w[1], true, SegKind::DrawnLine));
+            }
+        }
+        at = path.last().map(|s| s.end).or(at);
+    }
 }
 
 /// Row-extent comb: each row from its leftmost to its rightmost active
@@ -672,6 +713,17 @@ impl PathStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strokes_are_joined_nearest_end_first() {
+        let a = vec![DVec2::new(0., 0.), DVec2::new(10., 0.)];
+        let b = vec![DVec2::new(30., 0.), DVec2::new(12., 0.)];
+        let mut path = Vec::new();
+        append_strokes(&mut path, &[a, b]);
+        // a forward, travel to b's near end (12,0), b written backwards.
+        let ends: Vec<_> = path.iter().map(|s| (s.start.x, s.end.x, s.active)).collect();
+        assert_eq!(ends, vec![(0., 10., true), (10., 12., false), (12., 30., true)]);
+    }
 
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
         vec![

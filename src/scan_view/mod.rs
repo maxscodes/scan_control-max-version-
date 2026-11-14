@@ -8,7 +8,7 @@ use image_compute::image_compute::ImageComputePipeline;
 pub mod border;
 mod callbacks;
 mod file_image;
-mod gds_image;
+pub mod gds_image;
 mod scale_bar;
 mod scan_image;
 pub mod static_image;

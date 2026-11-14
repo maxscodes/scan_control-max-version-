@@ -33,6 +33,9 @@ These are in rough dependency order.
 | GDS lithography: 5 path planners, Ramp or Z-lift moves, STOP, map overlay | 6 | Done (`lithography/`) | **No** |
 | Ring auto-centering: estimator and display-only Ring Assist overlay | 5 | Steps 1 and 2 done (`analysis/ring_center.rs`, `ring_assist.rs`) | Overlay is not yet live-checked |
 | Ring Assist GDS prior (v0.6): direction to the ring centre from the GDS, scan band check, alignment estimate with Shift GDS, warning when the GDS moves | 5 | Done (`analysis/gds_prior.rs`); GDS direction matched 12/12 labels on 20261110 | Not yet live-checked |
+| Ring Assist landing: guess where a frame is on the GDS without trusting the GDS placement (structure kind, ring, way to the centre, Shift GDS to a guess); checked against the frames after each move | 5 | Done, display only (`analysis/landing.rs`); way to the centre right on 29/40 labelled frames from one frame each (blind match 25/40), 24/29 when ≥ 80 % of the odds agree | Not yet live-checked |
+| Sequence tip moves and I(V) series: each entry can visit tip positions after its scan (Follow Me, placed by ctrl+click on the map) and run an I(V) series at each, saved automatically to the Nanonis session folder; entries can skip the scan | 1, 3 | Done (`sequence/`, shared series in `spectroscopy/worker.rs`) | **No** |
+| Fine Motion: stamp and move the scan frame within the piezo range (arrows step one frame, ctrl+drag/click on the map, Back), and move the tip with Follow Me (Go, live ctrl+drag, Halt) | — | Done (`fine_motion.rs`) | **No** |
 
 Only one tool can drive the tip at a time: a sequence, spectroscopy, lithography or a running scan.
 
@@ -41,7 +44,7 @@ Only one tool can drive the tip at a time: a sequence, spectroscopy, lithography
 These are suggested and in a rough order. Each one gets agreed on before work starts.
 
 1. **Hardware-test the I(V) series and lithography.** See the checklists below.
-2. **Add spectroscopy as a sequence step.** Make an I(V) series a step type in the sequence editor, and save the data and plots automatically for each step.
+2. ~~Add spectroscopy as a sequence step.~~ Done: tip positions with an I(V) series per sequence entry, saved automatically.
 3. **Add lithography as a sequence step.** Do this once lithography is trusted on hardware.
 4. **Ring auto-centering, step 3: tip movement.** This waits until the overlay gives the right direction on 10 to 20 real scans. It includes the fallback rule: when a scan can't give a direction, move half way back toward the last good scan.
 5. **Z spectroscopy.** Port the Python script if one exists.
@@ -76,6 +79,21 @@ After that come the ML pillars (5 and 7), then goal-driven autonomy (8).
 - [ ] Press STOP mid-run and check that bias, setpoint, feedback and Follow Me speed are all restored.
 - [ ] Check a rotated frame: the path should follow the red frame drawn on the map.
 - [ ] On the v5e build, check that `FolMe.XYPosSet` and `FolMe.SpeedGet` work.
+
+### Fine Motion
+
+- [ ] Move the frame with the scan stopped: check that Nanonis shows the new frame centre and that the dashed outline matched it.
+- [ ] Press "Stop scan, stamp & move frame" mid-scan: check the stamp lands where the scan was, and the next scan starts if asked.
+- [ ] Check the arrows on a rotated frame: each step should move one frame (less the overlap) in the arrow's direction on the map.
+- [ ] Send the tip with Go, then ctrl+drag it with "Move at once": check it follows at a safe Follow Me speed, and that Halt stops it.
+- [ ] Check that the target can't leave the piezo range.
+
+### Sequence tip moves and spectroscopy
+
+- [ ] One entry, no scan, two tip positions with moves only: check the tip goes to each and the sequence waits for it.
+- [ ] Scan, then one position with a 2-curve I(V) series: check the curves show in the I(V) window and the batch folder appears in the Nanonis session folder.
+- [ ] Abort during a series: check it stops after the curve in progress, Z feedback is left OFF, and the curves taken so far are saved.
+- [ ] After the series, check the next scan runs with Z feedback ON.
 
 ### Ring Assist
 

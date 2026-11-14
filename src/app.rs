@@ -69,6 +69,7 @@ pub struct AppState {
 impl MyApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let _ = REPAINT.set(cc.egui_ctx.clone());
+        crate::components::file_dialog_native::set_main_window(cc);
         let project = ProjectDb::new_temp().unwrap();
         let wgpu = cc.wgpu_render_state.as_ref().unwrap();
         let image_encoder = ImageEncoder::new(wgpu);

@@ -24,6 +24,11 @@ pub enum ScanCommand {
     SetBias(f32),
     /// Amps.
     SetSetpoint(f32),
+    /// Follow Me: send the tip to this XY position (metres, piezo
+    /// coordinates). Doesn't wait for the tip to arrive.
+    MoveTip { x: f64, y: f64 },
+    /// Follow Me: stop the tip where it is.
+    HaltTip,
 }
 
 /// Values read back from Nanonis by the slow status worker.
@@ -70,6 +75,11 @@ impl ScanControlState {
             saved_at: None,
             progress_start: None,
         }
+    }
+
+    /// A command was sent and hasn't finished yet.
+    pub fn busy(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -228,20 +238,24 @@ impl ScanControlState {
         self.show_progress(ui, status, input.rows);
 
         if let Some(cmd) = command {
-            info!("Sending scan command {cmd:?}");
-            match cmd {
-                ScanCommand::Pause => self.paused = true,
-                ScanCommand::Resume | ScanCommand::Stop | ScanCommand::Start(_) => {
-                    self.paused = false
-                }
-                _ => {}
-            }
-            if matches!(cmd, ScanCommand::Start(_)) {
-                self.progress_start = None;
-            }
-            self.pending = Some(cmd);
-            self.sender.send(cmd);
+            self.request(cmd);
         }
+    }
+
+    /// Send a scan command, as the panel buttons do (also used by other
+    /// tools, e.g. Fine Motion stopping and restarting the scan).
+    pub fn request(&mut self, cmd: ScanCommand) {
+        info!("Sending scan command {cmd:?}");
+        match cmd {
+            ScanCommand::Pause => self.paused = true,
+            ScanCommand::Resume | ScanCommand::Stop | ScanCommand::Start(_) => self.paused = false,
+            _ => {}
+        }
+        if matches!(cmd, ScanCommand::Start(_)) {
+            self.progress_start = None;
+        }
+        self.pending = Some(cmd);
+        self.sender.send(cmd);
     }
 
     fn show_progress(&mut self, ui: &mut Ui, status: &ScanStatus, rows: Option<(usize, usize)>) {

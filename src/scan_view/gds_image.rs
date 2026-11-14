@@ -22,9 +22,12 @@ pub struct GDSImage {
     pub scale: f64,
     buffers: BTreeMap<u16, GDSImageBuffers>,
     colors: BTreeMap<u16, Color32>,
-    polys: BTreeMap<u16, Vec<Vec<Vec2>>>,
+    polys: std::sync::Arc<BTreeMap<u16, Vec<Vec<Vec2>>>>,
     /// Ring systems found in the polygons (computed on first use).
     rings: std::sync::OnceLock<std::sync::Arc<Vec<crate::analysis::gds_prior::RingSystem>>>,
+    /// Ring structures drawn for landing (built on first use, off the UI
+    /// thread).
+    landing: crate::analysis::landing::LibraryCell,
 }
 
 impl GDSImage {
@@ -33,6 +36,13 @@ impl GDSImage {
         path: impl AsRef<Path>,
         transform: DAffine2,
     ) -> Self {
+        Self::new_from_data(Uuid::new_v4(), encoder, read_polys(path), transform)
+    }
+}
+
+/// Polygons per layer from a GDS file (nm), centred on their bounding box.
+pub fn read_polys(path: impl AsRef<Path>) -> BTreeMap<u16, Vec<Vec<Vec2>>> {
+    {
         let gds = gdsr::Library::read_file(path, None).unwrap();
         let mut polys = BTreeMap::new();
         for cell in gds.cells().values() {
@@ -57,8 +67,11 @@ impl GDSImage {
         for vert in polys.values_mut().flatten().flatten() {
             *vert -= center;
         }
-        Self::new_from_data(Uuid::new_v4(), encoder, polys, transform)
+        polys
     }
+}
+
+impl GDSImage {
     pub fn new_from_data(
         uuid: Uuid,
         encoder: &ImageEncoder,
@@ -105,8 +118,9 @@ impl GDSImage {
             colors,
             scale,
             uuid,
-            polys,
+            polys: std::sync::Arc::new(polys),
             rings: std::sync::OnceLock::new(),
+            landing: Default::default(),
         }
     }
     pub fn uuid(&self) -> Uuid {
@@ -122,6 +136,14 @@ impl GDSImage {
         self.rings
             .get_or_init(|| std::sync::Arc::new(crate::analysis::gds_prior::find_ring_systems(&self.polys)))
             .clone()
+    }
+    /// What landing needs to build its structure library for this GDS.
+    pub fn landing_source(&self) -> crate::analysis::landing::LandingSource {
+        crate::analysis::landing::LandingSource {
+            polys: self.polys.clone(),
+            systems: self.ring_systems(),
+            cell: self.landing.clone(),
+        }
     }
     pub fn show(&self, ui: &mut Ui) {
         let ctx = ui

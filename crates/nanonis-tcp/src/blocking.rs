@@ -97,6 +97,10 @@ impl NanonisTcp {
     pub fn bias_set(&mut self, bias: f32) -> NanonisTcpResult<()> {
         self.call::<bias::Set>(&bias::SetArgs { bias })
     }
+    /// The folder Nanonis saves data into.
+    pub fn util_session_path_get(&mut self) -> NanonisTcpResult<String> {
+        self.call::<util::SessionPathGet>(&()).map(|r| r.session_path)
+    }
     pub fn scan_props_get(&mut self) -> NanonisTcpResult<scan::PropsGetResponse> {
         self.call::<scan::PropsGet>(&())
     }

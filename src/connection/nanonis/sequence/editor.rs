@@ -12,11 +12,12 @@ use crate::{
             course_motion::CourseMotionState,
             sequence::{
                 model::{
-                    compile, expand, Dir, Frame as ScanFrame, FrameSpec, Position, ScanEntry,
-                    Sequence, Speed, Step,
+                    compile, expand, with_current_scan, CurrentScan, Dir, Frame as ScanFrame,
+                    FrameSpec, Position, ScanEntry, Sequence, Speed, Step, CURRENT_SCAN,
                 },
                 runner::{SequenceCommand, SequenceEvent},
             },
+            spectroscopy::IvCurve,
         },
         ScanArea,
     },
@@ -28,6 +29,11 @@ use crate::{
 pub enum SequenceAction {
     CoarseMoved(IVec2),
     StampRequest,
+    /// An I(V) series started (base name): show it in the I(V) window.
+    SpecStarted(String),
+    SpecCurve(IvCurve),
+    /// The series ended: (ok, message, the .dat files Nanonis saved).
+    SpecDone(bool, String, Vec<std::path::PathBuf>),
 }
 
 /// Snapshot of what the runner is executing.
@@ -37,6 +43,8 @@ pub(super) struct RunView {
     pub current: usize,
     pub paused: bool,
     pub wait_remaining: Option<f64>,
+    /// Progress text of the step in progress (I(V) series).
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +79,8 @@ struct SweepSettings {
 pub(super) enum DragTarget {
     Frame,
     Coarse,
+    /// Tip positions: ctrl+click adds or removes one, ctrl+drag moves one.
+    Tip,
 }
 
 pub struct SequenceState {
@@ -80,6 +90,8 @@ pub struct SequenceState {
     pub(super) drag: Option<DragTarget>,
     /// Real-space (nm) coarse offset during a drag, so sub-step moves add up.
     pub(super) coarse_drag_real: Option<DVec2>,
+    /// Tip position being dragged on the map (index into the entry's points).
+    pub(super) tip_drag: Option<usize>,
     pub(super) window_open: bool,
     cmd_tx: Sender<SequenceCommand>,
     events: Receiver<SequenceEvent>,
@@ -92,6 +104,8 @@ pub struct SequenceState {
     /// After a sequence finishes its plan is hidden from the map, until the
     /// sequence or the selected entry changes (or "Show plan" is clicked).
     pub(super) plan_hidden: Option<(Sequence, Option<usize>)>,
+    /// What Run does with a scan that is already running in Nanonis.
+    current_scan: CurrentScan,
 }
 
 impl SequenceState {
@@ -102,6 +116,7 @@ impl SequenceState {
             selected: None,
             drag: None,
             coarse_drag_real: None,
+            tip_drag: None,
             window_open: false,
             cmd_tx,
             events,
@@ -120,6 +135,7 @@ impl SequenceState {
             load_tx,
             load_rx,
             plan_hidden: None,
+            current_scan: CurrentScan::After,
         }
     }
 
@@ -129,6 +145,10 @@ impl SequenceState {
     }
     fn is_active(&self) -> bool {
         self.run.is_some()
+    }
+    /// Ctrl+drag on the map is editing a sequence entry.
+    pub fn map_drag_active(&self) -> bool {
+        self.window_open && self.drag.is_some()
     }
 
     fn send(&self, cmd: SequenceCommand) {
@@ -155,7 +175,26 @@ impl SequenceState {
                     if let Some(run) = &mut self.run {
                         run.current = index;
                         run.wait_remaining = None;
+                        run.detail = None;
                     }
+                }
+                SequenceEvent::SpecStarted { base } => actions.push(SequenceAction::SpecStarted(base)),
+                SequenceEvent::SpecStatus(text) => {
+                    if let Some(run) = &mut self.run {
+                        run.detail = Some(text);
+                    }
+                }
+                SequenceEvent::SpecCurve(curve) => actions.push(SequenceAction::SpecCurve(curve)),
+                SequenceEvent::SpecDone { ok, message, files } => {
+                    if ok {
+                        info!("{message}");
+                    } else {
+                        error!("{message}");
+                    }
+                    if let Some(run) = &mut self.run {
+                        run.detail = None;
+                    }
+                    actions.push(SequenceAction::SpecDone(ok, message, files));
                 }
                 SequenceEvent::WaitProgress { remaining } => {
                     if let Some(run) = &mut self.run {
@@ -211,12 +250,17 @@ impl SequenceState {
         actions
     }
 
-    fn start(&mut self, from_entry: usize, group: u32, last_dir: Dir) {
+    /// `current`: a scan is running in Nanonis (in direction `last_dir`) and
+    /// the sequence waits for it / includes it.
+    fn start(&mut self, from_entry: usize, group: u32, last_dir: Dir, current: Option<CurrentScan>) {
         self.plan_hidden = None;
-        let steps = compile(&self.seq, from_entry, last_dir);
+        let mut steps = compile(&self.seq, from_entry, last_dir);
         if steps.is_empty() {
             self.last_error = Some("nothing to run (no enabled entries)".into());
             return;
+        }
+        if let Some(mode) = current {
+            steps = with_current_scan(steps, mode, last_dir, true);
         }
         self.last_error = None;
         self.status = "Starting".into();
@@ -225,6 +269,7 @@ impl SequenceState {
             current: 0,
             paused: false,
             wait_remaining: None,
+            detail: None,
         });
         self.send(SequenceCommand::Run { steps, group });
     }
@@ -287,6 +332,8 @@ impl SequenceState {
         let current_frame = scan_area
             .and_then(|a| a.image_transform)
             .map(ScanFrame::from_transform);
+        let tip_pos = scan_area.and_then(|a| a.tip_pos);
+        let scanning = scan_area.is_some_and(|a| a.scan_status.scanning);
         ui.add_enabled_ui(editable, |ui| self.show_toolbar(ui));
         ui.separator();
         self.show_entry_table(ui, editable, last_dir);
@@ -302,7 +349,7 @@ impl SequenceState {
         if details {
             ui.columns(2, |cols| {
                 cols[0].add_enabled_ui(editable, |ui| {
-                    self.show_details(ui, current_frame, course);
+                    self.show_details(ui, current_frame, tip_pos, course);
                 });
                 self.show_steps(&mut cols[1], last_dir);
             });
@@ -310,7 +357,7 @@ impl SequenceState {
             ui.add_enabled_ui(editable, |ui| self.show_sweep(ui));
         }
         ui.separator();
-        self.show_run_controls(ui, course, last_dir, blocked_by);
+        self.show_run_controls(ui, course, last_dir, scanning, blocked_by);
     }
 
     fn show_toolbar(&mut self, ui: &mut Ui) {
@@ -387,7 +434,7 @@ impl SequenceState {
         };
         let tx = self.load_tx.clone();
         std::thread::spawn(move || {
-            let Some(path) = rfd::FileDialog::new()
+            let Some(path) = crate::components::file_dialog_native::dialog()
                 .add_filter("Scan sequence", &["json"])
                 .set_title("Save Sequence")
                 .set_file_name("sequence.json")
@@ -406,7 +453,7 @@ impl SequenceState {
     fn load_dialog(&mut self) {
         let tx = self.load_tx.clone();
         std::thread::spawn(move || {
-            let Some(path): Option<PathBuf> = rfd::FileDialog::new()
+            let Some(path): Option<PathBuf> = crate::components::file_dialog_native::dialog()
                 .add_filter("Scan sequence", &["json"])
                 .set_title("Load Sequence")
                 .pick_file()
@@ -437,8 +484,8 @@ impl SequenceState {
             None => compile(&self.seq, 0, last_dir),
         };
         for (i, step) in compiled {
-            if let (Step::Scan(d), Some(slot)) = (step, resolved.get_mut(i)) {
-                *slot = Some(d);
+            if let (Step::Scan(d), Some(slot)) = (&step, resolved.get_mut(i)) {
+                *slot = Some(*d);
             }
         }
         ScrollArea::vertical()
@@ -448,11 +495,11 @@ impl SequenceState {
             .show(ui, |ui| {
                 egui::Grid::new("sequence entry grid")
                     .striped(true)
-                    .num_columns(11)
+                    .num_columns(12)
                     .show(ui, |ui| {
                         for h in [
                             "#", "On", "Name", "Bias", "Current", "Frame", "Pixels", "Speed",
-                            "Coarse", "Dir", "Waits (s)",
+                            "Coarse", "Dir", "Waits (s)", "Tip",
                         ] {
                             ui.label(RichText::new(h).strong());
                         }
@@ -485,17 +532,27 @@ impl SequenceState {
                             ui.label(e.coarse.map_or("–".into(), |c| {
                                 format!("{:+}, {:+}", c.steps[0], c.steps[1])
                             }));
-                            match (e.dir, resolved[i]) {
-                                (Dir::Alternate, Some(d)) => {
-                                    ui.label(format!("⇅ {}", d.arrow()))
-                                        .on_hover_text("alternates with the previous scan")
-                                }
-                                (d, _) => ui.label(d.arrow()),
-                            };
+                            if !e.scan {
+                                ui.weak("no scan");
+                            } else {
+                                match (e.dir, resolved[i]) {
+                                    (Dir::Alternate, Some(d)) => {
+                                        ui.label(format!("⇅ {}", d.arrow()))
+                                            .on_hover_text("alternates with the previous scan")
+                                    }
+                                    (d, _) => ui.label(d.arrow()),
+                                };
+                            }
                             ui.label(format!(
                                 "{}/{}/{}",
                                 e.settle_s, e.wait_before_s, e.wait_after_s
                             ));
+                            let n = e.tip.points.len();
+                            ui.label(match (n, e.tip.spectroscopy) {
+                                (0, _) => "–".to_string(),
+                                (n, true) => format!("{n} × I(V)"),
+                                (n, false) => format!("{n} moves"),
+                            });
                             ui.end_row();
                         }
                     });
@@ -509,6 +566,7 @@ impl SequenceState {
         &mut self,
         ui: &mut Ui,
         current_frame: Option<ScanFrame>,
+        tip_pos: Option<DVec2>,
         course: &CourseMotionState,
     ) {
         let Some(i) = self.selected.filter(|&i| i < self.seq.entries.len()) else {
@@ -520,13 +578,13 @@ impl SequenceState {
         ui.label(RichText::new(format!("Entry {}", i + 1)).strong());
         if let Some(target) = drag {
             let what = match target {
-                DragTarget::Frame => "frame",
-                DragTarget::Coarse => "coarse move",
+                DragTarget::Frame => "Ctrl+drag on the map to move this entry's frame",
+                DragTarget::Coarse => "Ctrl+drag on the map to move this entry's coarse move",
+                DragTarget::Tip => {
+                    "Ctrl+click on the map to add a tip position (or remove one), ctrl+drag to move one"
+                }
             };
-            ui.colored_label(
-                Color32::from_rgb(0xff, 0x9c, 0xff),
-                format!("Ctrl+drag on the map to move this entry's {what}"),
-            );
+            ui.colored_label(Color32::from_rgb(0xff, 0x9c, 0xff), what);
         }
         egui::Grid::new("sequence entry details")
             .num_columns(2)
@@ -782,10 +840,20 @@ impl SequenceState {
                 });
                 ui.end_row();
 
+                ui.label("Scan");
+                ui.checkbox(&mut e.scan, "take the scan")
+                    .on_hover_text("Off: this entry only sets things up, moves the tip and runs spectroscopy");
+                ui.end_row();
+
                 ui.label("Stamp");
-                ui.checkbox(&mut e.stamp, "add image to layers when done");
+                ui.add_enabled(e.scan, egui::Checkbox::new(&mut e.stamp, "add image to layers when done"));
                 ui.end_row();
             });
+        ui.add_space(4.);
+        egui::CollapsingHeader::new(RichText::new("Tip moves & spectroscopy (after the scan)").strong())
+            .id_salt(("seq tip", i))
+            .default_open(!e.tip.points.is_empty())
+            .show(ui, |ui| show_tip_plan(ui, e, tip_pos, &mut drag));
         self.drag = drag;
         if e.bias == Some(0.) {
             ui.colored_label(Color32::ORANGE, "⚠ Bias is 0 V");
@@ -820,6 +888,9 @@ impl SequenceState {
                     if global == run.current {
                         let extra = match (step, run.wait_remaining) {
                             (Step::Wait(_), Some(rem)) => format!("   ◀ {rem:.0} s"),
+                            (Step::Spectroscopy(_), _) if run.detail.is_some() => {
+                                format!("   ◀ {}", run.detail.as_deref().unwrap_or_default())
+                            }
                             _ if run.paused => "   ◀ paused".into(),
                             _ => "   ◀".into(),
                         };
@@ -987,10 +1058,26 @@ impl SequenceState {
         ui: &mut Ui,
         course: &CourseMotionState,
         last_dir: Dir,
+        scanning: bool,
         blocked_by: Option<&str>,
     ) {
         if let (Some(reason), false) = (blocked_by, self.is_active()) {
             ui.colored_label(Color32::ORANGE, reason);
+        }
+        // A scan started by hand is running: queue behind it or adopt it.
+        let current = (scanning && !self.is_active()).then_some(self.current_scan);
+        if current.is_some() {
+            ui.horizontal(|ui| {
+                ui.label(format!("A scan {} is running:", last_dir.arrow()));
+                ui.radio_value(&mut self.current_scan, CurrentScan::After, "start the sequence when it ends")
+                    .on_hover_text(
+                        "The sequence waits for the scan to finish, then runs.                          Abort while waiting leaves the scan running.",
+                    );
+                ui.radio_value(&mut self.current_scan, CurrentScan::Include, "add it to the sequence")
+                    .on_hover_text(
+                        "The running scan becomes the first scan of the sequence: it is stamped                          when done, Pause/Abort act on it, and alternating entries follow on from                          its direction.",
+                    );
+            });
         }
         ui.horizontal(|ui| {
             let active = self.is_active();
@@ -1001,7 +1088,7 @@ impl SequenceState {
                 .add_enabled(!active && has_entries, egui::Button::new("▶ Run all"))
                 .clicked()
             {
-                self.start(0, course.group_index(), last_dir);
+                self.start(0, course.group_index(), last_dir, current);
             }
             let sel = self.selected.filter(|&i| i < self.seq.entries.len());
             if ui
@@ -1011,7 +1098,7 @@ impl SequenceState {
                 )
                 .clicked()
             {
-                self.start(sel.unwrap(), course.group_index(), last_dir);
+                self.start(sel.unwrap(), course.group_index(), last_dir, current);
             }
             let paused = self.run.as_ref().is_some_and(|r| r.paused);
             if paused {
@@ -1040,9 +1127,13 @@ impl SequenceState {
             ui.separator();
             let progress = match &self.run {
                 Some(run) => {
-                    let entry = run.steps.get(run.current).map_or(0, |(i, _)| *i + 1);
+                    let entry = match run.steps.get(run.current) {
+                        Some((CURRENT_SCAN, _)) => "current scan".to_string(),
+                        Some((i, _)) => format!("entry {}", i + 1),
+                        None => "entry 0".to_string(),
+                    };
                     format!(
-                        "{} · entry {entry} · step {}/{}",
+                        "{} · {entry} · step {}/{}",
                         self.status,
                         (run.current + 1).min(run.steps.len()),
                         run.steps.len()
@@ -1113,6 +1204,88 @@ fn list_values(text: &str) -> Result<Vec<f64>, String> {
         return Err("Enter at least one value".into());
     }
     Ok(values)
+}
+
+/// The tip positions of an entry and the I(V) settings used at each.
+fn show_tip_plan(ui: &mut Ui, e: &mut ScanEntry, tip_pos: Option<DVec2>, drag: &mut Option<DragTarget>) {
+    let t = &mut e.tip;
+    ui.horizontal(|ui| {
+        drag_toggle(ui, drag, DragTarget::Tip);
+        if ui
+            .add_enabled(tip_pos.is_some(), egui::Button::new("+ Where the tip is"))
+            .on_hover_text("Add the tip's current position")
+            .clicked()
+        {
+            if let Some(p) = tip_pos {
+                t.points.push(p.to_array());
+            }
+        }
+        if ui.add_enabled(!t.points.is_empty(), egui::Button::new("Clear")).clicked() {
+            t.points.clear();
+        }
+    });
+    if t.points.is_empty() {
+        ui.weak("No tip positions: the entry just scans.");
+    } else {
+        let mut remove = None;
+        egui::Grid::new(("seq tip points", e.name.as_str())).num_columns(3).show(ui, |ui| {
+            for (k, p) in t.points.iter_mut().enumerate() {
+                ui.label(format!("P{:02}", k + 1));
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut p[0]).speed(0.5).max_decimals(1).prefix("x ").suffix(" nm"));
+                    ui.add(DragValue::new(&mut p[1]).speed(0.5).max_decimals(1).prefix("y ").suffix(" nm"));
+                });
+                if ui.small_button("🗑").on_hover_text("Remove this position").clicked() {
+                    remove = Some(k);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(k) = remove {
+            t.points.remove(k);
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.label("Settle at each position");
+        ui.add(DragValue::new(&mut t.settle_s).range(0.0..=f64::MAX).speed(0.1).suffix(" s"));
+    });
+    ui.checkbox(&mut t.spectroscopy, "Run an I(V) series at each position");
+    ui.add_enabled_ui(t.spectroscopy, |ui| {
+        let iv = &mut t.iv;
+        egui::Grid::new(("seq tip iv", e.name.as_str())).num_columns(2).show(ui, |ui| {
+            ui.label("Curves per position");
+            ui.add(DragValue::new(&mut iv.num_curves).range(1..=1000));
+            ui.end_row();
+            ui.label("Base name");
+            ui.text_edit_singleline(&mut iv.base_name)
+                .on_hover_text("Each position is saved as <base>_<entry>_P01, _P02, …");
+            ui.end_row();
+            ui.label("Z change per curve");
+            ui.add(DragValue::new(&mut iv.z_step_pm).speed(1.).suffix(" pm"))
+                .on_hover_text("Relative to the reference height; negative moves the tip closer");
+            ui.end_row();
+            ui.label("Between curves");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut iv.feedback_between, false, "Z ctrl OFF");
+                ui.radio_value(&mut iv.feedback_between, true, "Z ctrl ON");
+            });
+            ui.end_row();
+            ui.label("Settle time");
+            ui.add_enabled(
+                iv.feedback_between,
+                DragValue::new(&mut iv.delay_s).speed(0.05).range(0.0..=3600.0).suffix(" s"),
+            );
+            ui.end_row();
+        });
+        ui.weak(
+            "Sweep range, points and channels come from the Nanonis Bias Spectroscopy module. \
+             Each series is saved to the Nanonis session folder (curves, one combined plot \
+             .jpg/.svg and one table) and shown in the I(V) window.",
+        );
+        if let Err(msg) = iv.validate() {
+            ui.colored_label(Color32::ORANGE, format!("⚠ {msg}"));
+        }
+    });
 }
 
 /// A small "drag on map" toggle button. Returns true when switched on.

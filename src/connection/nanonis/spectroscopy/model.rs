@@ -77,8 +77,18 @@ pub struct IvCurve {
     pub didv_pa: Vec<(String, Vec<f64>)>,
     /// When the curve was acquired (UTC, ISO 8601).
     pub timestamp: String,
+    /// Bias (V) and current setpoint (pA) when the series started.
+    pub start_bias_v: f64,
+    pub start_setpoint_pa: f64,
 }
 impl IvCurve {
+    /// "Start: bias -2.000 V, setpoint 50.0 pA"
+    pub fn start_conditions(&self) -> String {
+        format!(
+            "Start: bias {:.3} V, setpoint {:.1} pA",
+            self.start_bias_v, self.start_setpoint_pa
+        )
+    }
     pub fn label(&self) -> String {
         format!("Z = {:+.1} pm", self.z_offset_pm)
     }
@@ -178,14 +188,17 @@ pub fn extract_iv(names: &[String], channels: &[Vec<f64>]) -> Result<IvData, Str
     Ok((bias, current_pa, didv))
 }
 
-/// The dI/dV channel shown for "Auto": lock-in demod 1 X if present, else the first.
+/// The dI/dV channel shown for "Auto": lock-in demod 1 Y if present, then
+/// demod 1 X, else the first.
 pub fn auto_didv_channel(names: &[String]) -> Option<&String> {
-    names
-        .iter()
-        .find(|n| {
+    let find = |marks: &[&str]| {
+        names.iter().find(|n| {
             let l = n.to_lowercase();
-            l.contains("demod 1 x") || l.contains("lix")
+            marks.iter().any(|m| l.contains(m))
         })
+    };
+    find(&["demod 1 y", "liy"])
+        .or_else(|| find(&["demod 1 x", "lix"]))
         .or(names.first())
 }
 
@@ -213,6 +226,8 @@ pub fn dat_contents(prefix: &str, curve: &IvCurve, didv_channels: &[String]) -> 
     let _ = writeln!(s, "# Zero-indexed Sequence Counter: {}", curve.index);
     let _ = writeln!(s, "# Target Measured relative Z: {:+.3} pm", curve.z_offset_pm);
     let _ = writeln!(s, "# Timestamp: {}", curve.timestamp);
+    let _ = writeln!(s, "# Start bias: {} V", fmt_g(curve.start_bias_v));
+    let _ = writeln!(s, "# Start current setpoint: {} pA", fmt_g(curve.start_setpoint_pa));
     let _ = writeln!(s, "# -------------------------------------------------");
     let mut columns = vec!["Bias_Voltage_V".to_string(), "Tunneling_Current_pA".to_string()];
     columns.extend(didv_channels.iter().map(|n| format!("{n}_pA")));
@@ -314,6 +329,16 @@ mod tests {
     }
 
     #[test]
+    fn auto_channel_prefers_y() {
+        let n = names(&["LI Demod 1 X (A)", "LI Demod 1 Y (A)", "LI Demod 2 X (A)"]);
+        assert_eq!(auto_didv_channel(&n), Some(&n[1]));
+        let n = names(&["LI Demod 2 X (A)", "LI Demod 1 X (A)"]);
+        assert_eq!(auto_didv_channel(&n), Some(&n[1]));
+        let n = names(&["dIdV (A)"]);
+        assert_eq!(auto_didv_channel(&n), Some(&n[0]));
+    }
+
+    #[test]
     fn extract_falls_back_to_order() {
         let n = names(&["Sweep (V)", "Signal"]);
         let (v, i, _) = extract_iv(&n, &[vec![0., 1.], vec![1e-12, 2e-12]]).unwrap();
@@ -350,13 +375,17 @@ mod tests {
             current_pa: vec![-1.25, 2.],
             didv_pa: vec![("LIX".into(), vec![0.1, 0.2])],
             timestamp: "t".into(),
+            start_bias_v: -2.,
+            start_setpoint_pa: 50.,
         };
         assert_eq!(dat_file_name("BiasSpec", &c), "BiasSpec_1_-20.0pm.dat");
         let s = dat_contents("BiasSpec", &c, &["LIX".into()]);
         let lines: Vec<_> = s.lines().collect();
-        assert_eq!(lines[6], "Bias_Voltage_V\tTunneling_Current_pA\tLIX_pA");
-        assert_eq!(lines[7], "-0.5\t-1.25\t0.1");
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[5], "# Start bias: -2 V");
+        assert_eq!(lines[6], "# Start current setpoint: 50 pA");
+        assert_eq!(lines[8], "Bias_Voltage_V\tTunneling_Current_pA\tLIX_pA");
+        assert_eq!(lines[9], "-0.5\t-1.25\t0.1");
+        assert_eq!(lines.len(), 11);
     }
 
     #[test]

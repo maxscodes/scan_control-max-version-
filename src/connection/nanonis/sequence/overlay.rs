@@ -1,4 +1,4 @@
-use egui::{Align2, Color32, FontId, Id, Ui};
+use egui::{Align2, Color32, FontId, Id, Stroke, Ui};
 use glam::{DAffine2, DVec2, IVec2};
 
 use crate::{
@@ -47,7 +47,11 @@ impl SequenceState {
         // Apply this frame's drag before drawing so the outline follows the mouse.
         if let Some(i) = drag_entry {
             if !course.menu_open() {
-                self.apply_drag(ui, i, scan_area, course, Frame::from_transform(transform));
+                if self.drag == Some(DragTarget::Tip) {
+                    self.apply_tip_edit(ui, i, scan_area, course);
+                } else {
+                    self.apply_drag(ui, i, scan_area, course, Frame::from_transform(transform));
+                }
             }
         }
 
@@ -63,10 +67,36 @@ impl SequenceState {
 
         let mut frame = Frame::from_transform(transform);
         let mut offset = DVec2::ZERO;
-        for &(entry, step) in steps.iter().skip(start) {
+        // Tip positions: (entry, number within the entry, last point on screen).
+        let mut tip_count: Option<(usize, usize, egui::Pos2)> = None;
+        for (entry, step) in steps.iter().skip(start) {
+            let entry = *entry;
             match step {
+                Step::MoveTip(p) => {
+                    let color = if drag_entry == Some(entry) { DRAG_COLOR } else { PLAN_COLOR };
+                    let to_screen = world2screen * scan_area.world_transform * DAffine2::from_translation(offset);
+                    let at = to_screen.transform_point2(DVec2::from_array(*p)).to_egui_pos2();
+                    let k = match tip_count {
+                        Some((e, k, last)) if e == entry => {
+                            ui.painter().line_segment([last, at], Stroke::new(1., color.gamma_multiply(0.6)));
+                            k + 1
+                        }
+                        _ => 1,
+                    };
+                    tip_count = Some((entry, k, at));
+                    let painter = ui.painter();
+                    painter.circle_stroke(at, 5., Stroke::new(2., color));
+                    painter.circle_filled(at, 1.5, color);
+                    painter.text(
+                        at + egui::vec2(6., -4.),
+                        Align2::LEFT_BOTTOM,
+                        format!("{}.{k}", entry + 1),
+                        FontId::proportional(12.),
+                        color,
+                    );
+                }
                 Step::CoarseMove { steps } => {
-                    offset += steps2real * IVec2::from_array(steps).as_dvec2();
+                    offset += steps2real * IVec2::from_array(*steps).as_dvec2();
                 }
                 Step::SetFrame(spec) => frame = spec.apply(frame),
                 Step::Scan(_) => {
@@ -102,6 +132,69 @@ impl SequenceState {
                     );
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Coarse offset (nm) in effect for entry `target`'s tip moves: every
+    /// coarse move up to and including its own.
+    fn offset_through(&self, target: usize, course: &CourseMotionState) -> DVec2 {
+        let steps2real = course.steps2real_world();
+        compile(&self.seq, 0, Dir::Down)
+            .into_iter()
+            .take_while(|(entry, _)| *entry <= target)
+            .filter_map(|(_, step)| match step {
+                Step::CoarseMove { steps } => Some(steps2real * IVec2::from_array(steps).as_dvec2()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Ctrl+click adds a tip position (or removes the one under the mouse),
+    /// ctrl+drag moves one.
+    fn apply_tip_edit(&mut self, ui: &Ui, i: usize, scan_area: &ScanArea, course: &CourseMotionState) {
+        /// Pick radius on screen, points.
+        const PICK: f64 = 10.;
+        let ctx = ui
+            .data(|map| map.get_temp::<ScanViewCtx>(Id::new(())))
+            .unwrap();
+        let resp = &ctx.screen_response;
+        if !ui.input(|i| i.modifiers.ctrl) {
+            self.tip_drag = None;
+            return;
+        }
+        let to_screen = ctx.world2egui()
+            * scan_area.world_transform
+            * DAffine2::from_translation(self.offset_through(i, course));
+        let Some(pointer) = resp.interact_pointer_pos().or(resp.hover_pos()) else {
+            return;
+        };
+        let pointer = DVec2::new(pointer.x as f64, pointer.y as f64);
+        let at = to_screen.inverse().transform_point2(pointer);
+        let points = &mut self.seq.entries[i].tip.points;
+        let nearest = points
+            .iter()
+            .enumerate()
+            .map(|(k, p)| (k, to_screen.transform_point2(DVec2::from_array(*p)).distance(pointer)))
+            .filter(|(_, d)| *d <= PICK)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(k, _)| k);
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.tip_drag = nearest;
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(p) = self.tip_drag.and_then(|k| points.get_mut(k)) {
+                *p = at.to_array();
+            }
+        } else {
+            self.tip_drag = None;
+        }
+        if resp.clicked() {
+            match nearest {
+                Some(k) => {
+                    points.remove(k);
+                }
+                None => points.push(at.to_array()),
             }
         }
     }
@@ -170,7 +263,7 @@ impl SequenceState {
                 c.steps = course.real_to_steps(real).to_array();
                 e.coarse = Some(c);
             }
-            None => {}
+            Some(DragTarget::Tip) | None => {}
         }
     }
 }

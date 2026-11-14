@@ -131,7 +131,10 @@ impl CourseMotionState {
             .clicked()
         {
             self.menu_active = true;
-            self.move_target = DVec2::ZERO;
+            // A running move (e.g. from Ring Assist) still needs its target.
+            if !self.currently_moving {
+                self.move_target = DVec2::ZERO;
+            }
         }
         let mut menu_active = self.menu_active;
         egui::Window::new("Course Motion")
@@ -276,7 +279,7 @@ impl CourseMotionState {
             return;
         };
         if self.menu_active {
-            if ui.input(|i| i.modifiers.ctrl) {
+            if ui.input(|i| i.modifiers.ctrl) && !self.currently_moving {
                 let [_, _, translate] = world_delta_transform(ui);
                 let world_translate = translate.translation;
                 let scan_world_translate = scan_area
@@ -342,6 +345,34 @@ impl CourseMotionState {
     /// The Course Motion window is open (it owns ctrl+drag on the map).
     pub fn menu_open(&self) -> bool {
         self.menu_active
+    }
+    /// A coarse move is running.
+    pub fn is_moving(&self) -> bool {
+        self.currently_moving
+    }
+    /// Start a coarse move of `steps` (e.g. from Ring Assist), with this
+    /// menu's withdraw/approach settings. When it completes, the scan area is
+    /// shifted on the map as for a move made here. Returns false if a move is
+    /// already running.
+    pub fn start_move(&mut self, steps: IVec2) -> bool {
+        if self.currently_moving || steps == IVec2::ZERO {
+            return false;
+        }
+        // Completion applies `get_steps()`, which is derived from the target.
+        self.move_target = self.steps2real_world() * steps.as_dvec2();
+        info!("Executing course move {steps:?} on group {} (Ring Assist)", self.group);
+        self.currently_moving = true;
+        self.move_sender.send(CourseMoveCommand {
+            steps,
+            group: self.group - 1,
+            auto_withdraw: self.auto_withdraw,
+            auto_approach: self.auto_approach,
+        });
+        true
+    }
+    /// Withdraw / approach settings used for moves.
+    pub fn withdraw_approach(&self) -> (bool, bool) {
+        (self.auto_withdraw, self.auto_approach)
     }
     fn write_steps(&mut self, steps: IVec2) {
         let change = steps - self.get_steps();

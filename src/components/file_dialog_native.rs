@@ -1,8 +1,60 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use glam::DAffine2;
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, WindowHandle,
+};
 
 use crate::{project::ProjectDb, scan_view::ImageEncoder, view_object};
+
+/// The main window, used as the owner of every file dialog. Without an
+/// owner, Windows may open the dialog behind the app window, so it looks like
+/// the button did nothing.
+struct MainWindow {
+    window: RawWindowHandle,
+    display: RawDisplayHandle,
+}
+// Safety: the handles are only identifiers (an HWND on Windows); the main
+// window outlives every dialog.
+unsafe impl Send for MainWindow {}
+unsafe impl Sync for MainWindow {}
+impl HasWindowHandle for MainWindow {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        // Safety: the main window lives as long as the app.
+        Ok(unsafe { WindowHandle::borrow_raw(self.window) })
+    }
+}
+impl HasDisplayHandle for MainWindow {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        // Safety: as above.
+        Ok(unsafe { DisplayHandle::borrow_raw(self.display) })
+    }
+}
+static MAIN_WINDOW: OnceLock<MainWindow> = OnceLock::new();
+
+/// Remember the main window so [`dialog`] can attach dialogs to it. Call once
+/// at startup, before any dialog is created.
+pub fn set_main_window(w: &(impl HasWindowHandle + HasDisplayHandle)) {
+    match (w.window_handle(), w.display_handle()) {
+        (Ok(window), Ok(display)) => {
+            let _ = MAIN_WINDOW.set(MainWindow {
+                window: window.as_raw(),
+                display: display.as_raw(),
+            });
+        }
+        (Err(e), _) | (_, Err(e)) => tracing::warn!("no window handle for file dialogs: {e}"),
+    }
+}
+
+/// A file dialog owned by the main window, so it opens in front of it.
+pub fn dialog() -> rfd::FileDialog {
+    let d = rfd::FileDialog::new();
+    match MAIN_WINDOW.get() {
+        Some(w) => d.set_parent(w),
+        None => d,
+    }
+}
 
 pub struct ObjectImportDialog {
     channel_tx: crossbeam::channel::Sender<view_object::Object>,
@@ -11,7 +63,7 @@ pub struct ObjectImportDialog {
 }
 impl ObjectImportDialog {
     pub fn new() -> Self {
-        let dialog = rfd::FileDialog::new()
+        let dialog = dialog()
             .add_filter("Any", &["png", "jpeg", "gds"])
             .add_filter("Image", &["png", "jpeg"])
             .add_filter("GDS", &["gds"])
@@ -51,7 +103,7 @@ pub struct ProjectOpenDialog {
 }
 impl ProjectOpenDialog {
     pub fn new() -> Self {
-        let dialog = rfd::FileDialog::new()
+        let dialog = dialog()
             .add_filter("Project File", &["scp"])
             .set_title("Open Project");
         let (channel_tx, channel_rx) = crossbeam::channel::unbounded();
@@ -90,7 +142,7 @@ pub struct ProjectSaveDialog {
 }
 impl ProjectSaveDialog {
     pub fn new() -> Self {
-        let dialog = rfd::FileDialog::new()
+        let dialog = dialog()
             .set_title("Save Project")
             .set_can_create_directories(true)
             .set_file_name("project.scp");

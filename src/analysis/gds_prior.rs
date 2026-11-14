@@ -14,7 +14,10 @@ use std::{collections::BTreeMap, sync::Arc};
 use glam::{DAffine2, DMat2, DVec2, Vec2};
 use uuid::Uuid;
 
-use crate::{components::selectable_list::SelectableList, connection::LiveImage, view_object::Object};
+use crate::{
+    analysis::ring_match::Expected, components::selectable_list::SelectableList, connection::LiveImage,
+    view_object::Object,
+};
 
 /// Angle bins (10° each) recording which side of a ring system has arcs.
 const BINS: usize = 36;
@@ -39,14 +42,16 @@ pub struct RingSystem {
     /// (inner, outer) radius of each band, local nm, innermost first.
     pub bands: Vec<(f64, f64)>,
     /// Angle bins (from +x, counter-clockwise) that have arcs.
-    covered: u64,
+    pub(crate) covered: u64,
+    /// GDS layer the bands are drawn on.
+    pub layer: u16,
 }
 
 impl RingSystem {
     pub fn outer_radius(&self) -> f64 {
         self.bands.last().map_or(0., |b| b.1)
     }
-    fn covers(&self, angle: f64) -> bool {
+    pub fn covers(&self, angle: f64) -> bool {
         let b = angle_bin(angle);
         (0..3).any(|k| self.covered & (1 << ((b + BINS - 1 + k) % BINS)) != 0)
     }
@@ -59,6 +64,7 @@ fn angle_bin(a: f64) -> usize {
 
 /// One annular arc polygon.
 struct Band {
+    layer: u16,
     center: DVec2,
     r_in: f64,
     r_out: f64,
@@ -67,7 +73,10 @@ struct Band {
 
 /// Find ring systems: groups of at least three concentric annular bands.
 pub fn find_ring_systems(polys: &BTreeMap<u16, Vec<Vec<Vec2>>>) -> Vec<RingSystem> {
-    let bands: Vec<Band> = polys.values().flatten().filter_map(|p| fit_band(p)).collect();
+    let bands: Vec<Band> = polys
+        .iter()
+        .flat_map(|(&layer, ps)| ps.iter().filter_map(move |p| fit_band(p).map(|b| Band { layer, ..b })))
+        .collect();
     let mut groups: Vec<Vec<Band>> = Vec::new();
     for b in bands {
         let tol = |r: f64| (0.01 * r).max(100.);
@@ -88,7 +97,7 @@ pub fn find_ring_systems(polys: &BTreeMap<u16, Vec<Vec<Vec2>>>) -> Vec<RingSyste
             radii.sort_by(|a, b| a.0.total_cmp(&b.0));
             // Pieces of the same band (e.g. left and right halves) count once.
             radii.dedup_by(|a, b| (a.0 - b.0).abs() < (0.02 * b.1).max(20.));
-            (radii.len() >= 3).then_some(RingSystem { center, bands: radii, covered })
+            (radii.len() >= 3).then_some(RingSystem { center, bands: radii, covered, layer: g[0].layer })
         })
         .collect()
 }
@@ -186,7 +195,7 @@ fn fit_band(poly: &[Vec2]) -> Option<Band> {
             }
         }
     }
-    Some(Band { center: c, r_in, r_out, covered })
+    Some(Band { layer: 0, center: c, r_in, r_out, covered })
 }
 
 /// Solve a small linear system by Gaussian elimination with partial pivoting.
@@ -224,6 +233,8 @@ pub struct GdsRings {
     pub uuid: Uuid,
     pub transform: DAffine2,
     pub systems: Arc<Vec<RingSystem>>,
+    /// For finding where a frame landed on this GDS.
+    pub landing: Option<crate::analysis::landing::LandingSource>,
 }
 
 /// Visible GDS layers that contain ring systems.
@@ -237,6 +248,7 @@ pub fn collect(objects: &SelectableList<Object>) -> Vec<GdsRings> {
                     uuid: image.uuid(),
                     transform: image.transform,
                     systems,
+                    landing: Some(image.landing_source()),
                 })
             }
             _ => None,
@@ -264,6 +276,15 @@ impl GdsPrediction {
 
 /// Predict the move for a frame (quad → world transform) from one GDS.
 pub fn predict(systems: &[RingSystem], gds_transform: DAffine2, frame: DAffine2) -> Option<GdsPrediction> {
+    predict_system(systems, gds_transform, frame).map(|p| p.1)
+}
+
+/// Like `predict`, with the index of the ring system used.
+fn predict_system(
+    systems: &[RingSystem],
+    gds_transform: DAffine2,
+    frame: DAffine2,
+) -> Option<(usize, GdsPrediction)> {
     let inv = gds_transform.inverse();
     let p = inv.transform_point2(frame.translation);
     let m = inv.matrix2 * frame.matrix2;
@@ -282,15 +303,72 @@ pub fn predict(systems: &[RingSystem], gds_transform: DAffine2, frame: DAffine2)
             best = Some((score, i));
         }
     }
-    let s = &systems[best?.1];
+    let si = best?.1;
+    let s = &systems[si];
     let center_world = gds_transform.transform_point2(s.center);
     let v = center_world - frame.translation;
-    Some(GdsPrediction {
-        center_world,
-        dir_world: v.normalize_or_zero(),
-        dist_nm: v.length(),
-        smallest_in_frame: (p - s.center).length() - half_diag <= s.bands[0].1,
-    })
+    Some((
+        si,
+        GdsPrediction {
+            center_world,
+            dir_world: v.normalize_or_zero(),
+            dist_nm: v.length(),
+            smallest_in_frame: (p - s.center).length() - half_diag <= s.bands[0].1,
+        },
+    ))
+}
+
+/// The rings the GDS expects in a frame of `size` pixels, in pixel
+/// coordinates (+x right, +y down rows), from whichever GDS covers it.
+pub fn expected(gds: &[GdsRings], frame: DAffine2, size: [u32; 2]) -> Option<Expected> {
+    let (g, si, pred) = gds
+        .iter()
+        .filter_map(|g| predict_system(&g.systems, g.transform, frame).map(|(si, p)| (g, si, p)))
+        .min_by(|a, b| a.2.dist_nm.total_cmp(&b.2.dist_nm))?;
+    let (w, h) = (size[0] as f64, size[1] as f64);
+    if w < 1. || h < 1. {
+        return None;
+    }
+    let q = frame.inverse().transform_point2(pred.center_world);
+    let center_px = DVec2::new((q.x + 0.5) * w - 0.5, (q.y + 0.5) * h - 0.5);
+    let gds_scale = g.transform.matrix2.determinant().abs().sqrt();
+    let nm_per_px = (frame.matrix2.x_axis.length() / w + frame.matrix2.y_axis.length() / h) / 2.;
+    let k = gds_scale / nm_per_px;
+    let bands_px = g.systems[si].bands.iter().map(|b| (b.0 * k, b.1 * k)).collect();
+    Some(Expected { center_px, bands_px })
+}
+
+/// The distinct kinds of ring system (band radii), scaled by `scale`
+/// (local nm → world nm). Systems with the same band layout count once.
+pub fn ring_kinds(systems: &[RingSystem], scale: f64) -> Vec<Vec<(f64, f64)>> {
+    let mut kinds: Vec<Vec<(f64, f64)>> = Vec::new();
+    for s in systems {
+        let b: Vec<(f64, f64)> = s.bands.iter().map(|b| (b.0 * scale, b.1 * scale)).collect();
+        let same = |k: &Vec<(f64, f64)>| {
+            k.len() == b.len()
+                && k.iter().zip(&b).all(|(x, y)| (x.0 - y.0).abs() < 0.02 * y.1 && (x.1 - y.1).abs() < 0.02 * y.1)
+        };
+        if !kinds.iter().any(same) {
+            kinds.push(b);
+        }
+    }
+    kinds
+}
+
+/// Ring kinds of every GDS on the map, in world nm (with each GDS's scale).
+pub fn ring_kinds_on_map(gds: &[GdsRings]) -> Vec<Vec<(f64, f64)>> {
+    let mut all = Vec::new();
+    for g in gds {
+        for k in ring_kinds(&g.systems, g.transform.matrix2.determinant().abs().sqrt()) {
+            let dup = all.iter().any(|a: &Vec<(f64, f64)>| {
+                a.len() == k.len() && a.iter().zip(&k).all(|(x, y)| (x.1 - y.1).abs() < 0.02 * y.1)
+            });
+            if !dup {
+                all.push(k);
+            }
+        }
+    }
+    all
 }
 
 /// Prediction from whichever GDS covers the frame (the nearest centre wins).
@@ -358,8 +436,15 @@ pub fn band_orientation(data: &[f32], size: [u32; 2], nm_per_px: f64) -> Option<
     if w < 16 || h < 16 || data.len() != w * h || !(nm_per_px > 0.) {
         return None;
     }
+    let res = detrend_clip(data, w, h)?;
+    band_orientation_from(res, w, h, nm_per_px)
+}
+
+/// Remove a quadratic background and clip outliers (blobs) to the 5–95 %
+/// range. Gaps (NaN) stay NaN. `None` with less than half the frame scanned.
+pub(crate) fn detrend_clip(data: &[f32], w: usize, h: usize) -> Option<Vec<f64>> {
     let valid = data.iter().filter(|v| v.is_finite()).count();
-    if valid * 2 < w * h {
+    if valid * 2 < w * h || valid < 16 {
         return None;
     }
     let uv = |i: usize| ((i % w) as f64 / w as f64 - 0.5, (i / w) as f64 / h as f64 - 0.5);
@@ -402,6 +487,10 @@ pub fn band_orientation(data: &[f32], size: [u32; 2], nm_per_px: f64) -> Option<
     for v in res.iter_mut().filter(|v| v.is_finite()) {
         *v = v.clamp(lo, hi);
     }
+    Some(res)
+}
+
+fn band_orientation_from(res: Vec<f64>, w: usize, h: usize, nm_per_px: f64) -> Option<Bands> {
 
     // Block-average to about 64 px.
     let k = (w.max(h) / 64).max(1);
@@ -457,7 +546,7 @@ pub fn band_orientation(data: &[f32], size: [u32; 2], nm_per_px: f64) -> Option<
     Some(Bands { normal_px: DVec2::new(angle.cos(), angle.sin()), coherence })
 }
 
-fn blur(img: &[f64], w: usize, h: usize, sigma: f64) -> Vec<f64> {
+pub(crate) fn blur(img: &[f64], w: usize, h: usize, sigma: f64) -> Vec<f64> {
     let r = (3. * sigma).ceil() as isize;
     let kernel: Vec<f64> = (-r..=r).map(|x| (-(x * x) as f64 / (2. * sigma * sigma)).exp()).collect();
     let mut tmp = vec![0.; w * h];
@@ -839,6 +928,21 @@ mod tests {
     }
 
     #[test]
+    fn expected_rings_in_pixels() {
+        let sys = Arc::new(find_ring_systems(&device()));
+        let gds = DAffine2::from_scale_angle_translation(DVec2::splat(0.75), 0., DVec2::new(5000., 1000.));
+        let g = [GdsRings { uuid: Uuid::nil(), transform: gds, systems: sys, landing: None }];
+        // 3 µm frame, 100 px, world y up and rows down; centre 6 µm (local) left of the ring centre.
+        let at = gds.transform_point2(DVec2::new(-6000., 3000.));
+        let frame = DAffine2::from_scale_angle_translation(DVec2::new(3000., -3000.), 0., at);
+        let e = expected(&g, frame, [100, 100]).unwrap();
+        // 4.5 µm world to the right = 150 px; same row as the frame centre.
+        assert!((e.center_px - DVec2::new(49.5 + 150., 49.5)).length() < 1e-6, "{e:?}");
+        // Innermost band 1..2 µm local = 0.75..1.5 µm world = 25..50 px.
+        assert!((e.bands_px[0].0 - 25.).abs() < 0.1 && (e.bands_px[0].1 - 50.).abs() < 0.1, "{e:?}");
+    }
+
+    #[test]
     fn band_orientation_finds_stripe_normal() {
         // Stripes whose normal is at 30° (pixel axes), on a tilted background
         // with a few bright blobs.
@@ -976,7 +1080,7 @@ mod real {
                     s.bands[0]
                 );
             }
-            gds.push(GdsRings { uuid: id, transform, systems: Arc::new(systems) });
+            gds.push(GdsRings { uuid: id, transform, systems: Arc::new(systems), landing: None });
         }
         let lt = txn.open_table(LT).unwrap();
         let ld = txn.open_table(LD).unwrap();
@@ -1043,6 +1147,28 @@ mod real {
 }
 
 #[cfg(test)]
+mod files {
+    use super::*;
+
+    /// Ring systems in the GDS files next to Cargo.toml:
+    /// `cargo test --bin scan_control gds_file_rings -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gds_file_rings() {
+        for f in ["As_Implanted_MLA150.GDS", "edge-deposit.GDS"] {
+            let polys = crate::scan_view::gds_image::read_polys(f);
+            let n: usize = polys.values().map(|p| p.len()).sum();
+            let systems = find_ring_systems(&polys);
+            println!("{f}: {n} polygons, layers {:?}, {} ring systems", polys.keys().collect::<Vec<_>>(), systems.len());
+            for s in &systems {
+                let b: Vec<(i64, i64)> = s.bands.iter().map(|b| (b.0.round() as i64, b.1.round() as i64)).collect();
+                println!("  centre {:?} bands {b:?}", s.center.round());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod bench {
     use super::*;
     use std::time::Instant;
@@ -1082,7 +1208,7 @@ mod bench {
         let t = Instant::now();
         let sys = find_ring_systems(&polys);
         println!("find_ring_systems (300 arcs): {:?}, {} systems", t.elapsed(), sys.len());
-        let g = vec![GdsRings { uuid: Uuid::nil(), transform: DAffine2::IDENTITY, systems: Arc::new(sys) }];
+        let g = vec![GdsRings { uuid: Uuid::nil(), transform: DAffine2::IDENTITY, systems: Arc::new(sys), landing: None }];
         let t = Instant::now();
         for k in 0..10000 {
             let f = DAffine2::from_scale_angle_translation(DVec2::splat(3000.), 0., DVec2::new(k as f64, 5000.));
@@ -1091,3 +1217,4 @@ mod bench {
         println!("predict_any: {:?} each", t.elapsed() / 10000);
     }
 }
+

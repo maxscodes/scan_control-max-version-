@@ -1,11 +1,13 @@
 mod channel_state;
 mod command_channel;
 mod course_motion;
+mod fine_motion;
 mod lithography;
 mod ring_assist;
 mod scan_control;
 mod scan_status;
 mod sequence;
+mod stamp_names;
 mod spectroscopy;
 mod worker;
 
@@ -32,6 +34,7 @@ use crate::{
         live_image::{FrameData, LiveImage},
         nanonis::{
             course_motion::CourseMotionState,
+            fine_motion::FineMotionState,
             lithography::{LithographyState, LithographyWorker},
             ring_assist::RingAssistState,
             scan_control::{PanelInput, Readback, ScanControlState},
@@ -57,6 +60,9 @@ pub struct NanonisConnection {
     channel_state: SharedState<ChannelState>,
     scan_status: SharedState<ScanStatus>,
     base_name: SharedState<String>,
+    /// Nanonis save folder, to name stamps after their .sxm files.
+    session_path: SharedState<String>,
+    stamp_namer: stamp_names::StampNamer,
     frame_queue_tx: OverwriteQueueSender<LineDir>,
     tip_pos: SharedState<DVec2>,
     readback: SharedState<Readback>,
@@ -65,6 +71,7 @@ pub struct NanonisConnection {
     slow_status_init: Arc<AtomicBool>,
     fast_status_init: Arc<AtomicBool>,
     course_menu: CourseMotionState,
+    fine_motion: FineMotionState,
     scan_control: ScanControlState,
     sequence: SequenceState,
     spectroscopy: SpectroscopyState,
@@ -134,6 +141,16 @@ impl Connection for NanonisConnection {
         let (got_forward, got_backward) =
             self.update_image_data(&mut scan_area.live_image, encoder);
         self.update_sequence(scan_area, encoder, got_forward, got_backward);
+        let fine_lock = self.fine_lock();
+        self.fine_motion.update(
+            scan_area,
+            encoder,
+            &mut self.scan_control,
+            &self.frame_queue_tx,
+            got_forward,
+            got_backward,
+            fine_lock,
+        );
         self.ring_assist.update(scan_area, got_forward, &gds);
         self.update_scan_status(scan_area);
         self.update_tip_pos(scan_area);
@@ -186,6 +203,7 @@ impl Connection for NanonisConnection {
                 format!("{}({})", base_name, name_index)
             };
             name_index += 1;
+            self.stamp_namer.add_new(stamp.uuid(), stamp.forward_data.data.clone(), stamp.forward_data.size);
             object_list.insert(
                 index,
                 SelectableEntry::new(
@@ -200,6 +218,7 @@ impl Connection for NanonisConnection {
                 ),
             );
         }
+        self.name_stamps(object_list);
     }
     fn show_menu(
         &mut self,
@@ -230,6 +249,11 @@ impl Connection for NanonisConnection {
         let scanning = scan_status
             .scanning
             .then_some("A scan is running; stop it first");
+        let fine = self
+            .fine_motion
+            .is_running()
+            .then_some("Fine Motion is moving");
+        let fine_lock = self.fine_lock();
         let locked_by = sequence.or(spectroscopy).or(lithography);
         let locked = locked_by.is_some();
 
@@ -266,13 +290,15 @@ impl Connection for NanonisConnection {
         let tools_ui: &mut Ui = if show_tools { ui } else { &mut tools_ui };
         let ui = tools_ui;
         self.course_menu.show_menu(ui, object_list, locked);
+        self.fine_motion.show_menu(ui, object_list, fine_lock);
         self.sequence
             .show_menu(ui, object_list, &self.course_menu, spectroscopy.or(lithography));
         self.spectroscopy
-            .show_menu(ui, sequence.or(lithography).or(scanning));
+            .show_menu(ui, sequence.or(lithography).or(scanning).or(fine));
         self.lithography
-            .show_menu(ui, object_list, sequence.or(spectroscopy).or(scanning));
-        self.ring_assist.show_menu(ui, object_list);
+            .show_menu(ui, object_list, sequence.or(spectroscopy).or(scanning).or(fine));
+        self.ring_assist
+            .show_menu(ui, object_list, &mut self.course_menu, locked_by);
     }
     fn status(&self) -> StatusInfo {
         let status = *self.scan_status.peek();
@@ -302,13 +328,65 @@ impl Connection for NanonisConnection {
             .find_map(|entry| entry.as_scan_area_mut())
         {
             self.sequence.show_overlay(ui, scan_area, &self.course_menu);
-            self.lithography.show_overlay(ui, scan_area);
+            // Only one tool takes ctrl+click / ctrl+drag on the map.
+            let map_free = !self.course_menu.menu_open() && !self.sequence.map_drag_active();
+            self.lithography.show_overlay(ui, scan_area, map_free);
             self.ring_assist.show_overlay(ui, scan_area);
+            let map_free = map_free && !self.lithography.map_edit_active();
+            self.fine_motion.show_overlay(ui, scan_area, map_free);
         }
     }
 }
 
 impl NanonisConnection {
+    /// Name stamps after the .sxm file Nanonis saved the same scan to (and
+    /// their training labels too). Stamps without a file name yet are looked
+    /// up in the background.
+    fn name_stamps(&mut self, object_list: &mut SelectableList<view_object::Object>) {
+        for o in object_list.iter() {
+            if let Object::ScanImage { image, name, .. } = &**o {
+                if !stamp_names::is_file_name(name) && image.forward_data.size[0] > 0 {
+                    self.stamp_namer.add_existing(
+                        image.uuid(),
+                        image.forward_data.data.clone(),
+                        image.forward_data.size,
+                    );
+                }
+            }
+        }
+        let session = self.session_path.read().clone();
+        for (id, file) in self.stamp_namer.poll(&session) {
+            let mut new = file.clone();
+            let mut k = 2;
+            while object_list.iter().any(|o| o.name() == new) {
+                new = format!("{file}({k})");
+                k += 1;
+            }
+            for o in object_list.iter_mut() {
+                if let Object::ScanImage { image, name, .. } = &mut **o {
+                    if image.uuid() == id {
+                        *name = new.clone();
+                        self.ring_assist.rename_label(id, &new);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Why Fine Motion can't move now: another tool drives the tip.
+    fn fine_lock(&self) -> Option<&'static str> {
+        if self.sequence.is_running() {
+            Some("A sequence is running")
+        } else if self.spectroscopy.is_running() {
+            Some("I(V) spectroscopy is running")
+        } else if self.lithography.is_running() {
+            Some("Lithography is running")
+        } else if self.course_menu.is_moving() {
+            Some("A coarse move is running")
+        } else {
+            None
+        }
+    }
     /// Copy the current Nanonis state into a (new or reloaded) scan area.
     fn sync_scan_area(&mut self, scan_area: &mut ScanArea) {
         scan_area.channel_opts = self.channel_state.read().channel_opts_names().collect();
@@ -326,6 +404,7 @@ impl NanonisConnection {
         let backward_data = SharedState::new_default();
         let scan_status = SharedState::new_default();
         let base_name = SharedState::new_default();
+        let session_path = SharedState::new_default();
         let tip_pos = SharedState::new_default();
         let readback = SharedState::new_default();
         let course_voltages = SharedState::new_default();
@@ -342,7 +421,8 @@ impl NanonisConnection {
         let sequence = SequenceState::new(seq_cmd_tx, seq_event_rx);
         let (spec_cmd_tx, spec_cmd_rx) = crossbeam::channel::unbounded();
         let (spec_event_tx, spec_event_rx) = crossbeam::channel::unbounded();
-        let spectroscopy = SpectroscopyState::new(spec_cmd_tx, spec_event_rx);
+        let plot_choice: crate::connection::nanonis::spectroscopy::SharedPlotChoice = Default::default();
+        let spectroscopy = SpectroscopyState::new(spec_cmd_tx, spec_event_rx, &plot_choice);
         let (litho_cmd_tx, litho_cmd_rx) = crossbeam::channel::unbounded();
         let (litho_event_tx, litho_event_rx) = crossbeam::channel::unbounded();
         let lithography = LithographyState::new(litho_cmd_tx, litho_event_rx);
@@ -366,6 +446,7 @@ impl NanonisConnection {
             &channel_state,
             &scan_status,
             &base_name,
+            &session_path,
             &course_voltages,
             &move_receiver,
             &scan_receiver,
@@ -373,7 +454,7 @@ impl NanonisConnection {
             &slow_status_init,
         )
         .run(address, 6500);
-        SequenceWorker::new(&ctx, seq_cmd_rx, seq_event_tx).run(address, 6500);
+        SequenceWorker::new(&ctx, seq_cmd_rx, seq_event_tx, &plot_choice).run(address, 6500);
         SpectroscopyWorker::new(&ctx, spec_cmd_rx, spec_event_tx).run(address, 6500);
         LithographyWorker::new(&ctx, litho_cmd_rx, litho_event_tx).run(address, 6500);
         Self {
@@ -389,7 +470,10 @@ impl NanonisConnection {
             last_world_transform: DAffine2::IDENTITY,
             slow_status_init,
             base_name,
+            session_path,
+            stamp_namer: Default::default(),
             course_menu,
+            fine_motion: FineMotionState::new(),
             scan_control,
             sequence,
             spectroscopy,
@@ -445,6 +529,11 @@ impl NanonisConnection {
             match action {
                 SequenceAction::CoarseMoved(steps) => {
                     self.course_menu.apply_completed_move(scan_area, steps);
+                }
+                SequenceAction::SpecStarted(base) => self.spectroscopy.sequence_series_started(&base),
+                SequenceAction::SpecCurve(curve) => self.spectroscopy.sequence_curve(curve),
+                SequenceAction::SpecDone(ok, message, files) => {
+                    self.spectroscopy.sequence_message(ok, message, files)
                 }
                 SequenceAction::StampRequest => {
                     if scan_area.channel_selected.is_none() {
