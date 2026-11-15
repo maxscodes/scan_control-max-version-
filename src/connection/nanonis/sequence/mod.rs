@@ -2,6 +2,7 @@
 //! frame, coarse moves, waits) and run them unattended on a dedicated worker.
 
 mod editor;
+mod eta;
 mod model;
 mod overlay;
 mod runner;

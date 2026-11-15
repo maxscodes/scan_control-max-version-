@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+
+use crossbeam::channel::{Receiver, Sender};
 
 use egui::{epaint::PathStroke, Color32, Id, Shape, Stroke, Ui};
 use glam::{DAffine2, DMat2, DVec2};
@@ -6,7 +8,8 @@ use redb::{ReadableTable as _, ReadableTableMetadata, TableDefinition};
 use uuid::Uuid;
 
 use crate::{
-    connection::{nanonis::ScanStatus, LiveImage},
+    analysis::sxm_match::{load_frame, SxmFrame},
+    connection::{live_image::FrameData, nanonis::ScanStatus, LiveImage},
     project::Persistant,
     scan_view::{border::dashes_from_line, BorderRectangle, ImageEncoder, ScanViewCtx},
     utils::vec_interop::{IntoEgui, Projection},
@@ -22,6 +25,12 @@ pub struct ScanArea {
     pub scan_status: ScanStatus,
     pub tip_pos: Option<DVec2>,
     pub stamp: VecDeque<LiveImage>,
+    /// Stamps made from .sxm files after the fact: (image, file name, channel).
+    pub stamp_import: VecDeque<(LiveImage, String, String)>,
+    /// Nanonis save folder, where the .sxm picker starts.
+    pub session_dir: String,
+    sxm_tx: Sender<SxmFrame>,
+    sxm_rx: Receiver<SxmFrame>,
     pub stamp_name_base: String,
     pub course_move_history: Vec<DVec2>,
     pub show_history: bool,
@@ -32,7 +41,12 @@ pub struct ScanArea {
 impl ScanArea {
     pub fn new(uuid: Uuid, encoder: &ImageEncoder, area_size: DVec2) -> Self {
         let live_image = LiveImage::new(uuid, encoder, DAffine2::IDENTITY);
+        let (sxm_tx, sxm_rx) = crossbeam::channel::unbounded();
         Self {
+            stamp_import: VecDeque::new(),
+            session_dir: String::new(),
+            sxm_tx,
+            sxm_rx,
             world_transform: DAffine2::IDENTITY,
             area_size,
             image_transform: None,
@@ -170,6 +184,56 @@ impl ScanArea {
                 egui::TextEdit::singleline(&mut self.stamp_name_base).desired_width(width),
             );
         });
+        if ui
+            .button("Stamp from .sxm\u{2026}")
+            .on_hover_text(
+                "Stamp saved .sxm scans you forgot to stamp live. They are placed \
+                 using the current map position, so pick scans taken since the \
+                 last coarse move.",
+            )
+            .clicked()
+        {
+            self.pick_sxm_files();
+        }
+    }
+    /// Ask for .sxm files and load them in the background; see
+    /// [`Self::poll_sxm_imports`].
+    fn pick_sxm_files(&self) {
+        let mut dialog = crate::components::file_dialog_native::dialog()
+            .add_filter("Nanonis scan", &["sxm"])
+            .set_title("Stamp from .sxm files");
+        let dir = PathBuf::from(self.session_dir.trim());
+        if !self.session_dir.trim().is_empty() && dir.is_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let tx = self.sxm_tx.clone();
+        let channel = self.channel_selected.clone();
+        std::thread::spawn(move || {
+            for path in dialog.pick_files().unwrap_or_default() {
+                match load_frame(&path, channel.as_deref()) {
+                    Ok(frame) => {
+                        let _ = tx.send(frame);
+                    }
+                    Err(e) => tracing::error!("cannot stamp {}: {e}", path.display()),
+                }
+            }
+            crate::app::request_repaint();
+        });
+    }
+    /// Turn loaded .sxm files into stamps, queued in `stamp_import`.
+    pub fn poll_sxm_imports(&mut self, encoder: &ImageEncoder) {
+        while let Ok(f) = self.sxm_rx.try_recv() {
+            let data = |d: Vec<f32>| FrameData { size: f.size, data: Arc::new(d.into_boxed_slice()) };
+            let image = self.live_image.stamp_from_data(
+                encoder,
+                self.world_transform * f.frame,
+                data(f.forward),
+                data(f.backward),
+                f.unit,
+            );
+            tracing::info!("stamped {} ({}) from file", f.name, f.channel);
+            self.stamp_import.push_back((image, f.name, f.channel));
+        }
     }
     fn show_channel_control(&mut self, ui: &mut Ui) {
         let mut selection = self.channel_selected.as_ref().map(|s| s.as_str());

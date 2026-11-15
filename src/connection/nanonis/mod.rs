@@ -162,6 +162,33 @@ impl Connection for NanonisConnection {
         let base_name = time_fmt::format::format_date_time(&scan_area.stamp_name_base, time)
             .unwrap_or_else(|_| scan_area.stamp_name_base.clone());
 
+        scan_area.poll_sxm_imports(encoder);
+        for (mut stamp, file, channel) in scan_area.stamp_import.drain(..).collect_vec() {
+            stamp.ring = self.ring_assist.stamp_result(
+                Some(&channel),
+                &stamp.forward_data.data,
+                stamp.forward_data.size,
+                stamp.transform,
+            );
+            stamp.gds_ref = crate::analysis::gds_prior::predict_any(&gds, stamp.transform)
+                .map(|(gi, _)| (gds[gi].uuid, gds[gi].transform));
+            let mut name = file.clone();
+            let mut k = 2;
+            while object_list.iter().any(|o| o.name() == name) {
+                name = format!("{file}({k})");
+                k += 1;
+            }
+            object_list.insert(
+                index,
+                SelectableEntry::new(
+                    Uuid::new_v4(),
+                    Object::ScanImage { image: stamp, name, hidden: false },
+                    |img| img.list_atoms(),
+                    |obj| obj.hidden_mut(),
+                ),
+            );
+        }
+
         let mut name_index = 0;
         for mut stamp in stamps {
             stamp.ring = self.ring_assist.stamp_result(
@@ -291,6 +318,10 @@ impl Connection for NanonisConnection {
         let ui = tools_ui;
         self.course_menu.show_menu(ui, object_list, locked);
         self.fine_motion.show_menu(ui, object_list, fine_lock);
+        self.sequence.line_times = Some(*self.readback.peek())
+            .filter(|_| self.slow_status_init.load(Ordering::SeqCst))
+            .map(|r| (r.fwd_line_time as f64, r.bwd_line_time as f64))
+            .filter(|&(f, _)| f > 0.);
         self.sequence
             .show_menu(ui, object_list, &self.course_menu, spectroscopy.or(lithography));
         self.spectroscopy
@@ -394,6 +425,7 @@ impl NanonisConnection {
         scan_area.image_transform = Some(*self.image_transform.read());
         scan_area.tip_pos = Some(*self.tip_pos.read());
         scan_area.stamp_name_base = self.base_name.read().clone();
+        scan_area.session_dir = self.session_path.read().clone();
         scan_area.scan_status = *self.scan_status.read();
     }
     pub fn new(ctx: egui::Context, address: impl AsRef<str>) -> Self {
@@ -587,6 +619,9 @@ impl NanonisConnection {
     fn update_base_name(&mut self, scan_area: &mut ScanArea) {
         if let Some(new_name) = self.base_name.read_new().as_deref() {
             scan_area.stamp_name_base = new_name.clone();
+        }
+        if let Some(dir) = self.session_path.read_new().as_deref() {
+            scan_area.session_dir = dir.clone();
         }
     }
     fn request_full_frame(tx: &OverwriteQueueSender<LineDir>) {

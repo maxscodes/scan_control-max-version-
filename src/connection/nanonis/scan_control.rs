@@ -40,6 +40,9 @@ pub struct Readback {
     pub setpoint: f32,
     /// Measured tunnelling current, amps.
     pub current: f32,
+    /// Seconds per scan line, forward and backward (Scan.SpeedGet).
+    pub fwd_line_time: f32,
+    pub bwd_line_time: f32,
 }
 
 /// What the panel needs to know each frame.
@@ -235,7 +238,8 @@ impl ScanControlState {
         });
 
         // 4. Progress of the running scan.
-        self.show_progress(ui, status, input.rows);
+        let line_time = input.readback.map(|r| (r.fwd_line_time + r.bwd_line_time) as f64).filter(|&t| t > 0.);
+        self.show_progress(ui, status, input.rows, line_time);
 
         if let Some(cmd) = command {
             self.request(cmd);
@@ -258,7 +262,13 @@ impl ScanControlState {
         self.sender.send(cmd);
     }
 
-    fn show_progress(&mut self, ui: &mut Ui, status: &ScanStatus, rows: Option<(usize, usize)>) {
+    fn show_progress(
+        &mut self,
+        ui: &mut Ui,
+        status: &ScanStatus,
+        rows: Option<(usize, usize)>,
+        line_time: Option<f64>,
+    ) {
         let Some((done, total)) = rows.filter(|&(_, t)| t > 0) else {
             return;
         };
@@ -273,13 +283,31 @@ impl ScanControlState {
         }
         let frac = done as f32 / total as f32;
         let mut text = format!("line {done}/{total}");
-        if let Some((t0, r0)) = self.progress_start {
-            let dt = t0.elapsed().as_secs_f64();
-            if done > r0 + 2 && dt > 2. && !self.paused {
-                let left = (total - done) as f64 * dt / (done - r0) as f64;
-                text += &format!(" · ~{}:{:02} left", left as u64 / 60, left as u64 % 60);
-            }
+        // Prefer Nanonis' own time per line: the rows we see arrive in
+        // bursts (and pauses stretch the clock), so a measured rate can be
+        // far off. Fall back to the measured rate only without it.
+        let left = match line_time {
+            Some(t) => Some((total - done) as f64 * t),
+            None => self.progress_start.and_then(|(t0, r0)| {
+                let dt = t0.elapsed().as_secs_f64();
+                (done > r0 + 2 && dt > 2.).then(|| (total - done) as f64 * dt / (done - r0) as f64)
+            }),
+        };
+        if let Some(left) = left.filter(|_| !self.paused) {
+            text += &format!(" \u{b7} ~{} left", fmt_duration(left));
         }
         ui.add(ProgressBar::new(frac).text(text).desired_height(16.));
+    }
+}
+
+/// "45 s", "3 min 05 s", "1 h 02 min".
+fn fmt_duration(secs: f64) -> String {
+    let s = secs.round().max(0.) as u64;
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min {:02} s", s / 60, s % 60)
+    } else {
+        format!("{} h {:02} min", s / 3600, (s % 3600) / 60)
     }
 }

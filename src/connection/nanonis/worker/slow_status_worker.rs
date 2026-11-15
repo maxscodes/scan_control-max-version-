@@ -189,10 +189,13 @@ impl SlowStatusWorker {
             return Ok(());
         }
         self.last_readback = Some(Instant::now());
+        let speed = conn.scan_speed_get().ok();
         let new = Readback {
             bias: conn.bias_get()?,
             setpoint: conn.zctrl_setpnt_get()?,
             current: conn.current_get()?,
+            fwd_line_time: speed.as_ref().map_or(0., |s| s.fwd_line_time),
+            bwd_line_time: speed.as_ref().map_or(0., |s| s.bwd_line_time),
         };
         if self.readback.modify_conditional(|prev| *prev != new, |prev| *prev = new) {
             self.ctx.request_repaint();

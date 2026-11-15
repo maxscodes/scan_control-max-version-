@@ -206,6 +206,27 @@ impl LiveImage {
     pub fn size(&self) -> [u32; 2] {
         self.image_view.size()
     }
+    /// A stamp made from saved data (an .sxm file), shown with this
+    /// image's display settings.
+    pub fn stamp_from_data(
+        &self,
+        encoder: &ImageEncoder,
+        transform: DAffine2,
+        forward: FrameData,
+        backward: FrameData,
+        unit: String,
+    ) -> Self {
+        let mut img = Self::new(Uuid::new_v4(), encoder, transform);
+        img.std_dev = self.std_dev;
+        img.fit_type = self.fit_type;
+        img.norm_type = self.norm_type;
+        img.line_dir = self.line_dir;
+        img.forward_data = forward;
+        img.backward_data = backward;
+        img.unit = unit;
+        img.write_and_update_texture(encoder);
+        img
+    }
     pub fn stamp(&mut self, encoder: &ImageEncoder) -> Self {
         let mut image_view = ScanViewImage::new(
             Uuid::new_v4(),

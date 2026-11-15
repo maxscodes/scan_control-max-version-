@@ -7,6 +7,7 @@ use std::{
 use crate::{
     components::{
         file_dialog_native::{ObjectImportDialog, ProjectOpenDialog, ProjectSaveDialog},
+        recent_files,
         selectable_list::{SelectableEntry, SelectableList},
     },
     connection::{nanonis::NanonisConnection, Connection},
@@ -125,6 +126,7 @@ impl MyApp {
     fn save_project_as(&mut self, path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
         self.write_project()?;
         self.project.save_as(path)?;
+        recent_files::add_project(self.project.current_path());
         self.verify_saved();
         Ok(())
     }
@@ -245,6 +247,7 @@ impl eframe::App for MyApp {
             match loaded {
                 Ok(list) => {
                     info!("opened {path}: {} objects", list.len());
+                    recent_files::add_project(project.current_path());
                     self.project = project;
                     self.app_state.object_list = list;
                     if let Some(conn) = self.active_connection.take() {
@@ -484,7 +487,11 @@ impl eframe::App for MyApp {
                         .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
                         .resizable(false)
                         .show(ctx, |ui| {
-                            ui.set_width(230.);
+                            // A minimum, not a fixed width: when a tool row
+                            // is wider, the scan buttons (which fill the
+                            // available width) stretch with the window
+                            // instead of staying 230 px wide on the left.
+                            ui.set_min_width(230.);
                             conn.show_menu(
                                 ui,
                                 &mut self.app_state.object_list,
@@ -864,6 +871,26 @@ fn file_menu_button(ui: &mut Ui, app: &mut MyApp) {
         if ui.button("Open").clicked() {
             app.project_open_dialog.pick_file();
         }
+        let recent = recent_files::recent();
+        ui.add_enabled_ui(!recent.projects.is_empty(), |ui| {
+            ui.menu_button("Open Recent", |ui| {
+                for (i, path) in recent.projects.iter().enumerate() {
+                    let text = format!("{}  {}", i + 1, recent_files::label(path));
+                    if ui
+                        .button(text)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        app.project_open_dialog.open_path(path.clone());
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear list").clicked() {
+                    recent_files::clear_projects();
+                }
+            });
+        });
+        ui.separator();
         if ui.button("Save").clicked() {
             app.save_project();
         }
@@ -871,21 +898,49 @@ fn file_menu_button(ui: &mut Ui, app: &mut MyApp) {
             // The current state is written when the path comes back.
             app.project_save_dialog.select_path();
         }
+        ui.separator();
         if ui.add(Button::new("Import Files")).clicked() {
-            let (scale, _, translation) = app
-                .app_state
-                .scan_view
-                .world_transform
-                .to_scale_angle_translation();
-            let tf = DAffine2::from_scale_angle_translation(
-                1e3 / (scale.abs()),
-                0.,
-                -translation / scale.abs() * DVec2::new(1., -1.),
-            );
+            let tf = import_transform(app);
             app.import_file_dialog
                 .pick_files(app.image_encoder.clone(), tf);
         }
+        ui.add_enabled_ui(!recent.imports.is_empty(), |ui| {
+            ui.menu_button("Import Recent", |ui| {
+                for path in &recent.imports {
+                    if ui
+                        .button(recent_files::label(path))
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        let tf = import_transform(app);
+                        app.import_file_dialog.import_paths(
+                            vec![path.clone()],
+                            app.image_encoder.clone(),
+                            tf,
+                        );
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear list").clicked() {
+                    recent_files::clear_imports();
+                }
+            });
+        });
     });
+}
+
+/// Where imported files land: the centre of the current view.
+fn import_transform(app: &MyApp) -> DAffine2 {
+    let (scale, _, translation) = app
+        .app_state
+        .scan_view
+        .world_transform
+        .to_scale_angle_translation();
+    DAffine2::from_scale_angle_translation(
+        1e3 / (scale.abs()),
+        0.,
+        -translation / scale.abs() * DVec2::new(1., -1.),
+    )
 }
 
 struct DeleteObjectsModifier {

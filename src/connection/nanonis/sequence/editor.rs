@@ -11,8 +11,10 @@ use crate::{
         nanonis::{
             course_motion::CourseMotionState,
             sequence::{
+                eta::{self, RunClock, ScanState, StepTimes},
                 model::{
-                    compile, expand, with_current_scan, CurrentScan, Dir, Frame as ScanFrame,
+                    compile, expand, with_current_scan, CoarseSpec, CurrentScan, Dir,
+                    Frame as ScanFrame,
                     FrameSpec, Position, ScanEntry, Sequence, Speed, Step, CURRENT_SCAN,
                 },
                 runner::{SequenceCommand, SequenceEvent},
@@ -74,6 +76,30 @@ struct SweepSettings {
     list: String,
 }
 
+/// Survey grid: tiles of the scan frame side by side, joined by coarse moves.
+struct SurveySettings {
+    cols: u32,
+    rows: u32,
+    /// Fraction of the frame shared with the neighbouring tile, in %.
+    overlap_pct: f64,
+    /// Grow towards +X (else -X) and +Y (else -Y), in scan-frame axes.
+    plus_x: bool,
+    plus_y: bool,
+    /// Wait after each approach before scanning, in s (drift settles).
+    settle_s: f64,
+}
+
+/// One tile of the grid: column, row (0-based) in visiting order.
+fn survey_order(cols: u32, rows: u32) -> Vec<(u32, u32)> {
+    // Serpentine: every move is one tile, never a long jump back.
+    (0..rows)
+        .flat_map(|r| {
+            let cs: Vec<u32> = if r % 2 == 0 { (0..cols).collect() } else { (0..cols).rev().collect() };
+            cs.into_iter().map(move |c| (c, r))
+        })
+        .collect()
+}
+
 /// What ctrl+drag on the map edits for the selected entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DragTarget {
@@ -99,6 +125,7 @@ pub struct SequenceState {
     status: String,
     last_error: Option<String>,
     sweep: SweepSettings,
+    survey: SurveySettings,
     load_tx: Sender<Result<Sequence, String>>,
     load_rx: Receiver<Result<Sequence, String>>,
     /// After a sequence finishes its plan is hidden from the map, until the
@@ -106,6 +133,16 @@ pub struct SequenceState {
     pub(super) plan_hidden: Option<(Sequence, Option<usize>)>,
     /// What Run does with a scan that is already running in Nanonis.
     current_scan: CurrentScan,
+    /// Nanonis' forward and backward time per line, s (set each frame).
+    pub line_times: Option<(f64, f64)>,
+    /// Scan set-up in Nanonis now, for the time estimate.
+    scan_now: Option<ScanState>,
+    /// What is left of the scan running in Nanonis now, s.
+    scan_left: Option<f64>,
+    /// Lengths of coarse moves, approaches, … learned over runs.
+    times: StepTimes,
+    /// Timing of the run in progress, and the scan set-up it started with.
+    clock: Option<(RunClock, ScanState)>,
 }
 
 impl SequenceState {
@@ -132,10 +169,23 @@ impl SequenceState {
                 step: 0.5,
                 list: "-1, -0.5, 0.2, 1.5".into(),
             },
+            survey: SurveySettings {
+                cols: 3,
+                rows: 3,
+                overlap_pct: 10.,
+                plus_x: true,
+                plus_y: false,
+                settle_s: 30.,
+            },
             load_tx,
             load_rx,
             plan_hidden: None,
             current_scan: CurrentScan::After,
+            line_times: None,
+            scan_now: None,
+            scan_left: None,
+            times: StepTimes::default(),
+            clock: None,
         }
     }
 
@@ -170,9 +220,15 @@ impl SequenceState {
                     if let Some(run) = &mut self.run {
                         run.paused = false;
                     }
+                    if let Some((clock, _)) = &mut self.clock {
+                        clock.resume();
+                    }
                 }
                 SequenceEvent::StepStarted { index } => {
                     if let Some(run) = &mut self.run {
+                        if let Some((clock, _)) = &mut self.clock {
+                            clock.step_started(index, &run.steps);
+                        }
                         run.current = index;
                         run.wait_remaining = None;
                         run.detail = None;
@@ -210,6 +266,9 @@ impl SequenceState {
                 }
                 SequenceEvent::Paused { index } => {
                     self.status = "Paused".into();
+                    if let Some((clock, _)) = &mut self.clock {
+                        clock.pause();
+                    }
                     if let Some(run) = &mut self.run {
                         run.paused = true;
                         run.current = index;
@@ -218,6 +277,9 @@ impl SequenceState {
                 }
                 SequenceEvent::Resumed => {
                     self.status = "Running".into();
+                    if let Some((clock, _)) = &mut self.clock {
+                        clock.resume();
+                    }
                     self.last_error = None;
                     if let Some(run) = &mut self.run {
                         run.paused = false;
@@ -226,11 +288,13 @@ impl SequenceState {
                 SequenceEvent::Finished => {
                     self.status = "Finished".into();
                     self.run = None;
+                    self.end_clock();
                     self.plan_hidden = Some((self.seq.clone(), self.selected));
                 }
                 SequenceEvent::Aborted => {
                     self.status = "Aborted".into();
                     self.run = None;
+                    self.end_clock();
                 }
                 SequenceEvent::Error { index, message } => {
                     error!("sequence error at step {index}: {message}");
@@ -248,6 +312,23 @@ impl SequenceState {
             }
         }
         actions
+    }
+
+    /// Keep what the run learned about step lengths for the next estimate.
+    fn end_clock(&mut self) {
+        if let Some((clock, _)) = self.clock.take() {
+            self.times = clock.times;
+        }
+    }
+
+    /// Seconds left in the run, and the fraction done.
+    fn run_eta(&self) -> Option<(f64, f32)> {
+        let run = self.run.as_ref()?;
+        let (clock, scan) = self.clock.as_ref()?;
+        let left = eta::remaining(&run.steps, run.current, *scan, clock, run.wait_remaining, self.scan_left);
+        let done = clock.elapsed();
+        let frac = if done + left > 0. { (done / (done + left)) as f32 } else { 0. };
+        Some((left, frac))
     }
 
     /// `current`: a scan is running in Nanonis (in direction `last_dir`) and
@@ -271,6 +352,9 @@ impl SequenceState {
             wait_remaining: None,
             detail: None,
         });
+        self.clock = self
+            .scan_now
+            .map(|scan| (RunClock::new(self.times.clone()), scan));
         self.send(SequenceCommand::Run { steps, group });
     }
 
@@ -290,7 +374,10 @@ impl SequenceState {
                 self.window_open = true;
             }
             if self.is_active() {
-                ui.label(&self.status);
+                match self.run_eta() {
+                    Some((left, _)) => ui.label(format!("{} \u{b7} ~{} left", self.status, eta::fmt_duration(left))),
+                    None => ui.label(&self.status),
+                };
             }
         });
         let scan_area = object_list
@@ -334,6 +421,26 @@ impl SequenceState {
             .map(ScanFrame::from_transform);
         let tip_pos = scan_area.and_then(|a| a.tip_pos);
         let scanning = scan_area.is_some_and(|a| a.scan_status.scanning);
+        self.scan_now = match (scan_area, self.line_times) {
+            (Some(a), Some((fwd_s, bwd_s))) => Some(ScanState {
+                lines: a.live_image.forward_data.size[1],
+                fwd_s,
+                bwd_s,
+                width_nm: current_frame.map_or(0., |f| f.width),
+            }),
+            _ => None,
+        };
+        // Rows still to scan in the running frame (unscanned rows are NaN).
+        self.scan_left = scan_area.filter(|_| scanning).zip(self.line_times).map(|(a, (f, b))| {
+            let d = &a.live_image.forward_data;
+            let [w, h] = d.size.map(|v| v as usize);
+            let done = if d.data.len() == w * h {
+                (0..h).filter(|&r| d.data[r * w + w / 2].is_finite()).count()
+            } else {
+                0
+            };
+            (h - done) as f64 * (f + b)
+        });
         ui.add_enabled_ui(editable, |ui| self.show_toolbar(ui));
         ui.separator();
         self.show_entry_table(ui, editable, last_dir);
@@ -355,6 +462,7 @@ impl SequenceState {
             });
             ui.separator();
             ui.add_enabled_ui(editable, |ui| self.show_sweep(ui));
+            ui.add_enabled_ui(editable, |ui| self.show_survey(ui, current_frame, course));
         }
         ui.separator();
         self.show_run_controls(ui, course, last_dir, scanning, blocked_by);
@@ -1053,6 +1161,135 @@ impl SequenceState {
             });
     }
 
+    fn show_survey(&mut self, ui: &mut Ui, current_frame: Option<ScanFrame>, course: &CourseMotionState) {
+        egui::CollapsingHeader::new("Survey Grid")
+            .default_open(false)
+            .show(ui, |ui| {
+                let sv = &mut self.survey;
+                ui.weak(
+                    "Scans a grid of tiles: scan and stamp, coarse move by one frame \
+                     (minus the overlap), scan again. Tiles are visited in a snake, \
+                     so every move is one tile.",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Tiles");
+                    ui.add(DragValue::new(&mut sv.cols).range(1..=50));
+                    ui.label("across ×");
+                    ui.add(DragValue::new(&mut sv.rows).range(1..=50));
+                    ui.label("down");
+                    ui.separator();
+                    ui.label("Overlap");
+                    ui.add(DragValue::new(&mut sv.overlap_pct).range(0. ..=90.).speed(0.5).suffix(" %"))
+                        .on_hover_text(
+                            "Share of each frame that also appears in the next tile. Coarse \
+                             steps are not exact, so keep some margin (10 % or more) or \
+                             tiles may leave gaps.",
+                        );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Grow towards");
+                    ui.selectable_value(&mut sv.plus_x, true, "+X");
+                    ui.selectable_value(&mut sv.plus_x, false, "−X");
+                    ui.selectable_value(&mut sv.plus_y, true, "+Y");
+                    ui.selectable_value(&mut sv.plus_y, false, "−Y");
+                    ui.separator();
+                    ui.label("Settle after approach");
+                    ui.add(DragValue::new(&mut sv.settle_s).range(0. ..=3600.).speed(1.).suffix(" s"));
+                });
+
+                // Tile size: the template's frame if it sets one, else Nanonis' frame.
+                let template = self
+                    .selected
+                    .and_then(|i| self.seq.entries.get(i).cloned())
+                    .unwrap_or_default();
+                let frame = current_frame.map(|f| template.frame.apply(f));
+                let Some(frame) = frame.filter(|f| f.width > 0. && f.height > 0.) else {
+                    ui.colored_label(Color32::RED, "No scan frame yet: connect to Nanonis first.");
+                    return;
+                };
+                // Frame axes in piezo nm: one tile right and one tile along +Y.
+                let axes = frame.to_transform().matrix2;
+                let keep = 1. - sv.overlap_pct / 100.;
+                let sx = if sv.plus_x { 1. } else { -1. };
+                let sy = if sv.plus_y { 1. } else { -1. };
+                let step_x = axes * DVec2::new(sx * keep, 0.);
+                // The frame transform flips y (scale -height): -1 is +Y.
+                let step_y = axes * DVec2::new(0., -sy * keep);
+                let steps_x = course.real_to_steps(step_x);
+                let steps_y = course.real_to_steps(step_y);
+                // What the rounded steps really give, as overlap.
+                let to_real = course.steps2real_world();
+                let real_overlap = |steps: IVec2, axis: DVec2, size: f64| {
+                    let moved = (to_real * steps.as_dvec2()).dot(axis.normalize_or_zero()).abs();
+                    (1. - moved / size) * 100.
+                };
+                let ov_x = real_overlap(steps_x, step_x, frame.width);
+                let ov_y = real_overlap(steps_y, step_y, frame.height);
+                let tiles = sv.cols * sv.rows;
+                ui.weak(format!(
+                    "Tile {:.2} × {:.2} µm · area ≈ {:.1} × {:.1} µm · {} scans, {} coarse moves",
+                    frame.width * 1e-3,
+                    frame.height * 1e-3,
+                    (frame.width * (1. + (sv.cols - 1) as f64 * keep)) * 1e-3,
+                    (frame.height * (1. + (sv.rows - 1) as f64 * keep)) * 1e-3,
+                    tiles,
+                    tiles - 1,
+                ));
+                ui.weak(format!(
+                    "Move per tile: {:?} steps across ({ov_x:.0} % overlap), {:?} steps down ({ov_y:.0} % overlap)",
+                    steps_x.to_array(),
+                    steps_y.to_array(),
+                ));
+                let bad = (sv.cols > 1 && (steps_x == IVec2::ZERO || ov_x < 0.))
+                    || (sv.rows > 1 && (steps_y == IVec2::ZERO || ov_y < 0.));
+                if bad {
+                    ui.colored_label(
+                        Color32::RED,
+                        "With the current coarse calibration the moves would not tile the frame. \
+                         Check the Coarse Motion calibration or the overlap.",
+                    );
+                }
+                let template_label = match self.selected.filter(|&i| i < self.seq.entries.len()) {
+                    Some(i) => format!("Template: entry {} (bias, current, speed, waits, dir)", i + 1),
+                    None => "Template: default entry (select one to use it as template)".into(),
+                };
+                ui.weak(template_label);
+                if ui
+                    .add_enabled(!bad, egui::Button::new(format!("Append {tiles} grid entries")))
+                    .on_hover_text(
+                        "The first tile is scanned where the tip is now. Every tile is \
+                         stamped. Check the plan on the map before running.",
+                    )
+                    .clicked()
+                {
+                    let order = survey_order(sv.cols, sv.rows);
+                    let mut prev: Option<(u32, u32)> = None;
+                    for (c, r) in order {
+                        let mut e = template.clone();
+                        e.enabled = true;
+                        e.scan = true;
+                        e.stamp = true;
+                        e.tip = Default::default();
+                        // Same frame for every tile; the stage does the moving.
+                        if matches!(e.frame.position, Position::Shift(_)) {
+                            e.frame.position = Position::Keep;
+                        }
+                        e.name = format!("grid r{} c{}", r + 1, c + 1);
+                        e.coarse = prev.map(|(pc, pr)| {
+                            let steps = if pr != r { steps_y } else if c > pc { steps_x } else { -steps_x };
+                            let base = template.coarse.unwrap_or_default();
+                            CoarseSpec { steps: steps.to_array(), withdraw: base.withdraw, approach: base.approach }
+                        });
+                        if prev.is_some() {
+                            e.settle_s = e.settle_s.max(sv.settle_s);
+                        }
+                        self.seq.entries.push(e);
+                        prev = Some((c, r));
+                    }
+                }
+            });
+    }
+
     fn show_run_controls(
         &mut self,
         ui: &mut Ui,
@@ -1154,9 +1391,49 @@ impl SequenceState {
                 self.plan_hidden = None;
             }
         });
+        self.show_eta(ui, last_dir, current);
         if let Some(err) = &self.last_error {
             ui.colored_label(Color32::RED, format!("Error: {err}"));
         }
+    }
+
+    /// Progress bar with the time left while running; the estimated length
+    /// of the whole sequence before it starts.
+    fn show_eta(&self, ui: &mut Ui, last_dir: Dir, current: Option<CurrentScan>) {
+        let Some(run) = &self.run else {
+            let Some(scan) = self.scan_now else {
+                ui.weak("Estimated time: connect to Nanonis to estimate.");
+                return;
+            };
+            let mut steps = compile(&self.seq, 0, last_dir);
+            if steps.is_empty() {
+                return;
+            }
+            if let Some(mode) = current {
+                steps = with_current_scan(steps, mode, last_dir, true);
+            }
+            let clock = RunClock::new(self.times.clone());
+            let total = eta::remaining(&steps, 0, scan, &clock, None, self.scan_left);
+            ui.weak(format!("Estimated time for Run all: ~{}", eta::fmt_duration(total)))
+                .on_hover_text(
+                    "Scans: lines \u{d7} Nanonis' time per line. Coarse moves, approaches and \
+                     I(V) series use rough defaults until a run has timed them.",
+                );
+            return;
+        };
+        let step = format!("step {}/{}", (run.current + 1).min(run.steps.len()), run.steps.len());
+        let (frac, text) = match self.run_eta() {
+            Some((left, frac)) => {
+                let text = if run.paused {
+                    format!("{step} \u{b7} paused \u{b7} ~{} left", eta::fmt_duration(left))
+                } else {
+                    format!("{step} \u{b7} ~{} left", eta::fmt_duration(left))
+                };
+                (frac, text)
+            }
+            None => (run.current as f32 / run.steps.len().max(1) as f32, step),
+        };
+        ui.add(egui::ProgressBar::new(frac).text(text).desired_height(16.));
     }
 }
 
@@ -1311,6 +1588,15 @@ mod tests {
         assert_eq!(step_values(1., 0., 0.3).unwrap().len(), 4);
         assert_eq!(step_values(0.2, 0.2, 0.).unwrap(), vec![0.2]);
         assert!(step_values(0., 1., 0.).is_err());
+    }
+
+    #[test]
+    fn survey_is_a_snake() {
+        assert_eq!(
+            super::survey_order(3, 2),
+            vec![(0, 0), (1, 0), (2, 0), (2, 1), (1, 1), (0, 1)]
+        );
+        assert_eq!(super::survey_order(1, 1), vec![(0, 0)]);
     }
 
     #[test]

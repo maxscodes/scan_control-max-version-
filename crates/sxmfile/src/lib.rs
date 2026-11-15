@@ -236,6 +236,13 @@ pub struct ChannelInfo {
     offset: f32,
 }
 
+impl ChannelInfo {
+    /// Physical unit of the channel, e.g. `m` or `A`.
+    pub fn unit(&self) -> &str {
+        &self.unit
+    }
+}
+
 fn chop_line<'a>(input: &mut &'a [u8]) -> Option<Result<&'a str, Utf8Error>> {
     if input.is_empty() {
         return None;

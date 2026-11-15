@@ -6,6 +6,7 @@ use raw_window_handle::{
     RawWindowHandle, WindowHandle,
 };
 
+use super::recent_files;
 use crate::{project::ProjectDb, scan_view::ImageEncoder, view_object};
 
 /// The main window, used as the owner of every file dialog. Without an
@@ -80,18 +81,38 @@ impl ObjectImportDialog {
         let channel = self.channel_tx.clone();
         std::thread::spawn(move || {
             if let Some(paths) = dialog.pick_files() {
-                for path in paths {
-                    if let Some(object) = view_object::Object::import(path, &encoder, transform) {
-                        channel.send(object).unwrap();
-                    }
-                }
+                import_all(paths, &encoder, transform, &channel);
             }
         });
+    }
+    /// Import files without asking, e.g. from the recent-files menu.
+    pub fn import_paths(&mut self, paths: Vec<PathBuf>, encoder: ImageEncoder, transform: DAffine2) {
+        let channel = self.channel_tx.clone();
+        std::thread::spawn(move || import_all(paths, &encoder, transform, &channel));
     }
     pub fn try_recv_object(&mut self) -> Option<view_object::Object> {
         match self.channel_rx.try_recv() {
             Ok(path) => Some(path),
             Err(_) => None,
+        }
+    }
+}
+
+fn import_all(
+    paths: Vec<PathBuf>,
+    encoder: &ImageEncoder,
+    transform: DAffine2,
+    channel: &crossbeam::channel::Sender<view_object::Object>,
+) {
+    for path in paths {
+        if !path.exists() {
+            tracing::error!("cannot import {}: file not found", path.display());
+            recent_files::remove_import(&path);
+            continue;
+        }
+        if let Some(object) = view_object::Object::import(path.clone(), encoder, transform) {
+            recent_files::add_import(&path);
+            let _ = channel.send(object);
         }
     }
 }
@@ -118,20 +139,34 @@ impl ProjectOpenDialog {
         let channel = self.channel_tx.clone();
         std::thread::spawn(move || {
             if let Some(path) = dialog.pick_file() {
-                match ProjectDb::open(path.clone()) {
-                    Ok(project) => {
-                        let _ = channel.send(project);
-                    }
-                    Err(e) => tracing::error!("could not open {}: {e}", path.display()),
-                }
+                open_project(path, &channel);
             }
         });
+    }
+    /// Open a project without asking, e.g. from the recent-files menu.
+    pub fn open_path(&mut self, path: PathBuf) {
+        let channel = self.channel_tx.clone();
+        std::thread::spawn(move || open_project(path, &channel));
     }
     pub fn try_recv_project(&mut self) -> Option<ProjectDb> {
         match self.channel_rx.try_recv() {
             Ok(project) => Some(project),
             Err(_) => None,
         }
+    }
+}
+
+fn open_project(path: PathBuf, channel: &crossbeam::channel::Sender<ProjectDb>) {
+    if !path.exists() {
+        tracing::error!("cannot open {}: file not found", path.display());
+        recent_files::remove_project(&path);
+        return;
+    }
+    match ProjectDb::open(path.clone()) {
+        Ok(project) => {
+            let _ = channel.send(project);
+        }
+        Err(e) => tracing::error!("could not open {}: {e}", path.display()),
     }
 }
 
