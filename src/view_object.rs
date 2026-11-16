@@ -7,10 +7,19 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::{
+    components::selectable_list::SelectableEntry,
     connection::{LiveImage, ScanArea},
     project::Persistant,
     scan_view::{FileImage, GDSImage, ImageEncoder},
 };
+
+/// Where an object sits on the map, to undo moving it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Placement {
+    Transform(DAffine2),
+    /// An imported image's four corners.
+    Corners([DVec2; 4]),
+}
 
 pub enum Object {
     Gds {
@@ -27,6 +36,9 @@ pub enum Object {
         image: LiveImage,
         name: String,
         hidden: bool,
+        /// Layer group (e.g. the tiles of one survey), shown together in
+        /// Layers and hidden or shown together.
+        group: Option<String>,
     },
     ScanArea {
         image: ScanArea,
@@ -35,6 +47,28 @@ pub enum Object {
 }
 
 impl Object {
+    /// This object as an entry of the layer list.
+    pub fn into_entry(self, id_salt: impl std::hash::Hash) -> SelectableEntry<Object> {
+        SelectableEntry::new(id_salt, self, |o| o.list_atoms(), |o| o.hidden_mut())
+    }
+    /// Where the object is on the map. `None` for the scan region, which
+    /// follows the instrument (coarse moves) rather than being placed.
+    pub fn placement(&self) -> Option<Placement> {
+        match self {
+            Object::Gds { image, .. } => Some(Placement::Transform(image.transform)),
+            Object::File { image, .. } => Some(Placement::Corners(image.world_points)),
+            Object::ScanImage { image, .. } => Some(Placement::Transform(image.transform)),
+            Object::ScanArea { .. } => None,
+        }
+    }
+    pub fn set_placement(&mut self, p: Placement) {
+        match (self, p) {
+            (Object::Gds { image, .. }, Placement::Transform(t)) => image.transform = t,
+            (Object::ScanImage { image, .. }, Placement::Transform(t)) => image.transform = t,
+            (Object::File { image, .. }, Placement::Corners(c)) => image.set_world_points(c),
+            _ => {}
+        }
+    }
     pub fn import(path: PathBuf, encoder: &ImageEncoder, transform: DAffine2) -> Option<Self> {
         match path.extension().and_then(|os| os.to_str()) {
             Some("gds") | Some("GDS") => {
@@ -93,6 +127,13 @@ impl Object {
             }
         };
         (image, name).into_atoms()
+    }
+    /// The layer group, for objects that can be grouped (stamps).
+    pub fn group_mut(&mut self) -> Option<&mut Option<String>> {
+        match self {
+            Object::ScanImage { group, .. } => Some(group),
+            _ => None,
+        }
     }
     pub fn hidden_mut(&mut self) -> &mut bool {
         match self {
@@ -209,6 +250,24 @@ const OBJECT_TYPE_TABLE: TableDefinition<Uuid, &'static str> =
     TableDefinition::new("object_type_table_v1");
 const OBJECT_DATA_TABLE: TableDefinition<Uuid, (&[u8], bool)> =
     TableDefinition::new("object_data_table_v1");
+/// Layer group of grouped objects (absent = no group).
+const OBJECT_GROUP_TABLE: TableDefinition<Uuid, &str> = TableDefinition::new("object_group_table_v1");
+
+fn write_group(txn: &redb::WriteTransaction, uuid: Uuid, group: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut table = txn.open_table(OBJECT_GROUP_TABLE)?;
+    let old = table.get(uuid)?.map(|v| v.value().to_string());
+    if old.as_deref() != group {
+        match group {
+            Some(g) => {
+                table.insert(uuid, g)?;
+            }
+            None => {
+                table.remove(uuid)?;
+            }
+        }
+    }
+    Ok(())
+}
 impl Persistant for Object {
     fn db_update<'t>(
         &self,
@@ -246,11 +305,13 @@ impl Persistant for Object {
                 image,
                 name,
                 hidden,
+                group,
             } => {
                 let (db_name, db_hidden) = data.value();
                 if db_name != name.as_bytes() || db_hidden != *hidden {
                     data.insert((name.as_bytes(), *hidden))?;
                 }
+                write_group(txn, uuid, group.as_deref())?;
                 image.db_update(txn)?;
             }
             Object::ScanArea { image, hidden } => {
@@ -290,6 +351,7 @@ impl Persistant for Object {
         }
         type_table.remove(id)?;
         data_table.remove(id)?;
+        txn.open_table(OBJECT_GROUP_TABLE)?.remove(id)?;
         Ok(())
     }
 
@@ -323,8 +385,10 @@ impl Persistant for Object {
                 image,
                 name,
                 hidden,
+                group,
             } => {
                 data_table.insert(uuid, (name.as_bytes(), *hidden))?;
+                write_group(txn, uuid, group.as_deref())?;
                 image.db_insert(txn)?;
                 type_table.insert(uuid, "scanimage")?;
             }
@@ -370,10 +434,12 @@ impl Persistant for Object {
                 let image = LiveImage::db_read(id, txn, encoder)?;
                 let (name, hidden) = data.value();
                 let name = unsafe { str::from_utf8_unchecked(name) }.to_string();
+                let group = txn.open_table(OBJECT_GROUP_TABLE)?.get(id)?.map(|g| g.value().to_string());
                 Ok(Self::ScanImage {
                     image,
                     name,
                     hidden,
+                    group,
                 })
             }
             "scanarea" => {

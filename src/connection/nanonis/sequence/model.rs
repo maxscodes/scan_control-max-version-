@@ -14,6 +14,42 @@ use crate::connection::nanonis::spectroscopy::IvSeriesSettings;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sequence {
     pub entries: Vec<ScanEntry>,
+    /// How each scan is started (older files: the default).
+    #[serde(default)]
+    pub scan_start: ScanStart,
+}
+
+/// Press Start this many times, `gap_s` apart, before keeping the scan:
+/// the first lines after a Start suffer from piezo creep, and restarting
+/// lets the scanner settle so the kept frame starts clean.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanStart {
+    pub starts: u32,
+    pub gap_s: f64,
+    /// Before the first Start, move the tip to the point where the scan
+    /// begins and wait this long there, s (0 = don't). The jump to the frame
+    /// start then creeps out before any line is recorded.
+    pub park_s: f64,
+}
+impl Default for ScanStart {
+    fn default() -> Self {
+        Self { starts: 3, gap_s: 3., park_s: 20. }
+    }
+}
+impl ScanStart {
+    /// Extra time each scan takes for parking and restarts, s.
+    pub fn extra_s(&self) -> f64 {
+        self.park_s.max(0.) + self.starts.saturating_sub(1) as f64 * self.gap_s.max(0.)
+    }
+}
+
+/// Where a scan of `frame` (nm) in direction `up` begins: the left end of
+/// the bottom line for an upward scan, of the top line for a downward one,
+/// in metres.
+pub fn scan_start_point(frame: &Frame, up: bool) -> DVec2 {
+    let local = DVec2::new(-0.5, if up { 0.5 } else { -0.5 });
+    frame.to_transform().transform_point2(local) * 1e-9
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +83,12 @@ pub struct ScanEntry {
     pub scan: bool,
     /// Tip positions visited after the scan, each with an optional I(V) series.
     pub tip: TipPlan,
+    /// Survey grid cell (row, column) this entry images, if any: its stamps
+    /// are lined up with their neighbours when the survey ends.
+    pub grid: Option<[u32; 2]>,
+    /// Where this survey tile is planned, relative to the grid's first
+    /// tile (piezo nm): the grid steers its moves towards it as it runs.
+    pub grid_pos: Option<[f64; 2]>,
 }
 
 /// Fine tip moves (Follow Me) after an entry's scan, with an optional I(V)
@@ -103,6 +145,8 @@ impl Default for ScanEntry {
             stamp: true,
             scan: true,
             tip: TipPlan::default(),
+            grid: None,
+            grid_pos: None,
         }
     }
 }
@@ -494,8 +538,76 @@ pub fn compile(seq: &Sequence, from_entry: usize, last_dir: Dir) -> Vec<(usize, 
     out
 }
 
+/// Where "Restart entry" picks up for the step at `index`: the start of its
+/// entry, but after a coarse move (withdraw, move, approach and the settle
+/// wait after them) that already finished, so the stage isn't moved twice.
+pub fn restart_index(steps: &[(usize, Step)], index: usize) -> usize {
+    let Some(&(entry, _)) = steps.get(index) else {
+        return index;
+    };
+    let start = steps[..index]
+        .iter()
+        .rposition(|(e, _)| *e != entry)
+        .map_or(0, |p| p + 1);
+    let mut i = start;
+    while i < index && matches!(steps[i].1, Step::Withdraw | Step::CoarseMove { .. } | Step::Approach) {
+        i += 1;
+    }
+    if i == start {
+        return start;
+    }
+    // The settle wait right after the move.
+    if i < index && matches!(steps[i].1, Step::Wait(_)) {
+        i += 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_sequence_files_get_default_scan_start() {
+        let seq: super::Sequence = serde_json::from_str(r#"{"entries": []}"#).unwrap();
+        assert_eq!(seq.scan_start, super::ScanStart::default());
+        assert_eq!(seq.scan_start.starts, 3);
+        // Files saved before parking existed keep their starts and park by default.
+        let seq: super::Sequence =
+            serde_json::from_str(r#"{"entries": [], "scan_start": {"starts": 2, "gap_s": 5.0}}"#).unwrap();
+        assert_eq!((seq.scan_start.starts, seq.scan_start.park_s), (2, 20.));
+    }
+
+    #[test]
+    fn scans_start_at_the_left_of_the_first_line() {
+        let f = super::Frame { center_x: 100., center_y: 50., width: 40., height: 20., angle: 0. };
+        let down = super::scan_start_point(&f, false) * 1e9;
+        let up = super::scan_start_point(&f, true) * 1e9;
+        assert!((down - DVec2::new(80., 60.)).length() < 1e-6, "{down}");
+        assert!((up - DVec2::new(80., 40.)).length() < 1e-6, "{up}");
+    }
+
+    #[test]
+    fn restart_skips_finished_coarse_move() {
+        use super::{restart_index, Dir, Step};
+        let steps = vec![
+            (0, Step::Scan(Dir::Down)),
+            (1, Step::Withdraw),
+            (1, Step::CoarseMove { steps: [10, 0] }),
+            (1, Step::Approach),
+            (1, Step::Wait(30.)),
+            (1, Step::SetBias(1.)),
+            (1, Step::Scan(Dir::Up)),
+            (1, Step::Stamp),
+        ];
+        // Scanning entry 1: back to its bias, not its coarse move.
+        assert_eq!(restart_index(&steps, 6), 5);
+        assert_eq!(restart_index(&steps, 7), 5);
+        // Coarse move not done yet: from where it stopped.
+        assert_eq!(restart_index(&steps, 2), 2);
+        assert_eq!(restart_index(&steps, 4), 4);
+        // Entry without a coarse move: its start.
+        assert_eq!(restart_index(&steps, 0), 0);
+    }
+
     use super::*;
 
     #[test]
@@ -606,6 +718,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let c = compile(&seq, 0, Dir::Down);
         assert_eq!(
@@ -630,6 +743,7 @@ mod tests {
                 ScanEntry::default(),
                 ScanEntry::default(),
             ],
+            ..Default::default()
         };
         let dirs: Vec<_> = compile(&seq, 0, Dir::Down)
             .into_iter()
@@ -647,6 +761,7 @@ mod tests {
     fn current_scan_goes_first() {
         let seq = Sequence {
             entries: vec![ScanEntry::default()],
+            ..Default::default()
         };
         let steps = with_current_scan(compile(&seq, 0, Dir::Up), CurrentScan::Include, Dir::Up, true);
         assert_eq!(
@@ -702,6 +817,7 @@ mod tests {
                 resolution: Some([128, 64]),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let s = serde_json::to_string(&seq).unwrap();
         assert_eq!(serde_json::from_str::<Sequence>(&s).unwrap(), seq);

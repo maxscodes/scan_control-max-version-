@@ -11,6 +11,9 @@ use itertools::Itertools;
 
 use crate::utils::response_group::{ResponseGroup, ResponseGroupExt};
 
+/// The group of an item, `None` if it can't be grouped.
+pub type GroupFn<T> = dyn Fn(&mut T) -> Option<&mut Option<String>>;
+
 pub struct SelectableList<T> {
     items: Vec<SelectableEntry<T>>,
     last_selected: Option<usize>,
@@ -23,47 +26,232 @@ impl<T> SelectableList<T> {
             last_selected: None,
         }
     }
-    pub fn show(&mut self, ui: &mut Ui) {
-        for i in (0..self.items.len()).rev() {
-            let mut resp =
-                list_item(ui, &mut self.items[i]).synchronize(&mut self.items[i].resp_group);
-            if resp.sync.hovered() {
-                resp.orig = resp.orig.highlight();
+
+    /// Shows the items (topmost first), with items in the same group (from
+    /// `group_of`, `None` for items that can't be grouped) shown together
+    /// under a collapsible header that selects, hides and shows them all.
+    /// Returns a group the user asked to save as one image (its items).
+    pub fn show_grouped(&mut self, ui: &mut Ui, group_of: &GroupFn<T>) -> Option<Vec<usize>> {
+        let n = self.items.len();
+        let groups: Vec<Option<String>> =
+            self.items.iter_mut().map(|it| group_of(&mut it.inner).and_then(|g| g.clone())).collect();
+        let mut done: Vec<&str> = Vec::new();
+        let mut export = None;
+        for i in (0..n).rev() {
+            let Some(g) = groups[i].as_deref() else {
+                self.show_item(ui, i, Some(group_of));
+                continue;
+            };
+            if done.contains(&g) {
+                continue;
             }
-            if resp.orig.clicked() {
-                if ui.input(|i| i.modifiers.shift) && self.last_selected.is_some() {
-                    let mut i = i as isize;
-                    let last = self.last_selected.unwrap() as isize;
-                    let add = ((i < last) as isize) * 2 - 1;
-                    while i != last {
-                        self.items[i as usize].selected = true;
-                        i += add;
+            done.push(g);
+            // Members top to bottom, shown where the topmost one is.
+            let members: Vec<usize> = (0..n).rev().filter(|&j| groups[j].as_deref() == Some(g)).collect();
+            let (open, ex) = self.group_header(ui, g, &members, group_of);
+            if ex {
+                export = Some(members.clone());
+            }
+            if open {
+                ui.indent(("layer_group", g), |ui| {
+                    for &j in &members {
+                        self.show_item(ui, j, Some(group_of));
                     }
-                } else if ui.input(|i| i.modifiers.ctrl) {
-                    self[i].selected = !self[i].selected;
+                });
+            }
+        }
+        export
+    }
+
+    /// Hide or show every item `which` picks.
+    pub fn set_hidden_where(&mut self, which: impl Fn(&T) -> bool, hidden: bool) {
+        for i in 0..self.items.len() {
+            if which(&self.items[i].inner) {
+                self.set_hidden(i, hidden);
+            }
+        }
+    }
+    /// Hide or show the selected items.
+    pub fn set_selected_hidden(&mut self, hidden: bool) {
+        for i in self.iter_selected_indexes().collect_vec() {
+            self.set_hidden(i, hidden);
+        }
+    }
+    /// Whether any item `which` picks is hidden / shown: (any hidden, any shown).
+    pub fn hidden_state_where(&mut self, which: impl Fn(&T) -> bool) -> (bool, bool) {
+        let (mut any_hidden, mut any_shown) = (false, false);
+        for i in 0..self.items.len() {
+            if which(&self.items[i].inner) {
+                if self.is_hidden(i) {
+                    any_hidden = true;
                 } else {
-                    self.clear_selected();
-                    self[i].selected = true;
-                }
-                if self[i].selected {
-                    self.last_selected = Some(i);
+                    any_shown = true;
                 }
             }
-            resp.orig.context_menu(|ui| {
-                if ui.button("Hide selected").clicked() {
-                    for n in self.iter_selected_indexes().collect_vec() {
-                        let item = &mut self.items[n];
-                        *(item.hidden_fn)(&mut item.inner) = true;
-                    }
+        }
+        (any_hidden, any_shown)
+    }
+
+    fn set_hidden(&mut self, i: usize, hidden: bool) {
+        let item = &mut self.items[i];
+        *(item.hidden_fn)(&mut item.inner) = hidden;
+    }
+    fn is_hidden(&mut self, i: usize) -> bool {
+        let item = &mut self.items[i];
+        *(item.hidden_fn)(&mut item.inner)
+    }
+
+    /// Header row of a group. Returns whether it is open, and whether the
+    /// user asked to save it as one image.
+    fn group_header(&mut self, ui: &mut Ui, name: &str, members: &[usize], group_of: &GroupFn<T>) -> (bool, bool) {
+        let id = ui.make_persistent_id(("layer_group_open", name));
+        let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, false));
+        let all_hidden = members.iter().all(|&j| self.is_hidden(j));
+        let all_selected = members.iter().all(|&j| self.items[j].selected);
+        let mut export = false;
+        ui.horizontal(|ui| {
+            let arrow = if open { "\u{25bc}" } else { "\u{25b6}" };
+            if ui.add(egui::Button::new(arrow).frame(false)).on_hover_text("Show / hide the list").clicked() {
+                open = !open;
+            }
+            let resp = ui
+                .selectable_label(all_selected, format!("{name} ({})", members.len()))
+                .on_hover_text("Click to select the whole group; right-click for more");
+            if resp.clicked() {
+                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                if !ctrl {
+                    self.clear_selected();
                 }
-                if ui.button("Show selected").clicked() {
-                    for n in self.iter_selected_indexes().collect_vec() {
-                        let item = &mut self.items[n];
-                        *(item.hidden_fn)(&mut item.inner) = false;
+                let select = !(ctrl && all_selected);
+                for &j in members {
+                    self.items[j].selected = select;
+                }
+            }
+            if resp.double_clicked() {
+                open = !open;
+            }
+            resp.context_menu(|ui| {
+                let mut new_name = name.to_string();
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    if ui.text_edit_singleline(&mut new_name).changed() && !new_name.trim().is_empty() {
+                        for &j in members {
+                            if let Some(g) = group_of(&mut self.items[j].inner) {
+                                *g = Some(new_name.clone());
+                            }
+                        }
+                    }
+                });
+                if ui.button("Save as one image\u{2026}").clicked() {
+                    export = true;
+                    ui.close();
+                }
+                if ui.button(if all_hidden { "Show all" } else { "Hide all" }).clicked() {
+                    for &j in members {
+                        self.set_hidden(j, !all_hidden);
+                    }
+                    ui.close();
+                }
+                if ui.button("Ungroup").clicked() {
+                    for &j in members {
+                        if let Some(g) = group_of(&mut self.items[j].inner) {
+                            *g = None;
+                        }
+                    }
+                    ui.close();
+                }
+            });
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut hidden = all_hidden;
+                if hidden_toggle_icon(ui, &mut hidden).clicked() {
+                    for &j in members {
+                        self.set_hidden(j, hidden);
                     }
                 }
             });
+        });
+        ui.data_mut(|d| d.insert_persisted(id, open));
+        (open, export)
+    }
+
+    fn show_item(&mut self, ui: &mut Ui, i: usize, group_of: Option<&GroupFn<T>>) {
+        let (resp, eye) = list_item(ui, &mut self.items[i]);
+        if eye && self.items[i].selected {
+            // The eye of a selected item hides or shows the whole selection.
+            let hidden = self.is_hidden(i);
+            self.set_selected_hidden(hidden);
         }
+        let mut resp = resp.synchronize(&mut self.items[i].resp_group);
+        if resp.sync.hovered() {
+            resp.orig = resp.orig.highlight();
+        }
+        if resp.orig.clicked() {
+            if ui.input(|i| i.modifiers.shift) && self.last_selected.is_some() {
+                let mut i = i as isize;
+                let last = self.last_selected.unwrap() as isize;
+                let add = ((i < last) as isize) * 2 - 1;
+                while i != last {
+                    self.items[i as usize].selected = true;
+                    i += add;
+                }
+            } else if ui.input(|i| i.modifiers.ctrl) {
+                self[i].selected = !self[i].selected;
+            } else {
+                self.clear_selected();
+                self[i].selected = true;
+            }
+            if self[i].selected {
+                self.last_selected = Some(i);
+            }
+        }
+        resp.orig.context_menu(|ui| {
+            if ui.button("Hide selected").clicked() {
+                for n in self.iter_selected_indexes().collect_vec() {
+                    self.set_hidden(n, true);
+                }
+            }
+            if ui.button("Show selected").clicked() {
+                for n in self.iter_selected_indexes().collect_vec() {
+                    self.set_hidden(n, false);
+                }
+            }
+            let Some(group_of) = group_of else { return };
+            let selected = self.iter_selected_indexes().collect_vec();
+            let groupable = |s: &mut Self, n: usize| group_of(&mut s.items[n].inner).is_some();
+            let can_group: Vec<usize> = selected.iter().copied().filter(|&n| groupable(self, n)).collect();
+            ui.separator();
+            if ui
+                .add_enabled(can_group.len() >= 2, egui::Button::new("Group selected"))
+                .on_disabled_hover_text("Select two or more stamps")
+                .clicked()
+            {
+                // First free "Group N".
+                let names: Vec<String> = (0..self.items.len())
+                    .filter_map(|n| group_of(&mut self.items[n].inner).and_then(|g| g.clone()))
+                    .collect();
+                let name = (1..)
+                    .map(|k| format!("Group {k}"))
+                    .find(|c| !names.contains(c))
+                    .unwrap_or_default();
+                for &n in &can_group {
+                    if let Some(g) = group_of(&mut self.items[n].inner) {
+                        *g = Some(name.clone());
+                    }
+                }
+                ui.close();
+            }
+            let in_group = can_group
+                .iter()
+                .any(|&n| group_of(&mut self.items[n].inner).is_some_and(|g| g.is_some()));
+            if ui.add_enabled(in_group, egui::Button::new("Remove from group")).clicked() {
+                for &n in &can_group {
+                    if let Some(g) = group_of(&mut self.items[n].inner) {
+                        *g = None;
+                    }
+                }
+                ui.close();
+            }
+        });
     }
     pub fn get_hovered(&self, ctx: &Context) -> Option<&SelectableEntry<T>> {
         self.items
@@ -160,7 +348,9 @@ impl<T> DerefMut for SelectableEntry<T> {
     }
 }
 
-fn list_item<'a, T>(ui: &mut Ui, item: &'a mut SelectableEntry<T>) -> Response {
+/// The row, and whether its eye was clicked.
+fn list_item<'a, T>(ui: &mut Ui, item: &'a mut SelectableEntry<T>) -> (Response, bool) {
+    let mut eye = false;
     let (response, hidden) = {
         let inner = &mut item.inner;
         let mut hidden = *(item.hidden_fn)(inner);
@@ -194,7 +384,7 @@ fn list_item<'a, T>(ui: &mut Ui, item: &'a mut SelectableEntry<T>) -> Response {
                     .min_size(min_size)
                     .allocate(ui);
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    hidden_toggle_icon(ui, &mut hidden);
+                    eye = hidden_toggle_icon(ui, &mut hidden).clicked();
                 });
                 prepared
             })
@@ -231,7 +421,7 @@ fn list_item<'a, T>(ui: &mut Ui, item: &'a mut SelectableEntry<T>) -> Response {
         (response, hidden)
     };
     *(item.hidden_fn)(&mut item.inner) = hidden;
-    response
+    (response, eye)
 }
 
 pub fn hidden_toggle_icon(ui: &mut Ui, hidden: &mut bool) -> Response {

@@ -72,6 +72,11 @@ impl SpectroscopyState {
         }
     }
 
+    /// Whether the tool window is open (toggled from the Scan Control tools).
+    pub fn open_mut(&mut self) -> &mut bool {
+        &mut self.window_open
+    }
+
     /// A series is in progress. Other tip-moving controls should be locked.
     pub fn is_running(&self) -> bool {
         self.running
@@ -206,20 +211,15 @@ impl SpectroscopyState {
     /// a new series can't start right now (scan or sequence running).
     pub fn show_menu(&mut self, ui: &mut Ui, blocked: Option<&str>) {
         self.poll_events();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.window_open, egui::Button::new("I(V) Spectroscopy"))
-                .clicked()
-            {
-                self.window_open = true;
-            }
-            if self.running {
-                ui.label(&self.status);
+        if self.running {
+            ui.horizontal(|ui| {
                 ui.spinner();
-            }
-        });
+                ui.label(RichText::new(format!("I(V): {}", self.status)).small());
+            });
+        }
         let mut open = self.window_open;
         egui::Window::new("I(V) Spectroscopy")
+            .vscroll(true)
             .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(1100.)
             .resizable(true)

@@ -115,6 +115,7 @@ fn corr(a: &[f32], b: &[f32]) -> f64 {
 /// The backward scan of the channel whose forward scan is this frame,
 /// turned to line up with the frame (rows as the frame has them, columns
 /// whichever way fits the forward scan better).
+#[cfg(test)] // used by the tests only
 pub fn backward_for(path: &Path, data: &[f32], size: [u32; 2]) -> Option<Vec<f32>> {
     let sxm = sxmfile::SXM::parse_file(path).ok()?;
     if sxm.get_image_size().ok()? != size {
@@ -140,11 +141,13 @@ pub fn backward_for(path: &Path, data: &[f32], size: [u32; 2]) -> Option<Vec<f32
 }
 
 /// Does this .sxm file hold the frame?
+#[cfg(test)] // used by the tests only
 pub fn sxm_matches(path: &Path, data: &[f32], size: [u32; 2]) -> bool {
     Sxm::load(path).is_some_and(|s| s.holds(data, size))
 }
 
 /// The first file in `files` that holds the frame.
+#[cfg(test)] // used by the tests only
 pub fn find_matching_sxm(data: &[f32], size: [u32; 2], files: &[PathBuf]) -> Option<PathBuf> {
     if data.len() != size[0] as usize * size[1] as usize {
         return None;

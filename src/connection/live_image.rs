@@ -4,7 +4,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use egui::{DragValue, Response, Ui, WidgetText};
 use glam::DAffine2;
-use image_compute::image_compute::{FitData, FitType};
+use image_compute::image_compute::FitData;
 use itertools::Itertools;
 use nanonis_tcp::LineDir;
 use redb::{ReadableTable as _, ReadableTableMetadata as _, TableDefinition};
@@ -18,7 +18,9 @@ use crate::{
     },
     project::Persistant,
     scan_view::{
-        static_image::NormType, ImageEncoder, ScanViewImage,
+        processing::{self, Background, Filters},
+        static_image::NormType,
+        ImageEncoder, ScanViewImage,
     },
 };
 
@@ -26,7 +28,10 @@ pub struct LiveImage {
     image_view: ScanViewImage,
     pub transform: DAffine2,
     pub std_dev: f32,
-    pub fit_type: FitType,
+    pub background: Background,
+    /// Display filters. They only change the drawn image: `forward_data`
+    /// and `backward_data` stay as recorded.
+    pub filters: Filters,
     pub norm_type: NormType,
     pub line_dir: LineDir,
     pub forward_data: FrameData,
@@ -62,7 +67,8 @@ impl LiveImage {
             norm_type,
             std_dev,
             line_dir: LineDir::Forward,
-            fit_type: FitType::MeanSubtract,
+            background: Background::Raw,
+            filters: Filters::default(),
             forward_data: empty_data.clone(),
             backward_data: empty_data,
             transform,
@@ -103,28 +109,87 @@ impl LiveImage {
         resp
     }
     pub fn show_menu(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
-        self.show_fit_control(ui, encoder);
-        self.show_normalization_control(ui);
-        self.show_line_dir_control(ui, encoder);
+        display_controls(ui, &mut [self], encoder);
         self.show_metadata(ui);
+    }
+    pub fn display_settings(&self) -> DisplaySettings {
+        DisplaySettings {
+            background: self.background,
+            filters: self.filters,
+            norm_type: self.norm_type,
+            std_dev: self.std_dev,
+            line_dir: self.line_dir,
+        }
+    }
+    /// Apply only the settings that differ between `from` and `to`, so
+    /// changing one setting on several images keeps their other settings.
+    pub fn apply_display_change(
+        &mut self,
+        from: &DisplaySettings,
+        to: &DisplaySettings,
+        encoder: &ImageEncoder,
+    ) {
+        let before = self.display_settings();
+        if from.background != to.background {
+            self.background = to.background;
+        }
+        let (f0, f1, f) = (&from.filters, &to.filters, &mut self.filters);
+        if f0.smooth != f1.smooth {
+            f.smooth = f1.smooth;
+        }
+        if f0.smooth_px != f1.smooth_px {
+            f.smooth_px = f1.smooth_px;
+        }
+        if f0.sharpen != f1.sharpen {
+            f.sharpen = f1.sharpen;
+        }
+        if f0.sharpen_amount != f1.sharpen_amount {
+            f.sharpen_amount = f1.sharpen_amount;
+        }
+        if f0.deglitch != f1.deglitch {
+            f.deglitch = f1.deglitch;
+        }
+        if f0.deglitch_threshold != f1.deglitch_threshold {
+            f.deglitch_threshold = f1.deglitch_threshold;
+        }
+        if from.norm_type != to.norm_type {
+            self.norm_type = to.norm_type;
+        }
+        if from.std_dev != to.std_dev {
+            self.std_dev = to.std_dev;
+        }
+        if from.line_dir != to.line_dir {
+            self.line_dir = to.line_dir;
+        }
+        let after = self.display_settings();
+        // Contrast is applied when drawing; the rest needs the image redone.
+        if (before.background, before.filters, before.line_dir)
+            != (after.background, after.filters, after.line_dir)
+        {
+            self.write_and_update_texture(encoder);
+        }
     }
     pub fn show_metadata(&self, ui: &mut Ui) {
         let norm = self.image_view.norm_data.read();
         let fit = self.image_view.fit_data.read();
         if let (Some(norm), Some(fit)) = (norm.as_ref(), fit.as_ref()) {
-            ui.label(format!(
-                "Range:    {:.2}{}",
-                EngFmt(norm.max - norm.min),
-                self.unit
-            ));
-            ui.label(format!("Std Dev: {:.2}{}", EngFmt(norm.stddev), self.unit));
-            if let FitData::PlaneFitSubtract {
-                x_slope, y_slope, ..
-            } = fit
-            {
-                ui.label(format!("X Slope: {:.2}{}", EngFmt(*x_slope), self.unit));
-                ui.label(format!("Y Slope: {:.2}{}", EngFmt(*y_slope), self.unit));
-            }
+            let unit = &self.unit;
+            egui::Grid::new((self.uuid, "metadata_grid"))
+                .num_columns(2)
+                .spacing([8., 2.])
+                .show(ui, |ui| {
+                    let row = |ui: &mut Ui, name: &str, v: f32| {
+                        ui.weak(name);
+                        ui.monospace(format!("{:.2}{unit}", EngFmt(v)));
+                        ui.end_row();
+                    };
+                    row(ui, "Range", norm.max - norm.min);
+                    row(ui, "Std dev", norm.stddev);
+                    if let FitData::PlaneFitSubtract { x_slope, y_slope, .. } = fit {
+                        row(ui, "X slope", *x_slope);
+                        row(ui, "Y slope", *y_slope);
+                    }
+                });
         }
         if let Some(r) = &self.ring {
             ui.label(egui::RichText::new(format!("Ring: {}", r.summary())).color(r.color()));
@@ -140,49 +205,8 @@ impl LiveImage {
             ));
         }
     }
-    pub fn show_fit_control(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
-        if combo_box(
-            ui,
-            (self.image_view.uuid(), "fit type"),
-            &mut self.fit_type,
-            &(),
-        ) {
-            self.update_texture(encoder);
-        };
-    }
-    pub fn show_normalization_control(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            combo_box(
-                ui,
-                (self.image_view.uuid(), "norm type"),
-                &mut self.norm_type,
-                &(),
-            );
-            if self.norm_type == NormType::StdDev {
-                ui.add(
-                    DragValue::new(&mut self.std_dev)
-                        .range((0.)..=(9.))
-                        .speed(0.01),
-                );
-            }
-        });
-    }
-    pub fn show_line_dir_control(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
-        let text = match self.line_dir {
-            LineDir::Forward => "Forward",
-            LineDir::Backward => "Backward",
-        };
-        if ui.button(text).clicked() {
-            match self.line_dir {
-                LineDir::Forward => self.line_dir = LineDir::Backward,
-
-                LineDir::Backward => self.line_dir = LineDir::Forward,
-            }
-            self.write_and_update_texture(encoder);
-        }
-    }
     pub fn update_texture(&self, encoder: &ImageEncoder) {
-        self.image_view.write_texture(encoder, self.fit_type);
+        self.image_view.write_texture(encoder, self.background.gpu_fit());
     }
     pub fn write_and_update_texture(&mut self, encoder: &ImageEncoder) {
         let new_data = match self.line_dir {
@@ -192,8 +216,12 @@ impl LiveImage {
         if self.image_view.size() != new_data.size {
             self.image_view = self.image_view.resized(encoder, new_data.size);
         }
+        // Processing works on a copy; the recorded data is never changed.
+        let processed =
+            processing::process(&new_data.data, new_data.size, self.background, self.filters);
+        let src: &[f32] = processed.as_deref().unwrap_or(&new_data.data);
         self.image_view
-            .write_lines(encoder, .., |buf| buf.copy_from_slice(&new_data.data))
+            .write_lines(encoder, .., |buf| buf.copy_from_slice(src))
             .unwrap();
         self.update_texture(encoder);
     }
@@ -203,6 +231,7 @@ impl LiveImage {
     pub fn uuid(&self) -> Uuid {
         self.uuid
     }
+    #[allow(dead_code)] // for ScanArea::show_scan_line, disabled on v5
     pub fn size(&self) -> [u32; 2] {
         self.image_view.size()
     }
@@ -218,7 +247,8 @@ impl LiveImage {
     ) -> Self {
         let mut img = Self::new(Uuid::new_v4(), encoder, transform);
         img.std_dev = self.std_dev;
-        img.fit_type = self.fit_type;
+        img.background = self.background;
+        img.filters = self.filters;
         img.norm_type = self.norm_type;
         img.line_dir = self.line_dir;
         img.forward_data = forward;
@@ -241,7 +271,8 @@ impl LiveImage {
             image_view,
             transform: self.transform,
             std_dev: self.std_dev,
-            fit_type: self.fit_type,
+            background: self.background,
+            filters: self.filters,
             norm_type: self.norm_type,
             line_dir: self.line_dir,
             forward_data: self.forward_data.clone(),
@@ -256,6 +287,121 @@ impl LiveImage {
         }
     }
 }
+
+/// The display settings of a scan image that can be shared across stamps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplaySettings {
+    pub background: Background,
+    pub filters: Filters,
+    pub norm_type: NormType,
+    pub std_dev: f32,
+    pub line_dir: LineDir,
+}
+
+/// Processing, contrast and colour controls. The first image's settings are
+/// shown; a change is applied to every image in `images` (only the setting
+/// that was changed, so mixed selections keep their other settings).
+pub fn display_controls(ui: &mut Ui, images: &mut [&mut LiveImage], encoder: &ImageEncoder) {
+    let Some(first) = images.first() else { return };
+    let id = first.image_view.uuid();
+    let before = first.display_settings();
+    let mut s = before;
+    egui::Grid::new((id, "display_grid"))
+        .num_columns(2)
+        .spacing([8., 4.])
+        .show(ui, |ui| {
+            ui.label("Direction");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut s.line_dir, LineDir::Forward, "Forward");
+                ui.selectable_value(&mut s.line_dir, LineDir::Backward, "Backward");
+            })
+            .response
+            .on_hover_text("Show the forward or backward scan");
+            ui.end_row();
+
+            processing::processing_rows(ui, id, &mut s.background, &mut s.filters);
+
+            ui.label("Contrast");
+            ui.horizontal(|ui| {
+                combo_box(ui, (id, "norm type"), &mut s.norm_type, &());
+                if s.norm_type == NormType::StdDev {
+                    ui.add(DragValue::new(&mut s.std_dev).range((0.)..=(9.)).speed(0.01));
+                }
+            });
+            ui.end_row();
+
+            processing::color_scale_ui(ui);
+        });
+
+    // Undo and reset. Processing never changes the recorded data, so going
+    // back only needs the earlier settings.
+    let hist_id = egui::Id::new("display_settings_history");
+    let mut hist: DisplayHistory = ui.data(|d| d.get_temp(hist_id)).unwrap_or_default();
+    let now = ui.input(|i| i.time);
+    let can_undo = images
+        .iter()
+        .any(|img| hist.0.get(&img.uuid()).is_some_and(|(v, _)| !v.is_empty()));
+    let mut undo = false;
+    let mut reset = false;
+    ui.horizontal(|ui| {
+        undo = ui
+            .add_enabled(can_undo, egui::Button::new("\u{21b6} Undo"))
+            .on_hover_text("Go back to the processing before the last change")
+            .clicked();
+        reset = ui
+            .button("Original")
+            .on_hover_text(
+                "Show the image as recorded: no background removal, filters or \
+                 contrast changes (Undo brings the processing back)",
+            )
+            .clicked();
+    });
+    if reset {
+        s.background = Background::Raw;
+        s.filters = Filters::default();
+        s.norm_type = NormType::FullScale;
+    }
+    if undo {
+        for img in images.iter_mut() {
+            let entry = hist.0.entry(img.uuid()).or_default();
+            if let Some(prev) = entry.0.pop() {
+                let cur = img.display_settings();
+                img.apply_display_change(&cur, &prev, encoder);
+            }
+            entry.1 = f64::NEG_INFINITY;
+        }
+    } else if s != before {
+        for img in images.iter_mut() {
+            // A drag changes the value every frame: one undo step for it.
+            let entry = hist.0.entry(img.uuid()).or_default();
+            if reset || now - entry.1 > 0.7 {
+                entry.0.push(img.display_settings());
+                if entry.0.len() > 50 {
+                    entry.0.remove(0);
+                }
+            }
+            entry.1 = if reset { f64::NEG_INFINITY } else { now };
+            if reset {
+                let cur = img.display_settings();
+                let target = DisplaySettings {
+                    background: s.background,
+                    filters: s.filters,
+                    norm_type: s.norm_type,
+                    ..cur
+                };
+                img.apply_display_change(&cur, &target, encoder);
+            } else {
+                img.apply_display_change(&before, &s, encoder);
+            }
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(hist_id, hist));
+}
+
+/// Earlier display settings per image, for Undo, and when each was last
+/// changed.
+#[derive(Clone, Default)]
+struct DisplayHistory(std::collections::HashMap<Uuid, (Vec<DisplaySettings>, f64)>);
 
 impl ComboBoxType for LineDir {
     type Ctx = ();
@@ -277,6 +423,16 @@ pub struct FrameData {
     pub size: [u32; 2],
     pub data: Arc<Box<[f32]>>,
 }
+impl FrameData {
+    /// Same size and the same values bit for bit (NaN, unscanned pixels,
+    /// compare equal), so a re-downloaded unchanged frame can be skipped.
+    pub fn same_as(&self, other: &FrameData) -> bool {
+        self.size == other.size
+            && (Arc::ptr_eq(&self.data, &other.data)
+                || bytemuck::cast_slice::<f32, u32>(&self.data)
+                    == bytemuck::cast_slice::<f32, u32>(&other.data))
+    }
+}
 impl Default for FrameData {
     fn default() -> Self {
         Self {
@@ -291,6 +447,9 @@ const TRANSFORM_TABLE: TableDefinition<Uuid, [f64; 6]> =
 const STD_DEV_TABLE: TableDefinition<Uuid, f32> = TableDefinition::new("liveimage_stddev_table_v1");
 const DIR_TABLE: TableDefinition<Uuid, u32> = TableDefinition::new("liveimage_dir_table_v1");
 const FIT_TABLE: TableDefinition<Uuid, u8> = TableDefinition::new("liveimage_fit_table_v1");
+/// Optional: only images with filters changed from the defaults have a row.
+const FILTER_TABLE: TableDefinition<Uuid, [f32; 6]> =
+    TableDefinition::new("liveimage_filter_table_v1");
 const NORM_TABLE: TableDefinition<Uuid, u8> = TableDefinition::new("liveimage_norm_table_v1");
 const DATA_TABLE: TableDefinition<Uuid, [FrameData; 2]> =
     TableDefinition::new("liveimage_data_table_v1");
@@ -333,9 +492,22 @@ impl Persistant for LiveImage {
 
         let mut fit_table = txn.open_table(FIT_TABLE)?;
         let mut fit_data = fit_table.get_mut(id)?.expect("");
-        if fit_data.value() != Into::<u8>::into(self.fit_type) {
-            fit_data.insert(&self.fit_type.into())?;
+        if fit_data.value() != Into::<u8>::into(self.background) {
+            fit_data.insert(&self.background.into())?;
         }
+        drop(fit_data);
+        drop(fit_table);
+
+        let mut filter_table = txn.open_table(FILTER_TABLE)?;
+        let stored = filter_table.get(id)?.map(|v| v.value());
+        let wanted = (!self.filters.is_default()).then(|| self.filters.to_array());
+        if stored != wanted {
+            match wanted {
+                Some(a) => filter_table.insert(id, a)?,
+                None => filter_table.remove(id)?,
+            };
+        }
+        drop(filter_table);
 
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         let mut norm_data = norm_table.get_mut(id)?.expect("");
@@ -391,6 +563,8 @@ impl Persistant for LiveImage {
         dir_table.remove(id)?;
         let mut fit_table = txn.open_table(FIT_TABLE)?;
         fit_table.remove(id)?;
+        let mut filter_table = txn.open_table(FILTER_TABLE)?;
+        filter_table.remove(id)?;
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         norm_table.remove(id)?;
         let mut unit_table = txn.open_table(UNIT_TABLE)?;
@@ -420,7 +594,11 @@ impl Persistant for LiveImage {
         let mut dir_table = txn.open_table(DIR_TABLE)?;
         dir_table.insert(id, &self.line_dir.into())?;
         let mut fit_table = txn.open_table(FIT_TABLE)?;
-        fit_table.insert(id, &self.fit_type.into())?;
+        fit_table.insert(id, &self.background.into())?;
+        if !self.filters.is_default() {
+            let mut filter_table = txn.open_table(FILTER_TABLE)?;
+            filter_table.insert(id, self.filters.to_array())?;
+        }
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         norm_table.insert(id, &self.norm_type.into())?;
         let mut unit_table = txn.open_table(UNIT_TABLE)?;
@@ -455,6 +633,8 @@ impl Persistant for LiveImage {
         let dir_data = dir_table.get(id)?.unwrap().value();
         let fit_table = txn.open_table(FIT_TABLE)?;
         let fit_data = fit_table.get(id)?.unwrap().value();
+        let filter_table = txn.open_table(FILTER_TABLE)?;
+        let filters = filter_table.get(id)?.map(|v| Filters::from_array(v.value()));
         let norm_table = txn.open_table(NORM_TABLE)?;
         let norm_data = norm_table.get(id)?.unwrap().value();
         let unit_table = txn.open_table(UNIT_TABLE)?;
@@ -473,7 +653,8 @@ impl Persistant for LiveImage {
         let mut image = Self::new(id, encoder, DAffine2::from_cols_array(&tran_data));
         image.std_dev = stddev_data;
         image.line_dir = LineDir::try_from(dir_data).unwrap();
-        image.fit_type = FitType::try_from(fit_data).unwrap();
+        image.background = Background::try_from(fit_data).unwrap_or(Background::Raw);
+        image.filters = filters.unwrap_or_default();
         image.norm_type = NormType::try_from(norm_data).unwrap();
         image.unit = unit_data;
         image.ring = ring;

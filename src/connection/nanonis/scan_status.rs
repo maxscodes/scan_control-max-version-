@@ -4,7 +4,9 @@ use nanonis_tcp::{LineDir, ScanDir};
 #[derive(Debug, Clone, Copy)]
 pub struct ScanStatus {
     pub scan_dir: ScanDir,
+    #[allow(dead_code)] // set by the end-of-line wait, not available on Nanonis v5
     pub line_dir: LineDir,
+    #[allow(dead_code)] // set by the end-of-line wait, not available on Nanonis v5
     pub line_number: u32,
     pub scanning: bool,
 }
@@ -19,6 +21,7 @@ impl Default for ScanStatus {
     }
 }
 impl ScanStatus {
+    #[allow(dead_code)] // end-of-line wait: not available on Nanonis v5
     pub fn scan_line_position(&self, scan_size: [u32; 2], line_dir: LineDir) -> Option<f64> {
         if !self.scanning {
             return None;

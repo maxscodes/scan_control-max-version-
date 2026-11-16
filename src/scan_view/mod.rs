@@ -9,6 +9,7 @@ pub mod border;
 mod callbacks;
 mod file_image;
 pub mod gds_image;
+pub mod processing;
 mod scale_bar;
 mod scan_image;
 pub mod static_image;

@@ -86,11 +86,6 @@ impl ProjectDb {
     pub fn db(&self) -> &Database {
         &self.db
     }
-    pub fn update_from(&self, val: &impl Persistant) -> Result<(), Box<dyn Error>> {
-        let txn = self.db.begin_write()?;
-        val.db_update(&txn)?;
-        Ok(())
-    }
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -109,6 +104,7 @@ pub trait Persistant: Sized {
         txn: &'t WriteTransaction,
         encoder: &ImageEncoder,
     ) -> Result<Self, Box<dyn Error>>;
+    #[allow(dead_code)] // debugging aid: prints table sizes
     fn db_dump_stats<'t>(txn: &'t WriteTransaction) -> Result<(), Box<dyn Error>>;
 }
 

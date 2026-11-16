@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     analysis::sxm_match::{load_frame, SxmFrame},
-    connection::{live_image::FrameData, nanonis::ScanStatus, LiveImage},
+    connection::{nanonis::ScanStatus, FrameData, LiveImage},
     project::Persistant,
     scan_view::{border::dashes_from_line, BorderRectangle, ImageEncoder, ScanViewCtx},
     utils::vec_interop::{IntoEgui, Projection},
@@ -111,6 +111,7 @@ impl ScanArea {
         }
         .show(ui);
     }
+    #[allow(dead_code)] // end-of-line wait: not available on Nanonis v5
     fn show_scan_line(&self, ui: &mut Ui) {
         let Some(image_tran) = self.image_transform else {
             return;
@@ -151,49 +152,40 @@ impl ScanArea {
         let center = tf.project_pos2(tip_pos).to_egui_pos2();
         ui.painter().circle_filled(center, 3., Color32::BLUE);
     }
+    /// Channel, display settings and stamping. Map display options (move
+    /// history, ring results) are in the View menu.
     pub fn show_menu(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
-        ui.set_max_width(140.);
         self.show_channel_control(ui);
         self.live_image.show_menu(ui, encoder);
+        ui.add_space(4.);
         self.show_stamp_button(ui, encoder);
-        ui.separator();
-        ui.checkbox(&mut self.show_history, "Show history");
-        if self.show_history {
-            ui.indent("history_boxes_check", |ui|{
-                ui.checkbox(&mut self.show_history_boxes, "Show boxes");
-            });
-        }
-        ui.checkbox(&mut self.show_stamp_rings, "Show ring results on stamps");
     }
     fn show_stamp_button(&mut self, ui: &mut Ui, encoder: &ImageEncoder) {
-        let font_id = egui::TextStyle::Body.resolve(ui.style());
-        let galley = ui.painter().layout_no_wrap(
-            self.stamp_name_base.clone(),
-            font_id.clone(),
-            ui.visuals().text_color(),
-        );
-        let padding = ui.spacing().button_padding.x * 2.0;
-        let width = galley.size().x + padding;
-
-        ui.horizontal(|ui| {
-            if ui.button("Stamp").clicked() {
+        ui.columns(2, |c| {
+            let w = c[0].available_width();
+            if c[0]
+                .add_sized([w, 24.], egui::Button::new("\u{1F4F7} Stamp"))
+                .on_hover_text("Paste the current image onto the map")
+                .clicked()
+            {
                 self.stamp.push_front(self.live_image.stamp(encoder));
             }
-            ui.add_enabled(
-                false,
-                egui::TextEdit::singleline(&mut self.stamp_name_base).desired_width(width),
-            );
+            let w = c[1].available_width();
+            if c[1]
+                .add_sized([w, 24.], egui::Button::new("From .sxm\u{2026}"))
+                .on_hover_text(
+                    "Stamp saved .sxm scans you forgot to stamp live. They are placed \
+                     using the current map position, so pick scans taken since the \
+                     last coarse move.",
+                )
+                .clicked()
+            {
+                self.pick_sxm_files();
+            }
         });
-        if ui
-            .button("Stamp from .sxm\u{2026}")
-            .on_hover_text(
-                "Stamp saved .sxm scans you forgot to stamp live. They are placed \
-                 using the current map position, so pick scans taken since the \
-                 last coarse move.",
-            )
-            .clicked()
-        {
-            self.pick_sxm_files();
+        if !self.stamp_name_base.is_empty() {
+            ui.label(egui::RichText::new(format!("Name: {}", self.stamp_name_base)).small().weak())
+                .on_hover_text("Stamps are named after the Nanonis file base name");
         }
     }
     /// Ask for .sxm files and load them in the background; see
@@ -236,18 +228,26 @@ impl ScanArea {
         }
     }
     fn show_channel_control(&mut self, ui: &mut Ui) {
-        let mut selection = self.channel_selected.as_ref().map(|s| s.as_str());
-        if egui::ComboBox::new((self.live_image.uuid(), "combo_box"), "")
-            .selected_text(selection.unwrap_or_default())
-            .show_ui(ui, |ui| {
-                self.channel_opts
-                    .iter()
-                    .map(|opt| ui.selectable_value(&mut selection, Some(opt), opt))
-                    .any(|resp| resp.clicked())
+        let mut selection = self.channel_selected.as_deref();
+        let changed = ui
+            .horizontal(|ui| {
+                ui.label("Channel");
+                egui::ComboBox::new((self.live_image.uuid(), "combo_box"), "")
+                    .width(ui.available_width() - 8.)
+                    .selected_text(selection.unwrap_or("None"))
+                    .show_ui(ui, |ui| {
+                        // `any` would stop drawing at the first click.
+                        let mut clicked = false;
+                        for opt in &self.channel_opts {
+                            clicked |= ui.selectable_value(&mut selection, Some(opt), opt).clicked();
+                        }
+                        clicked
+                    })
+                    .inner
+                    .unwrap_or(false)
             })
-            .inner
-            .is_some_and(|clicked| clicked)
-        {
+            .inner;
+        if changed {
             self.channel_selected = selection.map(|s| s.to_string());
         }
     }

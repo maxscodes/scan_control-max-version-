@@ -24,6 +24,12 @@ impl<S: 'static> UndoQueue<S> {
         self.queue.push(Box::new(modifier));
         self.index += 1;
     }
+    pub fn can_undo(&self) -> bool {
+        self.index > 0
+    }
+    pub fn can_redo(&self) -> bool {
+        self.index < self.queue.len()
+    }
     pub fn undo(&mut self, app_state: &mut S) {
         if self.index == 0 {
             return;

@@ -6,7 +6,10 @@ use glam::{DAffine2, DVec2};
 use uuid::Uuid;
 
 use crate::{
-    components::{file_dialog_native::dialog, selectable_list::SelectableList},
+    components::{
+        file_dialog_native::dialog,
+        selectable_list::SelectableList,
+    },
     connection::{
         nanonis::{
             lithography::{
@@ -18,7 +21,7 @@ use crate::{
         },
         ScanArea,
     },
-    scan_view::{GDSImage, ScanViewCtx},
+    scan_view::{GDSImage, ImageEncoder, ScanViewCtx},
     utils::vec_interop::IntoEgui as _,
     view_object::Object,
 };
@@ -92,11 +95,17 @@ pub struct LithographyState {
     grab: Option<(usize, Handle)>,
     shapes_tx: Sender<Result<Vec<Shape>, String>>,
     shapes_rx: Receiver<Result<Vec<Shape>, String>>,
+    /// A litho GDS loaded from this window, to put on the map.
+    gds_load_tx: Sender<Result<Object, String>>,
+    gds_load_rx: Receiver<Result<Object, String>>,
+    /// For building a loaded GDS's drawing buffers.
+    load_encoder: Option<ImageEncoder>,
 }
 
 impl LithographyState {
     pub fn new(cmd_tx: Sender<LithoCommand>, events: Receiver<LithoEvent>) -> Self {
         let (shapes_tx, shapes_rx) = crossbeam::channel::unbounded();
+        let (gds_load_tx, gds_load_rx) = crossbeam::channel::unbounded();
         Self {
             window_open: false,
             settings: LithoSettings::default(),
@@ -120,12 +129,45 @@ impl LithographyState {
             grab: None,
             shapes_tx,
             shapes_rx,
+            gds_load_tx,
+            gds_load_rx,
+            load_encoder: None,
         }
+    }
+
+    /// Ask for a litho GDS file and load it off the UI thread, centred on
+    /// the scan frame.
+    fn pick_litho_gds(&mut self, area: Option<&ScanArea>) {
+        let Some(encoder) = self.load_encoder.clone() else { return };
+        let center = area.map_or(DVec2::ZERO, |a| match a.image_transform {
+            Some(frame) => a.world_transform.transform_point2(frame.translation),
+            None => a.world_transform.translation,
+        });
+        let tx = self.gds_load_tx.clone();
+        let d = dialog()
+            .add_filter("GDS", &["gds", "GDS"])
+            .set_title("Load lithography GDS");
+        std::thread::spawn(move || {
+            let Some(path) = d.pick_file() else { return };
+            let name = path.display().to_string();
+            let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Object::import(path, &encoder, DAffine2::from_translation(center))
+            }));
+            let _ = tx.send(match loaded {
+                Ok(Some(o)) => Ok(o),
+                _ => Err(format!("Could not read the GDS {name}")),
+            });
+        });
     }
 
     /// Ctrl+drag / ctrl+click on the map edits drawn shapes.
     pub fn map_edit_active(&self) -> bool {
         self.window_open && self.edit_on_map && !self.is_running()
+    }
+
+    /// Whether the tool window is open (toggled from the Scan Control tools).
+    pub fn open_mut(&mut self) -> &mut bool {
+        &mut self.window_open
     }
 
     /// Lithography or a tip move is in progress: other tip controls lock.
@@ -191,27 +233,47 @@ impl LithographyState {
         }
     }
 
-    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>, blocked: Option<&str>) {
+    pub fn show_menu(
+        &mut self,
+        ui: &mut Ui,
+        object_list: &mut SelectableList<Object>,
+        encoder: &ImageEncoder,
+        blocked: Option<&str>,
+    ) {
         self.poll_events();
+        // A litho GDS picked in this window: add it to the map and use it.
+        while let Ok(loaded) = self.gds_load_rx.try_recv() {
+            match loaded {
+                Ok(object) => {
+                    let id = object.uuid();
+                    object_list.push(object.into_entry(Uuid::new_v4()));
+                    self.gds = Some(id);
+                    self.use_gds = true;
+                    self.excluded_layers.clear();
+                    self.set_status(
+                        StatusKind::Idle,
+                        "Litho GDS loaded at the scan frame: drag it on the map to align, then preview",
+                    );
+                }
+                Err(e) => self.set_status(StatusKind::Error, e),
+            }
+        }
+        self.load_encoder = Some(encoder.clone());
         if self.map_edit_active() && ui.input(|i| i.modifiers.ctrl) {
             // Ctrl+drag edits shapes: don't also move selected layers.
             object_list.clear_selected();
         }
         let object_list = &*object_list;
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.window_open, egui::Button::new("Lithography"))
-                .clicked()
-            {
-                self.window_open = true;
-            }
-            if self.running {
-                if let Some((done, total)) = self.progress {
-                    ui.label(format!("litho {done}/{total}"));
-                }
+        if self.running {
+            ui.horizontal(|ui| {
                 ui.spinner();
-            }
-        });
+                let text = match self.progress {
+                    Some((done, total)) => format!("Lithography: {done}/{total}"),
+                    None => "Lithography running".into(),
+                };
+                ui.label(egui::RichText::new(text).small());
+            });
+        }
         let gds_list: Vec<(Uuid, String, &GDSImage)> = object_list
             .iter()
             .filter_map(|o| match &**o {
@@ -281,8 +343,18 @@ impl LithographyState {
 
         ui.add_enabled_ui(editable, |ui| {
             ui.label(RichText::new("Geometry").strong());
+            if ui
+                .button("Load litho GDS\u{2026}")
+                .on_hover_text(
+                    "Open the GDS to write (usually not the sample's ring GDS). It is placed \
+                     on the map at the scan frame and selected here; drag it to align.",
+                )
+                .clicked()
+            {
+                self.pick_litho_gds(area);
+            }
             if gds_list.is_empty() {
-                ui.weak("No GDS on the map (File \u{2192} Import Files), or draw shapes below.");
+                ui.weak("No GDS on the map: load a litho GDS above, or draw shapes below.");
             } else {
                 ui.checkbox(&mut self.use_gds, "Write a GDS");
             }

@@ -1,11 +1,10 @@
-pub mod backing;
 mod live_image;
 pub mod queue;
 mod scan_area;
 mod shared_state;
 
 use egui::Ui;
-pub use live_image::{FrameData, LiveImage};
+pub use live_image::{display_controls, FrameData, LiveImage};
 pub use scan_area::ScanArea;
 
 use crate::{components::selectable_list::SelectableList, scan_view::ImageEncoder, view_object};

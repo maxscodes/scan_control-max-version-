@@ -146,10 +146,18 @@ impl FineMotionState {
     }
 
     /// Launcher button and window. `locked` says why moves can't start now.
-    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>, locked: Option<&str>) {
-        if ui.add_enabled(!self.open, Button::new("Fine Motion")).clicked() {
-            self.open = true;
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+    pub fn set_open(&mut self, open: bool) {
+        self.open = open;
+        if !open {
+            self.follow_dirty = false;
         }
+    }
+
+    /// The Fine Motion window (opened from the Scan Control tools).
+    pub fn show_menu(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>, locked: Option<&str>) {
         if !self.open {
             return;
         }
@@ -162,6 +170,7 @@ impl FineMotionState {
         };
         let mut open = self.open;
         egui::Window::new("Fine Motion")
+            .vscroll(true)
             .frame(theme::window_frame(ui.ctx()))
             .resizable(false)
             .collapsible(true)
@@ -170,9 +179,8 @@ impl FineMotionState {
                 ui.set_max_width(300.);
                 self.show_window(ui, scan_area, locked);
             });
-        self.open = open;
         if !open {
-            self.follow_dirty = false;
+            self.set_open(false);
         }
     }
 

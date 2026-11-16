@@ -182,6 +182,11 @@ impl FileImage {
     pub fn center(&self) -> glam::DVec2 {
         self.world_points.iter().sum::<glam::DVec2>() / 4.
     }
+    /// Put the image's corners at these map positions.
+    pub fn set_world_points(&mut self, points: [DVec2; 4]) {
+        self.world_points = points;
+        self.update_transform();
+    }
     pub fn transform_world_points(&mut self, tf: DAffine2) {
         for p in &mut self.world_points {
             *p = tf.project_pos2(*p);

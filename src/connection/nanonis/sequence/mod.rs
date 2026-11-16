@@ -3,10 +3,14 @@
 
 mod editor;
 mod eta;
+mod grid_track;
 mod model;
 mod overlay;
 mod runner;
 
 pub use editor::{SequenceAction, SequenceState};
-pub(crate) use model::Frame;
+pub(crate) use eta::fmt_duration;
+pub(crate) use model::{CoarseSpec, Dir, Frame, FrameSpec, Position, ScanEntry, ScanStart, Sequence, Speed};
+#[cfg(test)]
+pub(crate) use model::{compile, Step};
 pub use runner::SequenceWorker;

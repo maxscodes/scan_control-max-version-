@@ -1,8 +1,10 @@
 mod channel_state;
+mod coarse_cal;
 mod command_channel;
 mod course_motion;
 mod fine_motion;
 mod lithography;
+mod pair_view;
 mod ring_assist;
 mod scan_control;
 mod scan_status;
@@ -29,7 +31,7 @@ use tracing::trace;
 use uuid::Uuid;
 
 use crate::{
-    components::selectable_list::{SelectableEntry, SelectableList},
+    components::selectable_list::SelectableList,
     connection::{
         live_image::{FrameData, LiveImage},
         nanonis::{
@@ -78,6 +80,8 @@ pub struct NanonisConnection {
     lithography: LithographyState,
     ring_assist: RingAssistState,
     pending_stamp: Option<PendingStamp>,
+    /// Lines up survey tiles when a survey ends.
+    aligner: crate::analysis::mosaic::Aligner,
 }
 
 /// A stamp requested by the sequence runner, waiting for a fresh full frame.
@@ -109,15 +113,7 @@ impl Connection for NanonisConnection {
         }
         let mut scan_area = ScanArea::new(Uuid::new_v4(), encoder, *self.area_size.read());
         self.sync_scan_area(&mut scan_area);
-        object_list.push(SelectableEntry::new(
-            "area",
-            Object::ScanArea {
-                image: scan_area,
-                hidden: false,
-            },
-            |img| img.list_atoms(),
-            |obj| obj.hidden_mut(),
-        ));
+        object_list.push(Object::ScanArea { image: scan_area, hidden: false }.into_entry("area"));
         true
     }
 
@@ -172,20 +168,10 @@ impl Connection for NanonisConnection {
             );
             stamp.gds_ref = crate::analysis::gds_prior::predict_any(&gds, stamp.transform)
                 .map(|(gi, _)| (gds[gi].uuid, gds[gi].transform));
-            let mut name = file.clone();
-            let mut k = 2;
-            while object_list.iter().any(|o| o.name() == name) {
-                name = format!("{file}({k})");
-                k += 1;
-            }
+            let name = unique_name(object_list, &file);
             object_list.insert(
                 index,
-                SelectableEntry::new(
-                    Uuid::new_v4(),
-                    Object::ScanImage { image: stamp, name, hidden: false },
-                    |img| img.list_atoms(),
-                    |obj| obj.hidden_mut(),
-                ),
+                Object::ScanImage { image: stamp, name, hidden: false, group: None }.into_entry(Uuid::new_v4()),
             );
         }
 
@@ -233,19 +219,53 @@ impl Connection for NanonisConnection {
             self.stamp_namer.add_new(stamp.uuid(), stamp.forward_data.data.clone(), stamp.forward_data.size);
             object_list.insert(
                 index,
-                SelectableEntry::new(
-                    Uuid::new_v4(),
-                    Object::ScanImage {
-                        image: stamp,
-                        name,
-                        hidden: false,
-                    },
-                    |img| img.list_atoms(),
-                    |obj| obj.hidden_mut(),
-                ),
+                Object::ScanImage { image: stamp, name, hidden: false, group: None }.into_entry(Uuid::new_v4()),
             );
         }
         self.name_stamps(object_list);
+        // Put survey tiles in their survey's layer group (once their stamp
+        // is on the list).
+        let mut waiting = Vec::new();
+        for (id, g) in self.sequence.take_tile_groups() {
+            match object_list.iter_mut().find(|o| o.uuid() == id) {
+                Some(o) => {
+                    if let Some(group) = o.group_mut() {
+                        *group = Some(g);
+                    }
+                }
+                None => waiting.push((id, g)),
+            }
+        }
+        self.sequence.keep_tile_groups(waiting);
+        // A tracked grid: tiles dragged on the map are where the tip really
+        // was; the latest one carries the tip (scan area) with it.
+        let ids = self.sequence.grid_tile_ids();
+        if !ids.is_empty() {
+            let pos: std::collections::HashMap<Uuid, glam::DVec2> = object_list
+                .iter()
+                .filter(|o| ids.contains(&o.uuid()))
+                .map(|o| (o.uuid(), o.transform_center()))
+                .collect();
+            if let Some(delta) = self.sequence.grid_sync(|id| pos.get(&id).copied()) {
+                if delta != glam::DVec2::ZERO {
+                    if let Some(area) = object_list.iter_mut().find_map(|e| e.as_scan_area_mut()) {
+                        area.world_transform.translation += delta;
+                    }
+                }
+            }
+        }
+        if let Some((c, n)) = self.sequence.take_grid_calibration() {
+            self.course_menu.set_calibration(c, format!("survey grid ({n} moves)"));
+        }
+        // Line up the tiles of a survey that just ended.
+        if let Some(ids) = self.sequence.take_finished_survey() {
+            if self.aligner.start(object_list, &ids) {
+                self.sequence.set_status(format!("Lining up {} survey tiles\u{2026}", ids.len()));
+            }
+        }
+        if let Some(summary) = self.aligner.poll(object_list) {
+            self.sequence.set_status(summary);
+        }
     }
     fn show_menu(
         &mut self,
@@ -283,51 +303,92 @@ impl Connection for NanonisConnection {
         let fine_lock = self.fine_lock();
         let locked_by = sequence.or(spectroscopy).or(lithography);
         let locked = locked_by.is_some();
+        // Scan controls stay usable during a sequence: using one holds it.
+        let scan_locked_by = spectroscopy.or(lithography);
 
         // Status, scan buttons, bias/setpoint/current and progress: always shown.
         let was_compact = theme::prefs().scan_compact;
         let mut compact = was_compact;
         let rows = frame_rows(&scan_area.live_image.forward_data);
-        self.scan_control.show_menu(
+        let user_command = self.scan_control.show_menu(
             ui,
             PanelInput {
                 status: &scan_status,
                 sequence_active: self.sequence.is_running(),
-                locked: locked_by,
+                locked: scan_locked_by,
                 readback: Some(*self.readback.peek()).filter(|_| self.slow_status_init.load(Ordering::SeqCst)),
                 rows,
             },
             &mut compact,
         );
+        if let Some(cmd) = user_command {
+            // Hold the sequence before the command reaches Nanonis.
+            if !matches!(cmd, scan_control::ScanCommand::Save) {
+                self.sequence.interrupt(&format!("you used the scan controls ({})", cmd.describe()));
+            }
+            self.scan_control.request(cmd);
+        }
         if compact != was_compact {
             theme::update_prefs(|p| p.scan_compact = compact);
         }
 
-        // Full mode: image settings, stamp, history and the tool launchers.
-        // The tools are always updated (their windows stay open); only their
-        // launch buttons are hidden in compact mode.
+        // Full mode: image settings, stamp and the tool launchers. The tools
+        // are always updated (their windows stay open); only their launch
+        // buttons and status lines are hidden in compact mode.
         let show_tools = !compact;
         if show_tools {
             ui.separator();
-            scan_area.show_menu(ui, encoder);
+            egui::CollapsingHeader::new(egui::RichText::new("Image").strong())
+                .id_salt("scan_control_image")
+                .default_open(true)
+                .show_unindented(ui, |ui| scan_area.show_menu(ui, encoder));
             ui.separator();
-            ui.label(egui::RichText::new("Tools").small().weak());
+            theme::section_label(ui, "TOOLS");
         }
         let mut tools_ui = ui.new_child(egui::UiBuilder::new().invisible().sizing_pass());
         let tools_ui: &mut Ui = if show_tools { ui } else { &mut tools_ui };
         let ui = tools_ui;
-        self.course_menu.show_menu(ui, object_list, locked);
-        self.fine_motion.show_menu(ui, object_list, fine_lock);
-        self.sequence.line_times = Some(*self.readback.peek())
-            .filter(|_| self.slow_status_init.load(Ordering::SeqCst))
+        self.tool_buttons(ui);
+        ui.add_space(2.);
+        let readback = Some(*self.readback.peek()).filter(|_| self.slow_status_init.load(Ordering::SeqCst));
+        let line_times = readback
             .map(|r| (r.fwd_line_time as f64, r.bwd_line_time as f64))
             .filter(|&(f, _)| f > 0.);
+        (self.course_menu.cal_progress, self.course_menu.cal_measuring) = self.sequence.calibration_progress();
+        self.course_menu.cal_can_restore = self.sequence.can_restore_calibration_frame();
+        self.course_menu.line_times = line_times;
+        self.course_menu.show_menu(ui, object_list, locked);
+        // Auto calibration runs as a sequence; its result goes back to the menu.
+        if let Some(mut plan) = self.course_menu.take_calibration_request() {
+            // Remember the frame size and resolution to put back afterwards.
+            let rb = *self.readback.peek();
+            let frame = object_list
+                .iter()
+                .find_map(|o| o.as_scan_area())
+                .and_then(|a| a.image_transform)
+                .map(sequence::Frame::from_transform);
+            plan.restore = frame
+                .filter(|_| rb.lines > 0 && rb.pixels > 0)
+                .map(|f| ([f.width, f.height], [rb.pixels, rb.lines]));
+            plan.restore_line_time_s = Some(rb.fwd_line_time as f64).filter(|&t| t > 0.);
+            let old = self.course_menu.calibration();
+            self.sequence.start_calibration(plan, self.course_menu.group_index(), old);
+        }
+        if self.course_menu.take_restore_request() {
+            self.sequence.restore_calibration_frame();
+        }
+        if let Some(result) = self.sequence.take_calibration_result() {
+            self.course_menu.set_calibration_result(result);
+        }
+        self.fine_motion.show_menu(ui, object_list, fine_lock);
+        self.sequence.line_times = line_times;
+        self.sequence.lines = readback.map(|r| r.lines).filter(|&l| l > 0);
         self.sequence
             .show_menu(ui, object_list, &self.course_menu, spectroscopy.or(lithography));
         self.spectroscopy
             .show_menu(ui, sequence.or(lithography).or(scanning).or(fine));
         self.lithography
-            .show_menu(ui, object_list, sequence.or(spectroscopy).or(scanning).or(fine));
+            .show_menu(ui, object_list, encoder, sequence.or(spectroscopy).or(scanning).or(fine));
         self.ring_assist
             .show_menu(ui, object_list, &mut self.course_menu, locked_by);
     }
@@ -370,6 +431,26 @@ impl Connection for NanonisConnection {
 }
 
 impl NanonisConnection {
+    /// The tool launchers: one toggle per tool window, two to a row.
+    fn tool_buttons(&mut self, ui: &mut Ui) {
+        let mut coarse = self.course_menu.menu_open();
+        let mut fine = self.fine_motion.is_open();
+        ui.columns(2, |c| {
+            theme::tool_button(&mut c[0], &mut coarse, "Coarse Motion", "Coarse motor moves, auto approach and calibration");
+            theme::tool_button(&mut c[1], &mut fine, "Fine Motion", "Move the scan frame or the tip within the piezo range");
+            theme::tool_button(&mut c[0], self.sequence.open_mut(), "Sequence", "Plan and run scans, survey grids and tip moves");
+            theme::tool_button(&mut c[1], self.spectroscopy.open_mut(), "Spectroscopy", "I(V) spectroscopy series at stepped Z");
+            theme::tool_button(&mut c[0], self.lithography.open_mut(), "Lithography", "Write a GDS pattern with the tip");
+            theme::tool_button(&mut c[1], self.ring_assist.open_mut(), "Ring Assist", "Find the ring centre in Z scans and suggest moves");
+        });
+        if coarse != self.course_menu.menu_open() {
+            self.course_menu.set_open(coarse);
+        }
+        if fine != self.fine_motion.is_open() {
+            self.fine_motion.set_open(fine);
+        }
+    }
+
     /// Name stamps after the .sxm file Nanonis saved the same scan to (and
     /// their training labels too). Stamps without a file name yet are looked
     /// up in the background.
@@ -387,12 +468,7 @@ impl NanonisConnection {
         }
         let session = self.session_path.read().clone();
         for (id, file) in self.stamp_namer.poll(&session) {
-            let mut new = file.clone();
-            let mut k = 2;
-            while object_list.iter().any(|o| o.name() == new) {
-                new = format!("{file}({k})");
-                k += 1;
-            }
+            let new = unique_name(object_list, &file);
             for o in object_list.iter_mut() {
                 if let Object::ScanImage { image, name, .. } = &mut **o {
                     if image.uuid() == id {
@@ -512,6 +588,7 @@ impl NanonisConnection {
             lithography,
             ring_assist: RingAssistState::new(),
             pending_stamp: None,
+            aligner: Default::default(),
             fast_status_init,
         }
     }
@@ -531,19 +608,27 @@ impl NanonisConnection {
         live_image: &mut LiveImage,
         encoder: &ImageEncoder,
     ) -> (bool, bool) {
+        // While scanning, frames are re-downloaded about every 100 ms, mostly
+        // unchanged (a line takes longer). Only a changed frame is processed
+        // and uploaded again; "got" still reports every arrival, as stamping
+        // waits for a fresh download.
         let mut got = (false, false);
         if let Some(forward_data) = self.forward_data.read_new() {
             got.0 = true;
-            live_image.forward_data = forward_data.clone();
-            if live_image.line_dir == LineDir::Forward {
-                live_image.write_and_update_texture(encoder);
+            if !live_image.forward_data.same_as(&forward_data) {
+                live_image.forward_data = forward_data.clone();
+                if live_image.line_dir == LineDir::Forward {
+                    live_image.write_and_update_texture(encoder);
+                }
             }
         }
         if let Some(backward_data) = self.backward_data.read_new() {
             got.1 = true;
-            live_image.backward_data = backward_data.clone();
-            if live_image.line_dir == LineDir::Backward {
-                live_image.write_and_update_texture(encoder);
+            if !live_image.backward_data.same_as(&backward_data) {
+                live_image.backward_data = backward_data.clone();
+                if live_image.line_dir == LineDir::Backward {
+                    live_image.write_and_update_texture(encoder);
+                }
             }
         }
         got
@@ -594,9 +679,54 @@ impl NanonisConnection {
             if !fresh {
                 tracing::warn!("fresh frame not received, stamping current data");
             }
-            scan_area
-                .stamp
-                .push_front(scan_area.live_image.stamp(encoder));
+            let saved = self.sequence.take_scan_file();
+            let is_tile = self.sequence.current_entry_is_tile();
+            if self.sequence.calibration_active() || is_tile {
+                // The Z forward image from the file Nanonis saved: the live
+                // view may show another channel, or not have the whole
+                // frame yet.
+                let from_file = saved.as_deref().and_then(|p| {
+                    match crate::analysis::sxm_match::load_frame(std::path::Path::new(p), Some("Z")) {
+                        Ok(f) => Some(coarse_cal::CalFrame {
+                            data: FrameData { size: f.size, data: std::sync::Arc::new(f.forward.into_boxed_slice()) },
+                            frame: f.frame,
+                            source: format!("{} ({})", f.name, f.channel),
+                        }),
+                        Err(e) => {
+                            tracing::warn!("calibration: could not read {p}: {e}; using the live image");
+                            None
+                        }
+                    }
+                });
+                let frame = from_file.or_else(|| {
+                    scan_area.image_transform.map(|frame| coarse_cal::CalFrame {
+                        data: scan_area.live_image.forward_data.clone(),
+                        frame,
+                        source: format!("live view ({})", scan_area.channel_selected.as_deref().unwrap_or("?")),
+                    })
+                });
+                if let Some(frame) = frame {
+                    if is_tile {
+                        // Before StampDone, so the next move is corrected in time.
+                        let (calib, volts) = (self.course_menu.calibration(), self.course_menu.volts());
+                        let m2 = scan_area.world_transform.matrix2;
+                        if let Some(off) = self.sequence.grid_tile_scanned(frame, calib, volts, m2) {
+                            // The tip is where the match says: move the scan
+                            // area there, so this tile is stamped in place.
+                            let d = m2 * off;
+                            scan_area.world_transform.translation += d;
+                            scan_area.live_image.transform.translation += d;
+                        }
+                    } else {
+                        self.sequence.capture_calibration_frame(frame);
+                    }
+                }
+            }
+            let stamp = scan_area.live_image.stamp(encoder);
+            if self.sequence.current_entry_is_tile() {
+                self.sequence.record_tile(stamp.uuid());
+            }
+            scan_area.stamp.push_front(stamp);
             self.pending_stamp = None;
             self.sequence.stamp_done();
         }
@@ -642,7 +772,7 @@ impl NanonisConnection {
                 if state.selection.is_some() {
                     Self::request_full_frame(&self.frame_queue_tx);
                 } else {
-                    scan_area.live_image.clear_texture(encoder);
+                    clear_live(&mut scan_area.live_image, encoder);
                 }
             }
         }
@@ -662,10 +792,28 @@ impl NanonisConnection {
             if scan_area.channel_selected.is_some() {
                 Self::request_full_frame(&self.frame_queue_tx);
             } else {
-                scan_area.live_image.clear_texture(encoder);
+                clear_live(&mut scan_area.live_image, encoder);
             }
         }
     }
+}
+
+/// `file`, or `file(2)`, `file(3)`, ... if a layer already has that name.
+fn unique_name(object_list: &SelectableList<view_object::Object>, file: &str) -> String {
+    let taken = |name: &str| object_list.iter().any(|o| o.name() == name);
+    if !taken(file) {
+        return file.to_string();
+    }
+    (2..).map(|k| format!("{file}({k})")).find(|n| !taken(n)).unwrap()
+}
+
+/// No channel shown: drop the picture and its data, so the same frame
+/// downloaded again after picking a channel is drawn (unchanged frames are
+/// otherwise skipped).
+fn clear_live(live: &mut LiveImage, encoder: &ImageEncoder) {
+    live.forward_data = FrameData::default();
+    live.backward_data = FrameData::default();
+    live.clear_texture(encoder);
 }
 
 /// (rows received, total rows) of a frame being scanned: rows whose middle

@@ -20,6 +20,8 @@ pub struct ScanState {
     pub bwd_s: f64,
     /// Frame width, nm (for speeds given in nm/s).
     pub width_nm: f64,
+    /// Extra time per scan for the repeated Starts, s.
+    pub restart_s: f64,
 }
 impl ScanState {
     pub fn frame_s(&self) -> f64 {
@@ -128,7 +130,7 @@ impl StepTimes {
     /// Predicted length of `step` with the scan set up as `scan`.
     pub fn predict(&self, step: &Step, scan: &ScanState) -> f64 {
         match step {
-            Step::Scan(_) => scan.frame_s(),
+            Step::Scan(_) => scan.frame_s() + scan.restart_s,
             Step::AwaitScan { .. } => 0.,
             Step::Wait(s) => s.max(0.),
             _ => match kind(step) {
@@ -251,7 +253,7 @@ mod tests {
 
     #[test]
     fn scans_follow_resolution_and_speed() {
-        let scan = ScanState { lines: 100, fwd_s: 1., bwd_s: 1., width_nm: 1000. };
+        let scan = ScanState { lines: 100, fwd_s: 1., bwd_s: 1., width_nm: 1000., restart_s: 0. };
         let steps = vec![
             (0, Step::Scan(Dir::Down)),
             (1, Step::SetResolution([256, 50])),
@@ -269,10 +271,21 @@ mod tests {
     }
 
     #[test]
+    fn restarts_add_to_each_scan() {
+        use crate::connection::nanonis::sequence::model::ScanStart;
+        let restart_s = ScanStart { starts: 3, gap_s: 3., park_s: 10. }.extra_s();
+        let scan = ScanState { lines: 10, fwd_s: 1., bwd_s: 1., width_nm: 1000., restart_s };
+        let clock = RunClock::new(StepTimes::default());
+        let left = remaining(&[(0, Step::Scan(Dir::Down))], 0, scan, &clock, None, None);
+        // 20 s frame + 10 s parked + 2 × 3 s restarts.
+        assert!((left - 36.).abs() < 0.1, "{left}");
+    }
+
+    #[test]
     fn learns_from_finished_steps() {
         let mut t = StepTimes::default();
         let approach = Step::Approach;
         t.record(&approach, 60.);
-        assert!((t.predict(&approach, &ScanState { lines: 0, fwd_s: 0., bwd_s: 0., width_nm: 0. }) - 45.).abs() < 1e-9);
+        assert!((t.predict(&approach, &ScanState { lines: 0, fwd_s: 0., bwd_s: 0., width_nm: 0., restart_s: 0. }) - 45.).abs() < 1e-9);
     }
 }

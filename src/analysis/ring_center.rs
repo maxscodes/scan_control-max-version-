@@ -83,17 +83,20 @@ pub struct RingEstimate {
     pub direction: DVec2,
     /// Dominant edge-normal axis (unit, sign arbitrary). It is reliable even
     /// when the curvature is too weak to locate the centre.
+    #[allow(dead_code)] // diagnostic, read by the tests
     pub normal_axis: DVec2,
     /// Weighted median distance from edge pixels to the centre (pixels).
     pub radius_px: f64,
     /// λmin / λmax of the normal-equation matrix, in [0, 1]. Near 0 means the
     /// edges are almost parallel, so the distance to the centre is poorly determined.
+    #[allow(dead_code)] // diagnostic, read by the tests
     pub conditioning: f64,
     /// Fraction of edge pixels whose gradient line passes within
     /// `3 * angle_scale` of the centre. Low values mean the edges are not
     /// radial (noise, no rings in view), so the estimate should not be trusted.
     pub inlier_fraction: f64,
     /// Number of edge pixels used.
+    #[allow(dead_code)] // diagnostic, read by the tests
     pub n_edges: usize,
 }
 
@@ -105,6 +108,7 @@ pub enum RingError {
 
 /// Estimate the ring centre from a row-major `width × height` frame. NaN
 /// pixels (unscanned lines) are ignored.
+#[cfg(test)] // used by the tests only
 pub fn estimate_ring_center(
     data: &[f32],
     width: usize,
@@ -170,6 +174,7 @@ pub type Edge = (DVec2, DVec2, f64);
 pub struct LocalFeature {
     pub center_px: DVec2,
     pub radius_px: f64,
+    #[allow(dead_code)] // diagnostic, read by the tests
     pub n_edges: usize,
 }
 

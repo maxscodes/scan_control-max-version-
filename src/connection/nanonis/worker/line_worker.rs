@@ -23,6 +23,7 @@ impl LineWorker {
             scan_status: scan_status.clone(),
         }
     }
+    #[allow(dead_code)] // end-of-line wait: not available on Nanonis v5
     pub fn line_wait(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()> {
         let resp = conn
             .scan_wait_end_of_line(None)

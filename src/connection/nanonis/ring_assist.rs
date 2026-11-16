@@ -599,6 +599,11 @@ impl RingAssistState {
         ((to - from).length() > 1.).then_some((from, to))
     }
 
+    /// Whether the tool window is open (toggled from the Scan Control tools).
+    pub fn open_mut(&mut self) -> &mut bool {
+        &mut self.window_open
+    }
+
     /// `locked` (another tool drives the tip) blocks centring moves.
     pub fn show_menu(
         &mut self,
@@ -607,15 +612,9 @@ impl RingAssistState {
         course: &mut CourseMotionState,
         locked: Option<&str>,
     ) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!self.window_open, egui::Button::new("Ring Assist"))
-                .clicked()
-            {
-                self.window_open = true;
-            }
-            if ui
-                .selectable_label(self.semi_auto, "Semi-auto centring")
+                .selectable_label(self.semi_auto, "\u{25CE} Semi-auto centring")
                 .on_hover_text(
                     "After each complete frame, propose the coarse move toward the ring centre \
                      and make it when you click Proceed.",
@@ -635,6 +634,7 @@ impl RingAssistState {
         }
         let mut open = self.window_open;
         egui::Window::new("Ring Assist")
+            .vscroll(true)
             .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(320.)
             .resizable(true)
@@ -704,6 +704,7 @@ impl RingAssistState {
         let waiting = matches!(self.centring, Centring::AwaitingFresh { .. });
         let screen = ui.data(|m| m.get_temp::<ScanViewCtx>(Id::new(()))).map(|c| c.world2egui());
         egui::Window::new("Ring centring")
+            .vscroll(true)
             .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(340.)
             .collapsible(true)
@@ -821,9 +822,8 @@ impl RingAssistState {
         let plan = ring_live::plan_move(&cur.shot, center, sure, self.limits);
         // The coarse move is in the scan area's own axes.
         let local = scan_area.world_transform.matrix2.inverse() * plan.world;
-        let per_step = course.steps2real_world();
         let steps = course.real_to_steps(local);
-        let problem = if per_step.determinant().abs() < 1e-12 {
+        let problem = if !course.is_calibrated() {
             Some("Coarse motion isn't calibrated or the driver amplitudes are unknown.".to_string())
         } else if steps == IVec2::ZERO {
             Some(if plan.at_center {
@@ -1979,7 +1979,7 @@ fn show_proposal(
     }
     ui.label(
         RichText::new(format!(
-            "Auto withdraw {}, auto approach {} (set in Course Motion).",
+            "Auto withdraw {}, auto approach {} (set in Coarse Motion).",
             if withdraw { "on" } else { "off" },
             if approach { "on" } else { "off" }
         ))

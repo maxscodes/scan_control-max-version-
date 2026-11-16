@@ -18,15 +18,6 @@ pub const IDLE: Color32 = Color32::from_rgb(0x8a, 0x93, 0x9e);
 const ACCENT_DARK: Color32 = Color32::from_rgb(0x3d, 0xa5, 0xd9);
 const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xb5);
 
-/// Accent colour for the current theme.
-pub fn accent(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        ACCENT_DARK
-    } else {
-        ACCENT_LIGHT
-    }
-}
-
 /// Configure both the light and dark styles once at start-up, and apply the
 /// saved theme choice. Switching later only needs [`set_theme`].
 pub fn install(ctx: &egui::Context) {
@@ -142,6 +133,38 @@ pub fn overlay_frame(ctx: &egui::Context) -> Frame {
     Frame::window(&ctx.style()).multiply_with_opacity(0.92)
 }
 
+/// Accent colour for the current theme.
+pub fn accent(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        ACCENT_DARK
+    } else {
+        ACCENT_LIGHT
+    }
+}
+
+/// Width of the panels docked on the right of the map (Scan Control and the
+/// selected layers' settings), so they line up.
+pub const SIDE_PANEL_WIDTH: f32 = 260.;
+
+/// Small heading for a group of controls in a panel.
+pub fn section_label(ui: &mut Ui, text: &str) {
+    ui.add_space(2.);
+    ui.label(egui::RichText::new(text).small().strong().weak());
+}
+
+/// Full-width toggle that opens and closes a tool window; highlighted while
+/// the window is open.
+pub fn tool_button(ui: &mut Ui, open: &mut bool, text: &str, hover: &str) {
+    let button = egui::Button::new(text).selected(*open);
+    if ui
+        .add_sized([ui.available_width(), 26.], button)
+        .on_hover_text(hover)
+        .clicked()
+    {
+        *open = !*open;
+    }
+}
+
 /// A coloured status dot with a label. `pulse` animates the dot (scanning).
 pub fn status_pill(ui: &mut Ui, color: Color32, text: &str, pulse: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.), egui::Sense::hover());
@@ -183,6 +206,9 @@ pub struct UiPrefs {
     pub show_grid: bool,
     /// Draw the GDS-predicted direction on stamps.
     pub show_gds_prior: bool,
+    /// Colour palette for scan images.
+    pub color_map: crate::scan_view::processing::ColorMap,
+    pub color_invert: bool,
 }
 impl Default for UiPrefs {
     fn default() -> Self {
@@ -192,6 +218,8 @@ impl Default for UiPrefs {
             sequence_details: true,
             show_grid: false,
             show_gds_prior: true,
+            color_map: Default::default(),
+            color_invert: false,
         }
     }
 }

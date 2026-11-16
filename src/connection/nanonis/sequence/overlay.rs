@@ -25,7 +25,7 @@ impl SequenceState {
     /// per Scan step, offset by the coarse moves predicted before it. In drag
     /// mode, ctrl+drag moves the selected entry's frame or coarse move.
     pub fn show_overlay(&mut self, ui: &mut Ui, scan_area: &ScanArea, course: &CourseMotionState) {
-        if !self.window_open && self.run.is_none() {
+        if self.plan_off || (!self.window_open && self.run.is_none()) {
             return;
         }
         // Hidden after finishing, until the sequence or selection changes.
@@ -59,7 +59,6 @@ impl SequenceState {
             Some(run) => (run.steps.clone(), run.current),
             None => (compile(&self.seq, 0, Dir::Down), 0),
         };
-        let steps2real = course.steps2real_world();
         let ctx = ui
             .data(|map| map.get_temp::<ScanViewCtx>(Id::new(())))
             .unwrap();
@@ -96,7 +95,7 @@ impl SequenceState {
                     );
                 }
                 Step::CoarseMove { steps } => {
-                    offset += steps2real * IVec2::from_array(*steps).as_dvec2();
+                    offset += course.steps_to_real(IVec2::from_array(*steps));
                 }
                 Step::SetFrame(spec) => frame = spec.apply(frame),
                 Step::Scan(_) => {
@@ -139,12 +138,11 @@ impl SequenceState {
     /// Coarse offset (nm) in effect for entry `target`'s tip moves: every
     /// coarse move up to and including its own.
     fn offset_through(&self, target: usize, course: &CourseMotionState) -> DVec2 {
-        let steps2real = course.steps2real_world();
         compile(&self.seq, 0, Dir::Down)
             .into_iter()
             .take_while(|(entry, _)| *entry <= target)
             .filter_map(|(_, step)| match step {
-                Step::CoarseMove { steps } => Some(steps2real * IVec2::from_array(steps).as_dvec2()),
+                Step::CoarseMove { steps } => Some(course.steps_to_real(IVec2::from_array(steps))),
                 _ => None,
             })
             .sum()
@@ -251,13 +249,12 @@ impl SequenceState {
                 };
             }
             Some(DragTarget::Coarse) => {
-                let steps2real = course.steps2real_world();
                 let e = &mut self.seq.entries[i];
                 let mut c = e.coarse.unwrap_or(CoarseSpec::default());
                 // Accumulate in nm so small drags add up to whole steps.
                 let real = self
                     .coarse_drag_real
-                    .unwrap_or(steps2real * IVec2::from_array(c.steps).as_dvec2())
+                    .unwrap_or(course.steps_to_real(IVec2::from_array(c.steps)))
                     + delta;
                 self.coarse_drag_real = Some(real);
                 c.steps = course.real_to_steps(real).to_array();

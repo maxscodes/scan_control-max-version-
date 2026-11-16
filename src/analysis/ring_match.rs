@@ -173,10 +173,6 @@ pub struct RingMatch {
 }
 
 impl RingMatch {
-    /// Another ring position matches about as well (e.g. one pitch over).
-    pub fn ambiguous(&self) -> bool {
-        self.second_score > 0.9 * self.score
-    }
     /// How much better the chosen side fits than the opposite side: the
     /// direction confidence. Near 0 the direction could be 180° off.
     pub fn dir_gap(&self) -> f64 {
@@ -220,14 +216,6 @@ enum Frac<'a> {
 fn band_area_fraction(bands: &[(f64, f64)]) -> f64 {
     let outer = bands.last().map_or(1., |b| b.1);
     bands.iter().map(|b| b.1 * b.1 - b.0 * b.0).sum::<f64>() / (outer * outer)
-}
-
-/// Flatten a frame for matching. `raised` picks which tone is band.
-pub fn prepare(data: &[f32], size: [u32; 2], exp: &Expected, p: &MatchParams, raised: bool) -> Option<Prepared> {
-    if exp.bands_px.is_empty() {
-        return None;
-    }
-    prepare_with(data, size, exp.narrowest(), Frac::Nominal(exp), p, raised)
 }
 
 fn prepare_with(
@@ -336,9 +324,6 @@ struct Scorer {
     bands: Vec<(f64, f64)>,
     biases: Vec<f64>,
     r: Vec<f64>,
-    bin: Vec<u32>,
-    start: Vec<usize>,
-    buf: Vec<f64>,
 }
 
 impl Scorer {
@@ -382,88 +367,6 @@ impl Scorer {
         }
         best
     }
-
-    /// Best correlation over images (polarity) and width biases for a centre.
-    fn score(&mut self, c: DVec2) -> (f64, f64, bool) {
-        let mut best = (-1., 0., true);
-        for ii in 0..self.images.len() {
-            let n = self.images[ii].pos.len();
-            self.r.clear();
-            self.r.extend(self.images[ii].pos.iter().map(|p| (*p - c).length()));
-            let rmin = self.r.iter().copied().fold(f64::INFINITY, f64::min);
-            let rmax = self.r.iter().copied().fold(0., f64::max);
-            let nb = (rmax - rmin) as usize + 1;
-            // Counting sort of the values by radius bin.
-            self.start.clear();
-            self.start.resize(nb + 1, 0);
-            self.bin.clear();
-            for &r in &self.r {
-                let b = ((r - rmin) as usize).min(nb - 1);
-                self.bin.push(b as u32);
-                self.start[b + 1] += 1;
-            }
-            for b in 0..nb {
-                self.start[b + 1] += self.start[b];
-            }
-            self.buf.clear();
-            self.buf.resize(n, 0.);
-            let mut fill = self.start.clone();
-            for (i, &b) in self.bin.iter().enumerate() {
-                self.buf[fill[b as usize]] = self.images[ii].val[i];
-                fill[b as usize] += 1;
-            }
-            // Radial median profile.
-            let mut prof: Vec<(f64, f64, f64)> = Vec::with_capacity(nb);
-            for b in 0..nb {
-                let s = &mut self.buf[self.start[b]..self.start[b + 1]];
-                if s.len() >= 3 {
-                    let m = *s.select_nth_unstable_by(s.len() / 2, f64::total_cmp).1;
-                    prof.push((rmin + b as f64 + 0.5, m, (s.len() as f64).sqrt()));
-                }
-            }
-            if prof.len() < 4 {
-                continue;
-            }
-            for &bias in &self.biases {
-                let corr = weighted_corr(&prof, |r| template(&self.bands, r, bias));
-                let img = &self.images[ii];
-                let (corr, raised) = if img.symmetric && corr < 0. { (-corr, !img.raised) } else { (corr, img.raised) };
-                if corr > best.0 {
-                    best = (corr, bias, raised);
-                }
-            }
-        }
-        best
-    }
-}
-
-/// The GDS bands as a soft-edged 0/1 profile against radius (work pixels).
-fn template(bands: &[(f64, f64)], r: f64, bias: f64) -> f64 {
-    let sig = |x: f64| 1. / (1. + (-x / 0.5).exp());
-    bands.iter().map(|&(a, b)| sig(r - (a - bias / 2.)) - sig(r - (b + bias / 2.))).sum()
-}
-
-/// Weighted Pearson correlation of (r, value, weight) against `t(r)`.
-fn weighted_corr(prof: &[(f64, f64, f64)], t: impl Fn(f64) -> f64) -> f64 {
-    let (mut sw, mut sx, mut sy) = (0., 0., 0.);
-    let ts: Vec<f64> = prof.iter().map(|p| t(p.0)).collect();
-    for (p, &y) in prof.iter().zip(&ts) {
-        sw += p.2;
-        sx += p.2 * p.1;
-        sy += p.2 * y;
-    }
-    let (mx, my) = (sx / sw, sy / sw);
-    let (mut cxy, mut cxx, mut cyy) = (0., 0., 0.);
-    for (p, &y) in prof.iter().zip(&ts) {
-        let (dx, dy) = (p.1 - mx, y - my);
-        cxy += p.2 * dx * dy;
-        cxx += p.2 * dx * dx;
-        cyy += p.2 * dy * dy;
-    }
-    if cxx <= 1e-12 || cyy <= 1e-12 {
-        return 0.;
-    }
-    cxy / (cxx * cyy).sqrt()
 }
 
 /// Flattened images for scoring (one per polarity tried), and the working
@@ -573,9 +476,6 @@ pub fn match_rings(data: &[f32], size: [u32; 2], exp: &Expected, p: &MatchParams
         bands: exp.scaled(kf),
         biases: biases(p, narrow, pitch),
         r: Vec::new(),
-        bin: Vec::new(),
-        start: Vec::new(),
-        buf: Vec::new(),
     };
     let c0 = to_work(exp.center_px, k);
     let fc = DVec2::new((w as f64 - 1.) / 2., (h as f64 - 1.) / 2.);
@@ -617,6 +517,7 @@ pub fn match_rings(data: &[f32], size: [u32; 2], exp: &Expected, p: &MatchParams
 /// The flattened image the blind search scores, for inspection: frame
 /// `bands` (pixels) give the blur and two-tone fraction. Working pixel
 /// (x, y) covers frame pixels around `x * k + (k - 1) / 2`.
+#[cfg(test)] // used by the tests only
 pub fn blind_prepared(
     data: &[f32],
     size: [u32; 2],
@@ -690,9 +591,6 @@ fn blind_kind(data: &[f32], size: [u32; 2], bands: &[(f64, f64)], p: &MatchParam
         bands: exp.scaled(kf),
         biases: vec![0.],
         r: Vec::new(),
-        bin: Vec::new(),
-        start: Vec::new(),
-        buf: Vec::new(),
     };
     let eval = |sc: &mut Scorer, off: DVec2, stride: usize| {
         let (raw, bias, raised) = sc.score_2d(fc + off, stride);
@@ -781,9 +679,6 @@ pub fn score_at(
         bands: exp.scaled(kf),
         biases: biases(p, exp.narrowest() / kf, exp.pitch() / kf),
         r: Vec::new(),
-        bin: Vec::new(),
-        start: Vec::new(),
-        buf: Vec::new(),
     };
     Some(sc.score_2d(to_work(center_px, k), 1).0)
 }

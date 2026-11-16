@@ -9,11 +9,13 @@ use crate::{
     components::selectable_list::SelectableList,
     connection::{
         nanonis::{
-            course_motion::CourseMotionState,
+            coarse_cal::{self, CalFrame, CalPlan, CalResult},
+            course_motion::{CoarseCalibration, CourseMotionState},
             sequence::{
                 eta::{self, RunClock, ScanState, StepTimes},
+                grid_track::GridTrack,
                 model::{
-                    compile, expand, with_current_scan, CoarseSpec, CurrentScan, Dir,
+                    compile, expand, with_current_scan, CoarseSpec, CurrentScan, Dir, ScanStart,
                     Frame as ScanFrame,
                     FrameSpec, Position, ScanEntry, Sequence, Speed, Step, CURRENT_SCAN,
                 },
@@ -87,6 +89,9 @@ struct SurveySettings {
     plus_y: bool,
     /// Wait after each approach before scanning, in s (drift settles).
     settle_s: f64,
+    /// Place each tile by matching it with the one before, take dragged
+    /// tiles as where they really are, and aim the next move from that.
+    track: bool,
 }
 
 /// One tile of the grid: column, row (0-based) in visiting order.
@@ -124,6 +129,8 @@ pub struct SequenceState {
     pub(super) run: Option<RunView>,
     status: String,
     last_error: Option<String>,
+    /// Why the sequence is held: the instrument was used outside it.
+    interrupted: Option<String>,
     sweep: SweepSettings,
     survey: SurveySettings,
     load_tx: Sender<Result<Sequence, String>>,
@@ -131,23 +138,54 @@ pub struct SequenceState {
     /// After a sequence finishes its plan is hidden from the map, until the
     /// sequence or the selected entry changes (or "Show plan" is clicked).
     pub(super) plan_hidden: Option<(Sequence, Option<usize>)>,
+    /// The user hid the plan outlines from the map (to see the scan), until
+    /// they show it again. Running is not affected.
+    pub(super) plan_off: bool,
     /// What Run does with a scan that is already running in Nanonis.
     current_scan: CurrentScan,
     /// Nanonis' forward and backward time per line, s (set each frame).
     pub line_times: Option<(f64, f64)>,
+    /// Lines per frame set in Nanonis now (set each frame).
+    pub lines: Option<u32>,
     /// Scan set-up in Nanonis now, for the time estimate.
     scan_now: Option<ScanState>,
     /// What is left of the scan running in Nanonis now, s.
     scan_left: Option<f64>,
+    /// Window shrunk to the progress bar and run buttons.
+    minimized: bool,
+    /// A coarse calibration run: its plan, the calibration before it, and
+    /// the scans captured so far.
+    cal: Option<(CalPlan, CoarseCalibration, Vec<CalFrame>)>,
+    cal_tx: Sender<CalResult>,
+    cal_rx: Receiver<CalResult>,
+    /// Calibration scans done; the images are being compared.
+    cal_measuring: bool,
+    /// The file Nanonis saved the last scan of this run to.
+    last_scan_file: Option<String>,
+    /// Stamps of survey tiles taken in this run, and those of a finished
+    /// run waiting to be lined up.
+    survey_tiles: Vec<uuid::Uuid>,
+    finished_survey: Option<Vec<uuid::Uuid>>,
+    /// Layer group of this run's survey tiles, and tiles still to be put in it.
+    survey_group: Option<String>,
+    tile_groups: Vec<(uuid::Uuid, String)>,
+    /// Puts the frame size and resolution back if a calibration run was
+    /// aborted before doing so itself.
+    cal_restore: Option<(Sequence, u32)>,
     /// Lengths of coarse moves, approaches, … learned over runs.
     times: StepTimes,
     /// Timing of the run in progress, and the scan set-up it started with.
     clock: Option<(RunClock, ScanState)>,
+    /// A survey grid steering its moves as it runs (kept after the run,
+    /// so tiles can still be dragged into place and the calibration saved).
+    grid_track: Option<GridTrack>,
+    grid_calib_save: Option<(CoarseCalibration, usize)>,
 }
 
 impl SequenceState {
     pub fn new(cmd_tx: Sender<SequenceCommand>, events: Receiver<SequenceEvent>) -> Self {
         let (load_tx, load_rx) = crossbeam::channel::unbounded();
+        let (cal_tx, cal_rx) = crossbeam::channel::unbounded();
         Self {
             seq: Sequence::default(),
             selected: None,
@@ -160,6 +198,7 @@ impl SequenceState {
             run: None,
             status: "Idle".into(),
             last_error: None,
+            interrupted: None,
             sweep: SweepSettings {
                 param: SweepParam::Bias,
                 mode: SweepMode::Count,
@@ -172,21 +211,42 @@ impl SequenceState {
             survey: SurveySettings {
                 cols: 3,
                 rows: 3,
-                overlap_pct: 10.,
+                overlap_pct: 20.,
                 plus_x: true,
                 plus_y: false,
                 settle_s: 30.,
+                track: true,
             },
             load_tx,
             load_rx,
             plan_hidden: None,
+            plan_off: false,
             current_scan: CurrentScan::After,
             line_times: None,
+            lines: None,
             scan_now: None,
             scan_left: None,
             times: StepTimes::default(),
             clock: None,
+            minimized: false,
+            cal: None,
+            cal_tx,
+            cal_rx,
+            cal_measuring: false,
+            last_scan_file: None,
+            cal_restore: None,
+            survey_tiles: Vec::new(),
+            finished_survey: None,
+            survey_group: None,
+            tile_groups: Vec::new(),
+            grid_track: None,
+            grid_calib_save: None,
         }
+    }
+
+    /// Whether the tool window is open (toggled from the Scan Control tools).
+    pub fn open_mut(&mut self) -> &mut bool {
+        &mut self.window_open
     }
 
     /// A sequence is executing (not paused). Manual controls are locked.
@@ -198,11 +258,20 @@ impl SequenceState {
     }
     /// Ctrl+drag on the map is editing a sequence entry.
     pub fn map_drag_active(&self) -> bool {
-        self.window_open && self.drag.is_some()
+        self.window_open && self.drag.is_some() && !self.plan_off
     }
 
     fn send(&self, cmd: SequenceCommand) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// The instrument was used from the app while the sequence runs: hold
+    /// it at once, leaving Nanonis as the user set it.
+    pub fn interrupt(&mut self, reason: &str) {
+        if self.is_running() {
+            self.status = "Holding\u{2026}".into();
+            self.send(SequenceCommand::Interrupt(reason.to_string()));
+        }
     }
 
     pub fn stamp_done(&self) {
@@ -263,6 +332,7 @@ impl SequenceState {
                 SequenceEvent::StampRequest => actions.push(SequenceAction::StampRequest),
                 SequenceEvent::ScanDone { file_path } => {
                     info!("sequence scan saved to {file_path:?}");
+                    self.last_scan_file = (!file_path.trim().is_empty()).then(|| file_path.trim().to_string());
                 }
                 SequenceEvent::Paused { index } => {
                     self.status = "Paused".into();
@@ -275,8 +345,17 @@ impl SequenceState {
                         run.wait_remaining = None;
                     }
                 }
+                SequenceEvent::Interrupted { index, reason } => {
+                    self.status = "Held".into();
+                    self.interrupted = Some(reason);
+                    if let Some(run) = &mut self.run {
+                        run.paused = true;
+                        run.current = index;
+                    }
+                }
                 SequenceEvent::Resumed => {
                     self.status = "Running".into();
+                    self.interrupted = None;
                     if let Some((clock, _)) = &mut self.clock {
                         clock.resume();
                     }
@@ -287,13 +366,51 @@ impl SequenceState {
                 }
                 SequenceEvent::Finished => {
                     self.status = "Finished".into();
+                    // A tracked grid is already placed (and hand-corrected).
+                    if self.survey_tiles.len() >= 2 && self.grid_track.is_none() {
+                        self.finished_survey = Some(std::mem::take(&mut self.survey_tiles));
+                    }
+                    self.interrupted = None;
                     self.run = None;
+                    if let Some((plan, old, frames)) = self.cal.take() {
+                        // The run put the frame back itself.
+                        self.cal_restore = None;
+                        self.status = "Calibration scans done; measuring\u{2026}".into();
+                        self.cal_measuring = true;
+                        let tx = self.cal_tx.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(coarse_cal::compute(&frames, &plan, &old));
+                            crate::app::request_repaint();
+                        });
+                    }
                     self.end_clock();
                     self.plan_hidden = Some((self.seq.clone(), self.selected));
                 }
                 SequenceEvent::Aborted => {
                     self.status = "Aborted".into();
+                    if self.survey_tiles.len() >= 2 && self.grid_track.is_none() {
+                        self.finished_survey = Some(std::mem::take(&mut self.survey_tiles));
+                    }
+                    self.interrupted = None;
                     self.run = None;
+                    if let Some((plan, old, frames)) = self.cal.take() {
+                        // Stopped early: measure the moves whose scans were
+                        // both taken (the frame is put back with "Restore").
+                        if frames.len() >= 2 {
+                            self.status = format!(
+                                "Calibration stopped; measuring the {} moves done\u{2026}",
+                                frames.len() - 1
+                            );
+                            self.cal_measuring = true;
+                            let tx = self.cal_tx.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(coarse_cal::compute(&frames, &plan, &old));
+                                crate::app::request_repaint();
+                            });
+                        } else {
+                            self.status = "Calibration aborted".into();
+                        }
+                    }
                     self.end_clock();
                 }
                 SequenceEvent::Error { index, message } => {
@@ -343,6 +460,197 @@ impl SequenceState {
         if let Some(mode) = current {
             steps = with_current_scan(steps, mode, last_dir, true);
         }
+        self.cal = None;
+        let scan_start = self.seq.scan_start;
+        self.run_steps(steps, group, scan_start);
+    }
+
+    /// Run the coarse calibration scans (the user's entries stay as they are).
+    pub fn start_calibration(&mut self, plan: CalPlan, group: u32, old: CoarseCalibration) {
+        if self.is_active() {
+            self.last_error = Some("finish or abort the running sequence before calibrating".into());
+            return;
+        }
+        let seq = coarse_cal::build_sequence(&plan);
+        let steps = compile(&seq, 0, Dir::Down);
+        let restore = coarse_cal::restore_sequence(&plan);
+        self.cal_restore = (!restore.entries.is_empty()).then_some((restore, group));
+        self.cal = Some((plan, old, Vec::new()));
+        // Show the progress, small.
+        self.window_open = true;
+        self.minimized = true;
+        self.run_steps(steps, group, seq.scan_start);
+        self.status = "Calibrating".into();
+    }
+
+    /// An aborted calibration left the calibration frame size and
+    /// resolution in Nanonis.
+    pub fn can_restore_calibration_frame(&self) -> bool {
+        self.cal_restore.is_some() && !self.is_active()
+    }
+    /// Put the frame size and resolution from before the calibration back.
+    pub fn restore_calibration_frame(&mut self) {
+        if self.is_active() {
+            return;
+        }
+        if let Some((seq, group)) = self.cal_restore.take() {
+            let steps = compile(&seq, 0, Dir::Down);
+            self.run_steps(steps, group, seq.scan_start);
+            self.status = "Restoring frame and resolution".into();
+        }
+    }
+
+    /// The step running now belongs to a survey tile (so its stamp is one).
+    pub fn current_entry_is_tile(&self) -> bool {
+        if self.cal.is_some() {
+            return false;
+        }
+        let Some(run) = &self.run else { return false };
+        run.steps
+            .get(run.current)
+            .and_then(|(entry, _)| self.seq.entries.get(*entry))
+            .is_some_and(|e| e.grid.is_some())
+    }
+    /// A survey tile was scanned (its image): measure the move that got
+    /// here by matching it with the previous tile, and correct the move to
+    /// the next tile. Returns how far (piezo nm) the tip is from where the
+    /// moves predicted: move the scan area by it before stamping, so the
+    /// tile lands in the right place on the map.
+    pub fn grid_tile_scanned(
+        &mut self,
+        frame: CalFrame,
+        calib: CoarseCalibration,
+        volts: DVec2,
+        world_m2: glam::DMat2,
+    ) -> Option<DVec2> {
+        if !self.survey.track || self.cal.is_some() {
+            return None;
+        }
+        let run = self.run.as_ref()?;
+        let &(here, _) = run.steps.get(run.current)?;
+        let entry = self.seq.entries.get(here)?;
+        let target = DVec2::from_array(entry.grid_pos?);
+        let moved = entry.coarse.map(|c| IVec2::from_array(c.steps));
+        let track = self.grid_track.get_or_insert_with(|| GridTrack::new(calib, volts, world_m2));
+        // The map moved the scan area with the normal calibration.
+        let off = track.tile_scanned(frame, here, target, moved, &calib);
+        info!("{}", track.summary());
+        self.correct_next_move();
+        Some(off)
+    }
+
+    /// Re-aim the move to the tile after the latest one, unless it has
+    /// started already.
+    fn correct_next_move(&mut self) {
+        let plan = (|| {
+            let (track, run) = (self.grid_track.as_ref()?, self.run.as_ref()?);
+            let here = track.latest_entry()?;
+            let last_here = run.steps.iter().rposition(|(e, _)| *e == here)?;
+            let &(next, _) = run.steps.get(last_here + 1)?;
+            let entry = self.seq.entries.get(next)?;
+            let target = DVec2::from_array(entry.grid_pos?);
+            let planned = entry.coarse?.steps;
+            let move_at = run
+                .steps
+                .iter()
+                .position(|(e, s)| *e == next && matches!(s, Step::CoarseMove { .. }))?;
+            if move_at <= run.current {
+                return None;
+            }
+            let steps = track.next_steps(target)?.to_array();
+            (steps != planned).then_some((next, move_at, steps))
+        })();
+        let Some((next, move_at, steps)) = plan else { return };
+        if let Some(c) = self.seq.entries[next].coarse.as_mut() {
+            c.steps = steps;
+        }
+        self.send(SequenceCommand::AdjustCoarse { entry: next, steps });
+        if let Some(run) = &mut self.run {
+            if let Some((_, Step::CoarseMove { steps: s })) = run.steps.get_mut(move_at) {
+                *s = steps;
+            }
+        }
+    }
+
+    /// Stamps of the tracked grid's tiles.
+    pub fn grid_tile_ids(&self) -> Vec<uuid::Uuid> {
+        self.grid_track.as_ref().map(|t| t.ids()).unwrap_or_default()
+    }
+    /// Where the tiles' stamps are on the map now. Returns the map
+    /// displacement of the latest tile when tiles were moved by hand (the
+    /// tip, i.e. the scan area, moves with it).
+    pub fn grid_sync(&mut self, world: impl Fn(uuid::Uuid) -> Option<DVec2>) -> Option<DVec2> {
+        let delta = self.grid_track.as_mut()?.sync(world)?;
+        if let Some(t) = &self.grid_track {
+            info!("tiles moved by hand: {}", t.summary());
+        }
+        self.correct_next_move();
+        Some(delta)
+    }
+    /// The grid's calibration, when the user asked to save it.
+    pub fn take_grid_calibration(&mut self) -> Option<(CoarseCalibration, usize)> {
+        self.grid_calib_save.take()
+    }
+    pub fn record_tile(&mut self, id: uuid::Uuid) {
+        self.survey_tiles.push(id);
+        if let Some(t) = &mut self.grid_track {
+            t.set_latest_id(id);
+        }
+        let group = self.survey_group.get_or_insert_with(|| {
+            let t = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            format!(
+                "Survey {}-{:02}-{:02} {:02}:{:02}",
+                t.year(),
+                t.month() as u8,
+                t.day(),
+                t.hour(),
+                t.minute()
+            )
+        });
+        self.tile_groups.push((id, group.clone()));
+    }
+    /// Survey tiles to put in their layer group.
+    pub fn take_tile_groups(&mut self) -> Vec<(uuid::Uuid, String)> {
+        std::mem::take(&mut self.tile_groups)
+    }
+    /// Tiles whose stamp is not on the list yet: try again later.
+    pub fn keep_tile_groups(&mut self, waiting: Vec<(uuid::Uuid, String)>) {
+        self.tile_groups.extend(waiting);
+    }
+    /// Tile stamps of a survey that just ended (finished or aborted), to line up.
+    pub fn take_finished_survey(&mut self) -> Option<Vec<uuid::Uuid>> {
+        self.finished_survey.take()
+    }
+    pub fn set_status(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+    }
+
+    /// A calibration run is going (its stamps are captured).
+    pub fn calibration_active(&self) -> bool {
+        self.cal.is_some() && self.run.is_some()
+    }
+    /// The file the last scan was saved to (once).
+    pub fn take_scan_file(&mut self) -> Option<String> {
+        self.last_scan_file.take()
+    }
+    pub fn capture_calibration_frame(&mut self, frame: CalFrame) {
+        if let Some((_, _, frames)) = &mut self.cal {
+            frames.push(frame);
+        }
+    }
+    /// The measured calibration, once a run has been analysed.
+    pub fn take_calibration_result(&mut self) -> Option<CalResult> {
+        let r = self.cal_rx.try_recv().ok()?;
+        self.cal_measuring = false;
+        self.status = "Calibration measured: see Coarse Motion".into();
+        Some(r)
+    }
+
+    fn run_steps(&mut self, steps: Vec<(usize, Step)>, group: u32, scan_start: ScanStart) {
+        self.survey_tiles.clear();
+        self.survey_group = None;
+        self.grid_track = None;
+        self.plan_hidden = None;
         self.last_error = None;
         self.status = "Starting".into();
         self.run = Some(RunView {
@@ -355,7 +663,38 @@ impl SequenceState {
         self.clock = self
             .scan_now
             .map(|scan| (RunClock::new(self.times.clone()), scan));
-        self.send(SequenceCommand::Run { steps, group });
+        self.send(SequenceCommand::Run { steps, group, scan_start });
+    }
+
+    /// Refresh what the time estimate needs from the scan area (each frame,
+    /// also while the window is closed).
+    fn update_scan_info(&mut self, scan_area: Option<&ScanArea>) {
+        let current_frame = scan_area
+            .and_then(|a| a.image_transform)
+            .map(ScanFrame::from_transform);
+        let scanning = scan_area.is_some_and(|a| a.scan_status.scanning);
+        self.scan_now = match (scan_area, self.line_times) {
+            (Some(a), Some((fwd_s, bwd_s))) => Some(ScanState {
+                // Nanonis' setting, which changes before a new image arrives.
+                lines: self.lines.unwrap_or(a.live_image.forward_data.size[1]),
+                fwd_s,
+                bwd_s,
+                width_nm: current_frame.map_or(0., |f| f.width),
+                restart_s: self.seq.scan_start.extra_s(),
+            }),
+            _ => None,
+        };
+        // Rows still to scan in the running frame (unscanned rows are NaN).
+        self.scan_left = scan_area.filter(|_| scanning).zip(self.line_times).map(|(a, (f, b))| {
+            let d = &a.live_image.forward_data;
+            let [w, h] = d.size.map(|v| v as usize);
+            let done = if d.data.len() == w * h {
+                (0..h).filter(|&r| d.data[r * w + w / 2].is_finite()).count()
+            } else {
+                0
+            };
+            (h - done) as f64 * (f + b)
+        });
     }
 
     /// The "Sequence" button and window. Shown from the Scan Region menu.
@@ -366,35 +705,48 @@ impl SequenceState {
         course: &CourseMotionState,
         blocked_by: Option<&str>,
     ) {
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.window_open, egui::Button::new("Sequence"))
-                .clicked()
-            {
-                self.window_open = true;
-            }
-            if self.is_active() {
-                match self.run_eta() {
-                    Some((left, _)) => ui.label(format!("{} \u{b7} ~{} left", self.status, eta::fmt_duration(left))),
-                    None => ui.label(&self.status),
-                };
-            }
-        });
+        // Status and progress stay visible in the panel even with the
+        // window closed.
+        if self.is_active() {
+            ui.label(RichText::new(format!("Sequence: {}", self.status)).small());
+            self.progress_bar(ui);
+        }
         let scan_area = object_list
             .iter_mut()
             .find_map(|entry| entry.as_scan_area_mut());
+        self.update_scan_info(scan_area.as_deref());
         let mut open = self.window_open;
-        egui::Window::new("Sequence")
-            .frame(crate::theme::window_frame(ui.ctx()))
-            .default_width(720.)
-            // Width is adjustable; height follows the content, so the window
-            // shrinks when entry details are hidden.
-            .resizable([true, false])
-            .collapsible(true)
-            .open(&mut open)
-            .show(ui.ctx(), |ui| {
-                self.show_window(ui, scan_area.as_deref(), course, blocked_by);
-            });
+        if self.minimized {
+            // Just the progress bar and run buttons.
+            egui::Window::new("Sequence")
+                .vscroll(true)
+                .id(egui::Id::new("sequence_window_minimized"))
+                .frame(crate::theme::window_frame(ui.ctx()))
+                .auto_sized()
+                .collapsible(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    // The progress bar and wrapped labels take all the width
+                    // they are offered, so an auto-sized window would grow to
+                    // the screen width without a cap.
+                    ui.set_min_width(320.);
+                    ui.set_max_width(480.);
+                    self.show_window(ui, scan_area.as_deref(), course, blocked_by);
+                });
+        } else {
+            egui::Window::new("Sequence")
+                .vscroll(true)
+                .frame(crate::theme::window_frame(ui.ctx()))
+                .default_width(720.)
+                // Width is adjustable; height follows the content, so the window
+                // shrinks when entry details are hidden.
+                .resizable([true, false])
+                .collapsible(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    self.show_window(ui, scan_area.as_deref(), course, blocked_by);
+                });
+        }
         self.window_open = open;
         if !self.window_open || self.is_active() {
             self.drag = None;
@@ -421,26 +773,28 @@ impl SequenceState {
             .map(ScanFrame::from_transform);
         let tip_pos = scan_area.and_then(|a| a.tip_pos);
         let scanning = scan_area.is_some_and(|a| a.scan_status.scanning);
-        self.scan_now = match (scan_area, self.line_times) {
-            (Some(a), Some((fwd_s, bwd_s))) => Some(ScanState {
-                lines: a.live_image.forward_data.size[1],
-                fwd_s,
-                bwd_s,
-                width_nm: current_frame.map_or(0., |f| f.width),
-            }),
-            _ => None,
-        };
-        // Rows still to scan in the running frame (unscanned rows are NaN).
-        self.scan_left = scan_area.filter(|_| scanning).zip(self.line_times).map(|(a, (f, b))| {
-            let d = &a.live_image.forward_data;
-            let [w, h] = d.size.map(|v| v as usize);
-            let done = if d.data.len() == w * h {
-                (0..h).filter(|&r| d.data[r * w + w / 2].is_finite()).count()
+        ui.horizontal(|ui| {
+            let (icon, tip) = if self.minimized {
+                ("\u{1f5d6} Expand", "Show the whole sequence editor")
             } else {
-                0
+                ("\u{1f5d5} Minimize", "Shrink to the progress bar and run buttons")
             };
-            (h - done) as f64 * (f + b)
+            if ui.small_button(icon).on_hover_text(tip).clicked() {
+                self.minimized = !self.minimized;
+            }
+            let (label, tip) = if self.plan_off {
+                ("\u{1f441} Show plan on map", "Draw the sequence's frames, moves and tip points on the map again")
+            } else {
+                ("\u{1f441} Hide plan on map", "Hide the sequence's outlines from the map to see the scan (the sequence keeps running)")
+            };
+            if ui.small_button(label).on_hover_text(tip).clicked() {
+                self.plan_off = !self.plan_off;
+            }
         });
+        if self.minimized {
+            self.show_run_controls(ui, course, last_dir, scanning, blocked_by);
+            return;
+        }
         ui.add_enabled_ui(editable, |ui| self.show_toolbar(ui));
         ui.separator();
         self.show_entry_table(ui, editable, last_dir);
@@ -465,6 +819,33 @@ impl SequenceState {
             ui.add_enabled_ui(editable, |ui| self.show_survey(ui, current_frame, course));
         }
         ui.separator();
+        ui.add_enabled_ui(editable, |ui| {
+            ui.horizontal(|ui| {
+                let st = &mut self.seq.scan_start;
+                ui.label("Wait at the scan start");
+                ui.add(DragValue::new(&mut st.park_s).range(0. ..=600.).speed(1.).suffix(" s"));
+            })
+            .response
+            .on_hover_text(
+                "Before each scan the tip is moved to where the scan begins and waits \
+                 there this long, so the creep after that jump is over before the first \
+                 line is recorded. 0 = don't (the scan jumps there when it starts).",
+            );
+            ui.horizontal(|ui| {
+                let st = &mut self.seq.scan_start;
+                ui.label("Start each scan");
+                ui.add(DragValue::new(&mut st.starts).range(1..=10).suffix("\u{d7}"));
+                ui.label("with");
+                ui.add(DragValue::new(&mut st.gap_s).range(0. ..=60.).speed(0.1).suffix(" s"));
+                ui.label("between starts");
+            })
+            .response
+            .on_hover_text(
+                "Start is pressed this many times before the scan is kept: the scanner \
+                 settles after jumping to the frame start, so the first lines come out \
+                 cleaner. 1 = start once.",
+            );
+        });
         self.show_run_controls(ui, course, last_dir, scanning, blocked_by);
     }
 
@@ -744,7 +1125,7 @@ impl SequenceState {
                         });
                         if ui
                             .button("Use Coarse Motion target")
-                            .on_hover_text("Copy the steps currently planned in the Course Motion window")
+                            .on_hover_text("Copy the steps currently planned in the Coarse Motion window")
                             .clicked()
                         {
                             c.steps = course.get_steps().to_array();
@@ -1182,8 +1563,9 @@ impl SequenceState {
                     ui.add(DragValue::new(&mut sv.overlap_pct).range(0. ..=90.).speed(0.5).suffix(" %"))
                         .on_hover_text(
                             "Share of each frame that also appears in the next tile. Coarse \
-                             steps are not exact, so keep some margin (10 % or more) or \
-                             tiles may leave gaps.",
+                             steps are not exact, so keep some margin or tiles may leave gaps. \
+                             When the survey ends the tiles are lined up from these overlaps, \
+                             which works best at 15\u{2013}25 %.",
                         );
                 });
                 ui.horizontal(|ui| {
@@ -1195,6 +1577,14 @@ impl SequenceState {
                     ui.separator();
                     ui.label("Settle after approach");
                     ui.add(DragValue::new(&mut sv.settle_s).range(0. ..=3600.).speed(1.).suffix(" s"));
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut sv.track, "Correct moves as it runs").on_hover_text(
+                        "Each tile is placed on the map by matching it with the previous one. \
+                         If one is in the wrong place, drag it to the right spot: the step \
+                         size and the next moves are worked out from where the tiles are. \
+                         Keep 30 % overlap or more.",
+                    );
                 });
 
                 // Tile size: the template's frame if it sets one, else Nanonis' frame.
@@ -1216,14 +1606,17 @@ impl SequenceState {
                 // The frame transform flips y (scale -height): -1 is +Y.
                 let step_y = axes * DVec2::new(0., -sy * keep);
                 let steps_x = course.real_to_steps(step_x);
+                // The snake goes back the other way on alternate rows; the
+                // motor may step differently backwards.
+                let steps_x_back = course.real_to_steps(-step_x);
                 let steps_y = course.real_to_steps(step_y);
                 // What the rounded steps really give, as overlap.
-                let to_real = course.steps2real_world();
                 let real_overlap = |steps: IVec2, axis: DVec2, size: f64| {
-                    let moved = (to_real * steps.as_dvec2()).dot(axis.normalize_or_zero()).abs();
+                    let moved = course.steps_to_real(steps).dot(axis.normalize_or_zero()).abs();
                     (1. - moved / size) * 100.
                 };
-                let ov_x = real_overlap(steps_x, step_x, frame.width);
+                let ov_x = real_overlap(steps_x, step_x, frame.width)
+                    .min(real_overlap(steps_x_back, step_x, frame.width));
                 let ov_y = real_overlap(steps_y, step_y, frame.height);
                 let tiles = sv.cols * sv.rows;
                 ui.weak(format!(
@@ -1236,11 +1629,12 @@ impl SequenceState {
                     tiles - 1,
                 ));
                 ui.weak(format!(
-                    "Move per tile: {:?} steps across ({ov_x:.0} % overlap), {:?} steps down ({ov_y:.0} % overlap)",
+                    "Move per tile: {:?} / back {:?} steps across ({ov_x:.0} % overlap), {:?} steps down ({ov_y:.0} % overlap)",
                     steps_x.to_array(),
+                    steps_x_back.to_array(),
                     steps_y.to_array(),
                 ));
-                let bad = (sv.cols > 1 && (steps_x == IVec2::ZERO || ov_x < 0.))
+                let bad = (sv.cols > 1 && (steps_x == IVec2::ZERO || steps_x_back == IVec2::ZERO || ov_x < 0.))
                     || (sv.rows > 1 && (steps_y == IVec2::ZERO || ov_y < 0.));
                 if bad {
                     ui.colored_label(
@@ -1275,8 +1669,10 @@ impl SequenceState {
                             e.frame.position = Position::Keep;
                         }
                         e.name = format!("grid r{} c{}", r + 1, c + 1);
+                        e.grid = Some([r, c]);
+                        e.grid_pos = Some((step_x * c as f64 + step_y * r as f64).to_array());
                         e.coarse = prev.map(|(pc, pr)| {
-                            let steps = if pr != r { steps_y } else if c > pc { steps_x } else { -steps_x };
+                            let steps = if pr != r { steps_y } else if c > pc { steps_x } else { steps_x_back };
                             let base = template.coarse.unwrap_or_default();
                             CoarseSpec { steps: steps.to_array(), withdraw: base.withdraw, approach: base.approach }
                         });
@@ -1339,8 +1735,26 @@ impl SequenceState {
             }
             let paused = self.run.as_ref().is_some_and(|r| r.paused);
             if paused {
-                if ui.button("⏵ Resume").clicked() {
+                if ui
+                    .button("\u{23f5} Continue")
+                    .on_hover_text(
+                        "Carry on from where it stopped, keeping any changes you made. \
+                         A scan that was paused is resumed; one that was stopped is scanned again.",
+                    )
+                    .clicked()
+                {
                     self.send(SequenceCommand::Resume);
+                }
+                if ui
+                    .button("\u{21bb} Restart entry")
+                    .on_hover_text(
+                        "Run the current entry again from its start: its bias, current, frame \
+                         and speed are set again and its scan starts over. A coarse move that \
+                         already finished is not repeated.",
+                    )
+                    .clicked()
+                {
+                    self.send(SequenceCommand::RestartEntry);
                 }
             } else if ui
                 .add_enabled(active, egui::Button::new("⏸ Pause"))
@@ -1369,12 +1783,7 @@ impl SequenceState {
                         Some((i, _)) => format!("entry {}", i + 1),
                         None => "entry 0".to_string(),
                     };
-                    format!(
-                        "{} · {entry} · step {}/{}",
-                        self.status,
-                        (run.current + 1).min(run.steps.len()),
-                        run.steps.len()
-                    )
+                    format!("{} · {entry} · {}", self.status, Self::run_position(run))
                 }
                 None => self.status.clone(),
             };
@@ -1392,15 +1801,39 @@ impl SequenceState {
             }
         });
         self.show_eta(ui, last_dir, current);
+        if let (Some(reason), true) = (&self.interrupted, self.run.as_ref().is_some_and(|r| r.paused)) {
+            ui.colored_label(
+                Color32::ORANGE,
+                format!(
+                    "Held: {reason}. Nothing more is sent to Nanonis until you choose \
+                     Continue, Restart entry or Abort."
+                ),
+            );
+        }
         if let Some(err) = &self.last_error {
             ui.colored_label(Color32::RED, format!("Error: {err}"));
+        }
+        if let Some(t) = &self.grid_track {
+            ui.weak(t.summary());
+            let n = t.n_moves();
+            if n > 0
+                && ui
+                    .button(format!("Save grid calibration ({n} moves)"))
+                    .on_hover_text(
+                        "Use the step sizes learned from where the tiles are on the map as the \
+                         coarse calibration. Drag any misplaced tiles into place first.",
+                    )
+                    .clicked()
+            {
+                self.grid_calib_save = Some((t.calib, n));
+            }
         }
     }
 
     /// Progress bar with the time left while running; the estimated length
     /// of the whole sequence before it starts.
     fn show_eta(&self, ui: &mut Ui, last_dir: Dir, current: Option<CurrentScan>) {
-        let Some(run) = &self.run else {
+        if self.run.is_none() {
             let Some(scan) = self.scan_now else {
                 ui.weak("Estimated time: connect to Nanonis to estimate.");
                 return;
@@ -1420,8 +1853,40 @@ impl SequenceState {
                      I(V) series use rough defaults until a run has timed them.",
                 );
             return;
-        };
-        let step = format!("step {}/{}", (run.current + 1).min(run.steps.len()), run.steps.len());
+        }
+        self.progress_bar(ui);
+    }
+
+    /// Progress of the running sequence with the time left.
+    fn progress_bar(&self, ui: &mut Ui) {
+        if let Some((frac, text)) = self.progress() {
+            ui.add(egui::ProgressBar::new(frac).text(text).desired_height(16.));
+        }
+    }
+
+    /// Calibration run progress: `Some((fraction, text))` while its scans
+    /// run, and whether the scans are being compared.
+    pub fn calibration_progress(&self) -> (Option<(f32, String)>, bool) {
+        let running = self.cal.is_some().then(|| self.progress()).flatten();
+        (running, self.cal_measuring)
+    }
+
+    /// "scan 3/4": the scan running (or next, between scans) out of the
+    /// run's scans; "step k/n" for a run without scans.
+    fn run_position(run: &RunView) -> String {
+        let is_scan = |s: &Step| matches!(s, Step::Scan(_) | Step::AwaitScan { include: true, .. });
+        let total = run.steps.iter().filter(|(_, s)| is_scan(s)).count();
+        if total == 0 {
+            return format!("step {}/{}", (run.current + 1).min(run.steps.len()), run.steps.len());
+        }
+        let done = run.steps.iter().take(run.current).filter(|(_, s)| is_scan(s)).count();
+        format!("scan {}/{total}", (done + 1).min(total))
+    }
+
+    /// Fraction done and the bar's text, while a run is active.
+    fn progress(&self) -> Option<(f32, String)> {
+        let run = self.run.as_ref()?;
+        let step = Self::run_position(run);
         let (frac, text) = match self.run_eta() {
             Some((left, frac)) => {
                 let text = if run.paused {
@@ -1433,7 +1898,7 @@ impl SequenceState {
             }
             None => (run.current as f32 / run.steps.len().max(1) as f32, step),
         };
-        ui.add(egui::ProgressBar::new(frac).text(text).desired_height(16.));
+        Some((frac, text))
     }
 }
 

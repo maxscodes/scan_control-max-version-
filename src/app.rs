@@ -18,7 +18,7 @@ use crate::{
     theme::{self, ThemeChoice},
     utils::vec_interop::{IntoEgui as _, IntoGlam as _},
     undo_queue::{StateModify, UndoQueue},
-    view_object::Object,
+    view_object::{Object, Placement},
 };
 use egui::{Align2, Button, Color32, Layout, MenuBar, Modifiers, RichText, Stroke, Ui};
 use glam::{DAffine2, DVec2};
@@ -60,6 +60,18 @@ pub struct MyApp {
     pending_goto: Option<DAffine2>,
     /// GDS position before the last "Shift GDS", for Undo.
     gds_shift_undo: Option<(Uuid, DAffine2)>,
+    /// Where each object was when nothing was being moved; a difference
+    /// once the user lets go becomes an undoable move.
+    placements: HashMap<Uuid, Placement>,
+    /// Take the current placements as settled without recording a move
+    /// (after undo/redo or opening a project).
+    resync_placements: bool,
+    /// "Align stamps": lines up the selected stamps by their overlaps.
+    aligner: crate::analysis::mosaic::Aligner,
+    align_status: Option<(String, std::time::Instant)>,
+    /// "Save as one image": result messages from the background save.
+    export_tx: crossbeam::channel::Sender<String>,
+    export_rx: crossbeam::channel::Receiver<String>,
 }
 
 pub struct AppState {
@@ -80,6 +92,7 @@ impl MyApp {
         let project_save_dialog = ProjectSaveDialog::new();
         let project_open_dialog = ProjectOpenDialog::new();
 
+        let export_channel = crossbeam::channel::unbounded();
         Self {
             app_state: AppState {
                 scan_view: ScanView::new(&image_encoder),
@@ -91,6 +104,12 @@ impl MyApp {
             cursor_world: None,
             pending_goto: None,
             gds_shift_undo: None,
+            placements: HashMap::new(),
+            resync_placements: true,
+            aligner: Default::default(),
+            align_status: None,
+            export_tx: export_channel.0,
+            export_rx: export_channel.1,
             pending_connections: vec![nanonis_connection],
             active_connection: None,
             project,
@@ -100,6 +119,87 @@ impl MyApp {
     }
     pub fn mod_state<T: StateModify<AppState>>(&mut self, modifier: T) {
         self.undo_queue.push(&mut self.app_state, modifier);
+    }
+    fn undo(&mut self) {
+        self.undo_queue.undo(&mut self.app_state);
+        self.resync_placements = true;
+    }
+    fn redo(&mut self) {
+        self.undo_queue.redo(&mut self.app_state);
+        self.resync_placements = true;
+    }
+
+    /// Save the stamps at `indexes` (topmost first) as one picture laid out
+    /// as on the map; asks where to save it.
+    fn export_image(&mut self, indexes: &[usize], name: &str) {
+        let pieces: Vec<crate::analysis::mosaic_image::Piece> = indexes
+            .iter()
+            .filter_map(|&i| match &**self.app_state.object_list.get(i)? {
+                Object::ScanImage { image, .. } => Some(crate::analysis::mosaic_image::Piece {
+                    transform: image.transform,
+                    data: image.forward_data.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if pieces.is_empty() {
+            return;
+        }
+        let file: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || " -_().".contains(c) { c } else { '_' })
+            .collect();
+        let dialog = crate::components::file_dialog_native::dialog()
+            .add_filter("PNG image", &["png"])
+            .set_title("Save as one image")
+            .set_file_name(format!("{}.png", file.trim()));
+        let tx = self.export_tx.clone();
+        std::thread::spawn(move || {
+            let Some(path) = dialog.save_file() else { return };
+            let n = pieces.len();
+            let msg = match crate::analysis::mosaic_image::render(&pieces, 8000) {
+                Some(img) => match img.save(&path) {
+                    Ok(()) => format!(
+                        "Saved {n} stamps as {} ({}\u{d7}{} px)",
+                        path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                        img.width(),
+                        img.height()
+                    ),
+                    Err(e) => format!("Could not save the image: {e}"),
+                },
+                None => "Nothing to save: the stamps have no image data".into(),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Record moves of map objects (dragging, typed positions, Shift GDS,
+    /// …) for Undo, once each move is finished: no mouse button held and no
+    /// field being edited.
+    fn track_moves(&mut self, ctx: &egui::Context) {
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        if busy && !self.resync_placements {
+            return;
+        }
+        let now: HashMap<Uuid, Placement> = self
+            .app_state
+            .object_list
+            .iter()
+            .filter_map(|o| o.placement().map(|p| (o.uuid(), p)))
+            .collect();
+        if !std::mem::take(&mut self.resync_placements) {
+            let moves: Vec<(Uuid, Placement, Placement)> = now
+                .iter()
+                .filter_map(|(id, p)| {
+                    let before = *self.placements.get(id)?;
+                    (before != *p).then_some((*id, before, *p))
+                })
+                .collect();
+            if !moves.is_empty() {
+                self.mod_state(MoveObjectsModifier(moves));
+            }
+        }
+        self.placements = now;
     }
 
     /// Commit the current objects (GDS, images, scan area and its history)
@@ -175,6 +275,15 @@ impl MyApp {
                     ui.separator();
                     ui.monospace(format!("{:>9.3}, {:>9.3} \u{b5}m", p.x * 1e-3, p.y * 1e-3));
                 }
+                // Result of the last "Align stamps" / "Save as image", for a while.
+                if let Some((text, at)) = &self.align_status {
+                    if at.elapsed().as_secs() < 15 {
+                        ui.separator();
+                        ui.label(RichText::new(text).color(theme::accent(ui)))
+                            .on_hover_text(text);
+                        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                    }
+                }
             });
         });
     }
@@ -211,13 +320,14 @@ impl eframe::App for MyApp {
             }
         }
         while let Some(object) = self.import_file_dialog.try_recv_object() {
-            let entry = SelectableEntry::new(
-                uuid::Uuid::new_v4(),
-                object,
-                |img| img.list_atoms(),
-                |obj| obj.hidden_mut(),
-            );
+            let entry = object.into_entry(uuid::Uuid::new_v4());
             self.app_state.object_list.push(entry);
+        }
+        if let Some(summary) = self.aligner.poll(&mut self.app_state.object_list) {
+            self.align_status = Some((summary, std::time::Instant::now()));
+        }
+        if let Ok(msg) = self.export_rx.try_recv() {
+            self.align_status = Some((msg, std::time::Instant::now()));
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, egui::Key::S)) {
             self.save_project();
@@ -250,6 +360,7 @@ impl eframe::App for MyApp {
                     recent_files::add_project(project.current_path());
                     self.project = project;
                     self.app_state.object_list = list;
+                    self.resync_placements = true;
                     if let Some(conn) = self.active_connection.take() {
                         self.pending_connections.push(conn);
                     }
@@ -279,10 +390,10 @@ impl eframe::App for MyApp {
             self.mod_state(MoveBackwardModifier(indexes));
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
-            self.undo_queue.undo(&mut self.app_state);
+            self.undo();
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) {
-            self.undo_queue.redo(&mut self.app_state);
+            self.redo();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, egui::Key::Delete)) {
             let idxs = self
@@ -302,6 +413,55 @@ impl eframe::App for MyApp {
             MenuBar::new().ui(ui, |ui| {
                 file_menu_button(ui, self);
                 view_menu_button(ui, self);
+                ui.separator();
+                if ui
+                    .add_enabled(self.undo_queue.can_undo(), Button::new("\u{21b6} Undo"))
+                    .on_hover_text("Undo the last move, delete or reorder (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.undo();
+                }
+                if ui
+                    .add_enabled(self.undo_queue.can_redo(), Button::new("\u{21b7} Redo"))
+                    .on_hover_text("Redo (Ctrl+Y)")
+                    .clicked()
+                {
+                    self.redo();
+                }
+                ui.separator();
+                let selected: Vec<Uuid> = self
+                    .app_state
+                    .object_list
+                    .iter_selected()
+                    .filter(|o| matches!(&***o, Object::ScanImage { .. }))
+                    .map(|o| o.uuid())
+                    .collect();
+                if ui
+                    .add_enabled(
+                        selected.len() >= 2 && !self.aligner.busy(),
+                        Button::new(if self.aligner.busy() { "Aligning\u{2026}" } else { "Align stamps" }),
+                    )
+                    .on_hover_text(
+                        "Line up the selected stamps by matching the image where they overlap \
+                         (e.g. survey tiles). Only their positions change; Undo puts them back.",
+                    )
+                    .on_disabled_hover_text("Select two or more overlapping stamps")
+                    .clicked()
+                {
+                    self.aligner.start(&self.app_state.object_list, &selected);
+                }
+                if ui
+                    .add_enabled(!selected.is_empty(), Button::new("Save as image\u{2026}"))
+                    .on_hover_text(
+                        "Save the selected stamps as one PNG, laid out as on the map \
+                         (e.g. a survey grid). Tip: click a group in Layers to select it all.",
+                    )
+                    .on_disabled_hover_text("Select the stamps to save")
+                    .clicked()
+                {
+                    let idxs: Vec<usize> = self.app_state.object_list.iter_selected_indexes().rev().collect();
+                    self.export_image(&idxs, "stamps");
+                }
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(self.scan_frame_goto().is_some(), Button::new("\u{26F6} Fit scan"))
@@ -450,10 +610,10 @@ impl eframe::App for MyApp {
                 });
                 self.cursor_world = cursor_world;
                 if let Some(tf) = new_world_transform {
-                    let tf = DAffine2::from_scale(DVec2 {
-                        x: 0.5e3,
-                        y: -0.5e3,
-                    }) * tf.inverse();
+                    // Fill most of the map area, whatever the window size.
+                    let r = scan_view_resp.rect;
+                    let s = (0.9 * r.width().min(r.height()) as f64).max(100.);
+                    let tf = DAffine2::from_scale(DVec2 { x: s, y: -s }) * tf.inverse();
                     self.app_state.scan_view.world_transform = tf;
                 }
                 if scan_view_resp.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -462,12 +622,56 @@ impl eframe::App for MyApp {
                 egui::Window::new("Layers")
                     .frame(theme::overlay_frame(ctx))
                     .constrain_to(ui.min_rect())
-                    .anchor(Align2::LEFT_TOP, egui::Vec2::new(5., 5.))
+                    // Starts at the map's top-left; drag the title to move it.
+                    .default_pos(ui.min_rect().left_top() + egui::Vec2::new(5., 5.))
+                    .movable(true)
                     .default_size([200., 400.])
                     .resizable(true)
                     .scroll([false, true])
                     .show(ctx, |ui| {
-                        self.app_state.object_list.show(ui);
+                        let list = &mut self.app_state.object_list;
+                        let is_stamp = |o: &Object| matches!(o, Object::ScanImage { .. });
+                        let (any_hidden, any_shown) = list.hidden_state_where(is_stamp);
+                        let n_selected = list.iter_selected_indexes().count();
+                        let hint = "Ctrl+click to pick layers, Shift+click for a range. \
+                                    The eye of a selected layer hides or shows all selected.";
+                        egui::Grid::new("layers_visibility").num_columns(3).spacing([6., 4.]).show(ui, |ui| {
+                            ui.weak("All stamps");
+                            if ui.add_enabled(any_hidden, Button::new("Show").small()).clicked() {
+                                list.set_hidden_where(is_stamp, false);
+                            }
+                            if ui.add_enabled(any_shown, Button::new("Hide").small()).clicked() {
+                                list.set_hidden_where(is_stamp, true);
+                            }
+                            ui.end_row();
+                            ui.weak(if n_selected > 0 { format!("{n_selected} selected") } else { "Selected".into() })
+                                .on_hover_text(hint);
+                            if ui
+                                .add_enabled(n_selected > 0, Button::new("Show").small())
+                                .on_disabled_hover_text(hint)
+                                .clicked()
+                            {
+                                list.set_selected_hidden(false);
+                            }
+                            if ui
+                                .add_enabled(n_selected > 0, Button::new("Hide").small())
+                                .on_disabled_hover_text(hint)
+                                .clicked()
+                            {
+                                list.set_selected_hidden(true);
+                            }
+                            ui.end_row();
+                        });
+                        ui.separator();
+                        let export = self.app_state.object_list.show_grouped(ui, &Object::group_mut);
+                        if let Some(members) = export {
+                            let name = members
+                                .first()
+                                .and_then(|&i| self.app_state.object_list.get_mut(i))
+                                .and_then(|o| o.group_mut().and_then(|g| g.clone()))
+                                .unwrap_or_else(|| "stamps".into());
+                            self.export_image(&members, &name);
+                        }
                     })
                     .map(|resp| {
                         resp.response.context_menu(|ui| {
@@ -482,16 +686,13 @@ impl eframe::App for MyApp {
                 let mut new_top = ui.clip_rect().top();
                 if let Some(conn) = &mut self.active_connection {
                     if let Some(resp) = egui::Window::new("Scan Control")
+                        .vscroll(true)
                         .frame(theme::overlay_frame(ctx))
                         .constrain_to(ui.min_rect())
                         .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
                         .resizable(false)
                         .show(ctx, |ui| {
-                            // A minimum, not a fixed width: when a tool row
-                            // is wider, the scan buttons (which fill the
-                            // available width) stretch with the window
-                            // instead of staying 230 px wide on the left.
-                            ui.set_min_width(230.);
+                            ui.set_width(theme::SIDE_PANEL_WIDTH);
                             conn.show_menu(
                                 ui,
                                 &mut self.app_state.object_list,
@@ -507,7 +708,52 @@ impl eframe::App for MyApp {
                     .object_list
                     .iter_selected_indexes()
                     .collect_vec();
+                // Several stamps selected (e.g. a grid or a sequence): one
+                // window whose processing changes apply to all of them.
+                let stamps = selected
+                    .iter()
+                    .copied()
+                    .filter(|&i| matches!(&*self.app_state.object_list[i], Object::ScanImage { .. }))
+                    .collect_vec();
+                let multi = stamps.len() >= 2;
+                if multi {
+                    let mut rect = ui.min_rect();
+                    rect.set_top(new_top);
+                    if let Some(resp) = egui::Window::new(format!("{} stamps", stamps.len()))
+                        .vscroll(true)
+                        .id(egui::Id::new("multi_stamp_menu"))
+                        .frame(theme::overlay_frame(ctx))
+                        .constrain_to(rect)
+                        .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.set_width(theme::SIDE_PANEL_WIDTH);
+                            ui.weak("Changes apply to every selected stamp.");
+                            let mut images = self
+                                .app_state
+                                .object_list
+                                .iter_mut()
+                                .enumerate()
+                                .filter(|(i, _)| stamps.contains(i))
+                                .filter_map(|(_, o)| match &mut **o {
+                                    Object::ScanImage { image, .. } => Some(image),
+                                    _ => None,
+                                })
+                                .collect_vec();
+                            crate::connection::display_controls(
+                                ui,
+                                &mut images,
+                                &self.image_encoder,
+                            );
+                        })
+                    {
+                        new_top = resp.response.rect.bottom();
+                    }
+                }
                 for i in selected {
+                    if multi && stamps.contains(&i) {
+                        continue;
+                    }
                     if self.app_state.object_list[i].as_scan_area().is_some()
                         && self.active_connection.is_some()
                     {
@@ -517,11 +763,13 @@ impl eframe::App for MyApp {
                     let mut rect = ui.min_rect();
                     rect.set_top(new_top);
                     if let Some(resp) = egui::Window::new(name)
+                        .vscroll(true)
                         .frame(theme::overlay_frame(ctx))
                         .constrain_to(rect)
                         .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
                         .resizable(false)
                         .show(ctx, |ui| {
+                            ui.set_width(theme::SIDE_PANEL_WIDTH);
                             self.app_state.object_list[i].show_menu(ui, &mut self.image_encoder);
                             if matches!(&*self.app_state.object_list[i], Object::Gds { .. }) {
                                 gds_ring_check_ui(
@@ -537,6 +785,7 @@ impl eframe::App for MyApp {
                     }
                 }
             });
+        self.track_moves(ctx);
     }
 }
 
@@ -780,13 +1029,6 @@ fn view_menu_button(ui: &mut Ui, app: &mut MyApp) {
         {
             theme::update_prefs(|p| p.show_gds_prior = gds);
         }
-        if ui
-            .add_enabled(app.scan_frame_goto().is_some(), Button::new("Fit scan frame  (Home)"))
-            .clicked()
-        {
-            app.pending_goto = app.scan_frame_goto();
-            ui.close();
-        }
         if let Some(area) = app
             .app_state
             .object_list
@@ -794,6 +1036,18 @@ fn view_menu_button(ui: &mut Ui, app: &mut MyApp) {
             .find_map(|o| o.as_scan_area_mut())
         {
             ui.checkbox(&mut area.show_stamp_rings, "Show ring results on stamps");
+            ui.checkbox(&mut area.show_history, "Show coarse move history");
+            ui.add_enabled_ui(area.show_history, |ui| {
+                ui.checkbox(&mut area.show_history_boxes, "    with frame boxes");
+            });
+        }
+        ui.separator();
+        if ui
+            .add_enabled(app.scan_frame_goto().is_some(), Button::new("Fit scan frame  (Home)"))
+            .clicked()
+        {
+            app.pending_goto = app.scan_frame_goto();
+            ui.close();
         }
     });
 }
@@ -969,6 +1223,29 @@ impl StateModify<AppState> for DeleteObjectsModifier {
     }
 }
 
+/// Objects moved on the map: (object, from, to).
+struct MoveObjectsModifier(Vec<(Uuid, Placement, Placement)>);
+impl MoveObjectsModifier {
+    fn place(state: &mut AppState, id: Uuid, p: Placement) {
+        if let Some(o) = state.object_list.iter_mut().find(|o| o.uuid() == id) {
+            o.set_placement(p);
+        }
+    }
+}
+impl StateModify<AppState> for MoveObjectsModifier {
+    fn redo(&mut self, state: &mut AppState) -> bool {
+        for &(id, _, to) in &self.0 {
+            Self::place(state, id, to);
+        }
+        true
+    }
+    fn undo(&mut self, state: &mut AppState) {
+        for &(id, from, _) in &self.0 {
+            Self::place(state, id, from);
+        }
+    }
+}
+
 struct MoveForwardModifier(Vec<usize>);
 impl StateModify<AppState> for MoveForwardModifier {
     fn redo(&mut self, state: &mut AppState) -> bool {
@@ -989,15 +1266,6 @@ impl StateModify<AppState> for MoveBackwardModifier {
 
     fn undo(&mut self, state: &mut AppState) {
         self.0 = state.object_list.move_indexes_down(&self.0)
-    }
-}
-
-pub trait OkTraceExt<T> {
-    fn ok_trace(self) -> Option<T>;
-}
-impl<T, E: std::fmt::Display> OkTraceExt<T> for std::result::Result<T, E> {
-    fn ok_trace(self) -> Option<T> {
-        self.inspect_err(|e| error!("{e:#}")).ok()
     }
 }
 
@@ -1053,12 +1321,7 @@ impl Persistant for SelectableList<Object> {
         let mut object_list = SelectableList::new();
         for id in ids.values().copied() {
             let object = Object::db_read(id, txn, encoder)?;
-            let entry = SelectableEntry::new(
-                uuid::Uuid::new_v4(),
-                object,
-                |img| img.list_atoms(),
-                |obj| obj.hidden_mut(),
-            );
+            let entry = object.into_entry(uuid::Uuid::new_v4());
             object_list.push(entry);
         }
         Ok(object_list)

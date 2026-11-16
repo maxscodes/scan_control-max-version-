@@ -31,9 +31,6 @@ impl<T> SharedState<T> {
         self.local_epoch = self.shared_epoch.load(Ordering::Relaxed);
         self.inner.read()
     }
-    pub fn is_new(&self) -> bool {
-        self.local_epoch < self.shared_epoch.load(Ordering::Relaxed)
-    }
     pub fn read_new(&mut self) -> Option<RwLockReadGuard<'_, T>> {
         let shared_epoch = self.shared_epoch.load(Ordering::Relaxed);
         (self.local_epoch < shared_epoch).then(|| {

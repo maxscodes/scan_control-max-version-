@@ -1,5 +1,3 @@
-use core::f32;
-use std::mem::MaybeUninit;
 
 use eframe::{egui_wgpu::Callback, wgpu::TextureFormat};
 use egui::{Color32, Id, Response, Ui};
@@ -7,7 +5,7 @@ use glam::{DAffine2, DVec2, Vec2};
 
 use crate::{
     app::COLOR_MAP_SIZE,
-    scan_view::{callbacks::GlobalCallback, ImageEncoder},
+    scan_view::{callbacks::GlobalCallback, processing::ColorMap, ImageEncoder},
     utils::vec_interop::IntoGlam as _,
 };
 
@@ -16,6 +14,8 @@ pub struct ScanView {
     pub world_transform: DAffine2,
     target_format: TextureFormat,
     new_color_map: Option<Box<[egui::Color32; COLOR_MAP_SIZE]>>,
+    /// Palette last sent to the GPU.
+    applied_color_map: Option<(ColorMap, bool)>,
 }
 impl ScanView {
     pub fn show<R>(
@@ -23,6 +23,12 @@ impl ScanView {
         ui: &mut egui::Ui,
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> Response {
+        let prefs = crate::theme::prefs();
+        let wanted = (prefs.color_map, prefs.color_invert);
+        if self.applied_color_map != Some(wanted) {
+            self.new_color_map = Some(wanted.0.table(wanted.1));
+            self.applied_color_map = Some(wanted);
+        }
         let fill = if ui.style().visuals.dark_mode {
             Color32::from_rgb(0x0e, 0x10, 0x13)
         } else {
@@ -72,23 +78,15 @@ impl ScanView {
         screen_transform * self.world_transform
     }
     pub fn new(image_encoder: &ImageEncoder) -> Self {
-        let mut color_map: Box<MaybeUninit<[egui::Color32; COLOR_MAP_SIZE]>> = Box::new_uninit();
-        for i in 0..COLOR_MAP_SIZE {
-            let color = i as f32 / (COLOR_MAP_SIZE - 1) as f32;
-            unsafe {
-                color_map.assume_init_mut()[i] = Color32::from_gray((color * 255.) as u8);
-            }
-        }
         let mut world_transform = DAffine2::IDENTITY;
         world_transform.matrix2.y_axis[1] = -1.0;
         Self {
-            new_color_map: Some(unsafe { color_map.assume_init() }),
+            // Set from the preferences on the first `show`.
+            new_color_map: None,
+            applied_color_map: None,
             world_transform,
             target_format: image_encoder.wgpu_state.target_format,
         }
-    }
-    pub fn set_color_map(&mut self, color_map: Box<[egui::Color32; COLOR_MAP_SIZE]>) {
-        self.new_color_map = Some(color_map);
     }
 }
 

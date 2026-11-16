@@ -9,10 +9,10 @@ pub trait LoadHandler {
     fn load_folder(&mut self, path: &Path) -> Option<Self::FolderData>;
 }
 pub trait UpdateHandler: LoadHandler {
-    fn rename_file(&mut self, old: &Path, new: &Path, data: &mut Self::FileData) {}
-    fn rename_folder(&mut self, old: &Path, new: &Path, data: &mut Self::FolderData) {}
-    fn delete_file(&mut self, path: &Path, data: Self::FileData) {}
-    fn delete_folder(&mut self, path: &Path, data: Self::FolderData) {}
+    fn rename_file(&mut self, _old: &Path, _new: &Path, _data: &mut Self::FileData) {}
+    fn rename_folder(&mut self, _old: &Path, _new: &Path, _data: &mut Self::FolderData) {}
+    fn delete_file(&mut self, _path: &Path, _data: Self::FileData) {}
+    fn delete_folder(&mut self, _path: &Path, _data: Self::FolderData) {}
 }
 impl LoadHandler for () {
     type FileData = ();

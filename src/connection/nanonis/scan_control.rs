@@ -30,6 +30,23 @@ pub enum ScanCommand {
     /// Follow Me: stop the tip where it is.
     HaltTip,
 }
+impl ScanCommand {
+    /// Short description for messages, e.g. "stop scan".
+    pub fn describe(&self) -> String {
+        match self {
+            ScanCommand::Start(ScanDir::Up) => "scan up".into(),
+            ScanCommand::Start(ScanDir::Down) => "scan down".into(),
+            ScanCommand::Pause => "pause scan".into(),
+            ScanCommand::Resume => "resume scan".into(),
+            ScanCommand::Stop => "stop scan".into(),
+            ScanCommand::Save => "save scan".into(),
+            ScanCommand::SetBias(v) => format!("bias {v:.3} V"),
+            ScanCommand::SetSetpoint(a) => format!("setpoint {:.1} pA", a * 1e12),
+            ScanCommand::MoveTip { .. } => "move tip".into(),
+            ScanCommand::HaltTip => "halt tip".into(),
+        }
+    }
+}
 
 /// Values read back from Nanonis by the slow status worker.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -43,6 +60,10 @@ pub struct Readback {
     /// Seconds per scan line, forward and backward (Scan.SpeedGet).
     pub fwd_line_time: f32,
     pub bwd_line_time: f32,
+    /// Lines per frame and pixels per line set in Nanonis
+    /// (Scan.BufferGet); 0 if unknown.
+    pub lines: u32,
+    pub pixels: u32,
 }
 
 /// What the panel needs to know each frame.
@@ -85,9 +106,6 @@ impl ScanControlState {
         self.pending.is_some()
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.paused
-    }
 
     /// Short status text, also used by the status bar.
     pub fn status_text(&self, status: &ScanStatus) -> String {
@@ -104,7 +122,8 @@ impl ScanControlState {
         }
     }
 
-    pub fn show_menu(&mut self, ui: &mut Ui, input: PanelInput, compact: &mut bool) {
+    /// Returns the command the user clicked; the caller sends it.
+    pub fn show_menu(&mut self, ui: &mut Ui, input: PanelInput, compact: &mut bool) -> Option<ScanCommand> {
         if self.sender.poll_complete().is_some() {
             if matches!(self.pending, Some(ScanCommand::Save)) {
                 self.saved_at = Some(Instant::now());
@@ -240,10 +259,7 @@ impl ScanControlState {
         // 4. Progress of the running scan.
         let line_time = input.readback.map(|r| (r.fwd_line_time + r.bwd_line_time) as f64).filter(|&t| t > 0.);
         self.show_progress(ui, status, input.rows, line_time);
-
-        if let Some(cmd) = command {
-            self.request(cmd);
-        }
+        command
     }
 
     /// Send a scan command, as the panel buttons do (also used by other

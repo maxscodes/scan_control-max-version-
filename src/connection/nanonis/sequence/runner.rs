@@ -12,7 +12,7 @@ use nanonis_tcp::{
 use tracing::{debug, error, info, warn};
 
 use crate::connection::nanonis::{
-    sequence::model::{Frame, Speed, Step},
+    sequence::model::{restart_index, scan_start_point, Frame, ScanStart, Speed, Step},
     spectroscopy::{
         nanonis_saved_files, run_iv_series, save_batch, IvCurve, IvSeriesSettings, SeriesHost,
         SeriesOutcome, SharedPlotChoice,
@@ -34,6 +34,67 @@ const SCAN_POLL: Duration = Duration::from_millis(500);
 const TIP_TOLERANCE_M: f64 = 0.5e-9;
 /// Longest a single tip move may take.
 const TIP_MAX_TIME: Duration = Duration::from_secs(600);
+/// How often Nanonis is checked for changes made outside the sequence.
+const CHECK_EVERY: Duration = Duration::from_secs(1);
+/// A scan that ends before this share of its expected time was stopped,
+/// not finished.
+const SCAN_DONE_FRACTION: f64 = 0.8;
+
+/// The Nanonis settings a sequence controls. A change the sequence didn't
+/// make means someone else is using the instrument.
+#[derive(Debug, Clone, Copy)]
+struct Snapshot {
+    bias: f32,
+    setpoint: f32,
+    frame: Frame,
+    px: usize,
+    lines: usize,
+    fwd_line_time: f32,
+    bwd_line_time: f32,
+}
+impl Snapshot {
+    fn read(conn: &mut NanonisTcp) -> NanonisTcpResult<Self> {
+        let buffer = conn.scan_buffer_get()?;
+        let speed = conn.scan_speed_get()?;
+        Ok(Self {
+            bias: conn.bias_get()?,
+            setpoint: conn.zctrl_setpnt_get()?,
+            frame: Frame::from_get(&conn.scan_frame_get()?),
+            px: buffer.px_per_line,
+            lines: buffer.num_lines,
+            fwd_line_time: speed.fwd_line_time,
+            bwd_line_time: speed.bwd_line_time,
+        })
+    }
+    /// Seconds for one full frame (forward and backward lines).
+    fn frame_s(&self) -> f64 {
+        self.lines as f64 * (self.fwd_line_time + self.bwd_line_time) as f64
+    }
+    /// What changed from `self` to `now`, if anything.
+    fn change(&self, now: &Self) -> Option<String> {
+        let rel = |a: f64, b: f64| (a - b).abs() > 1e-3 * a.abs().max(b.abs());
+        if (self.bias - now.bias).abs() > 1e-3_f32.max(1e-3 * self.bias.abs()) {
+            return Some(format!("bias changed to {:.3} V", now.bias));
+        }
+        if rel(self.setpoint as f64, now.setpoint as f64) && (self.setpoint - now.setpoint).abs() > 1e-14 {
+            return Some(format!("setpoint changed to {:.1} pA", now.setpoint * 1e12));
+        }
+        let (a, b) = (self.frame, now.frame);
+        if (a.center_x - b.center_x).abs() > 1. || (a.center_y - b.center_y).abs() > 1. {
+            return Some("scan frame was moved".into());
+        }
+        if rel(a.width, b.width) || rel(a.height, b.height) || (a.angle - b.angle).abs() > 0.1 {
+            return Some("scan frame size or angle changed".into());
+        }
+        if self.px != now.px || self.lines != now.lines {
+            return Some(format!("resolution changed to {}×{}", now.px, now.lines));
+        }
+        if (self.fwd_line_time - now.fwd_line_time).abs() > 0.01 * self.fwd_line_time.abs() {
+            return Some("scan speed changed".into());
+        }
+        None
+    }
+}
 
 #[derive(Debug)]
 pub enum SequenceCommand {
@@ -41,15 +102,26 @@ pub enum SequenceCommand {
         steps: Vec<(usize, Step)>,
         /// Motor group index (0-based) for coarse moves.
         group: u32,
+        /// How each scan is started.
+        scan_start: ScanStart,
     },
     /// Hold now. A scan in progress is paused in Nanonis and resumed (not
     /// restarted) on Resume. A wait in progress is cut short and restarts
     /// from the beginning on resume. Other steps finish first.
     Pause,
+    /// Someone used the instrument from the app (reason): hold at once and
+    /// send nothing more to Nanonis, leaving it as the user set it.
+    Interrupt(String),
     Resume,
+    /// From a pause: go back to the start of the current entry (after a
+    /// finished coarse move) and run it again.
+    RestartEntry,
     Abort,
     /// UI has finished stamping the image.
     StampDone,
+    /// Use these steps for the coarse move of entry `entry`, if it hasn't
+    /// run yet (a survey grid correcting its next move).
+    AdjustCoarse { entry: usize, steps: [i32; 2] },
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +140,8 @@ pub enum SequenceEvent {
     /// are the .dat files Nanonis saved.
     SpecDone { ok: bool, message: String, files: Vec<std::path::PathBuf> },
     Paused { index: usize },
+    /// Paused because the instrument was used outside the sequence.
+    Interrupted { index: usize, reason: String },
     Resumed,
     Finished,
     Aborted,
@@ -77,11 +151,34 @@ pub enum SequenceEvent {
 struct RunState {
     steps: Vec<(usize, Step)>,
     group: u32,
+    scan_start: ScanStart,
     index: usize,
     paused: bool,
     pause_requested: bool,
     /// State of the scan started by the current Scan step.
     scan: ScanPhase,
+    /// The app asked to hold (someone used a control), with the reason.
+    interrupt: Option<String>,
+    /// Restart the current entry (set by RestartEntry, done with a connection).
+    restart: bool,
+    /// Nanonis settings as the sequence last left them; `None`: read afresh.
+    baseline: Option<Snapshot>,
+    last_check: Option<Instant>,
+    /// Scanning time of the current scan, and how long a full frame takes
+    /// (0: unknown, e.g. a scan started by hand).
+    scan_active: Duration,
+    scan_since: Option<Instant>,
+    scan_expected_s: f64,
+}
+impl RunState {
+    fn scan_time(&self) -> f64 {
+        (self.scan_active + self.scan_since.map_or(Duration::ZERO, |t| t.elapsed())).as_secs_f64()
+    }
+    /// The scan ran (nearly) its full time, so it finished rather than
+    /// being stopped.
+    fn scan_complete(&self) -> bool {
+        self.scan_expected_s <= 0. || self.scan_time() >= SCAN_DONE_FRACTION * self.scan_expected_s
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +194,8 @@ enum Outcome {
     Completed,
     /// Step was interrupted by a pause; do not advance.
     Interrupted,
+    /// The instrument was used outside the sequence (reason): hold.
+    External(String),
     Aborted,
 }
 
@@ -137,7 +236,7 @@ impl SequenceWorker {
     fn handle_command(&mut self, cmd: SequenceCommand) {
         debug!("sequence command {cmd:?}");
         match cmd {
-            SequenceCommand::Run { steps, group } => {
+            SequenceCommand::Run { steps, group, scan_start } => {
                 if self.state.as_ref().is_some_and(|s| !s.paused) {
                     warn!("ignoring Run while a sequence is active");
                     return;
@@ -151,10 +250,18 @@ impl SequenceWorker {
                 self.state = Some(RunState {
                     steps,
                     group,
+                    scan_start,
                     index: 0,
                     paused: false,
                     pause_requested: false,
                     scan: ScanPhase::NotStarted,
+                    interrupt: None,
+                    restart: false,
+                    baseline: None,
+                    last_check: None,
+                    scan_active: Duration::ZERO,
+                    scan_since: None,
+                    scan_expected_s: 0.,
                 });
                 self.emit(SequenceEvent::Started);
             }
@@ -163,12 +270,29 @@ impl SequenceWorker {
                     state.pause_requested = true;
                 }
             }
+            SequenceCommand::Interrupt(reason) => {
+                if let Some(state) = &mut self.state {
+                    if !state.paused {
+                        state.interrupt = Some(reason);
+                    }
+                }
+            }
             SequenceCommand::Resume => {
                 if let Some(state) = &mut self.state {
                     if state.paused {
                         state.paused = false;
                         state.pause_requested = false;
+                        state.interrupt = None;
+                        // Whatever was changed meanwhile is accepted.
+                        state.baseline = None;
                         self.emit(SequenceEvent::Resumed);
+                    }
+                }
+            }
+            SequenceCommand::RestartEntry => {
+                if let Some(state) = &mut self.state {
+                    if state.paused {
+                        state.restart = true;
                     }
                 }
             }
@@ -178,6 +302,19 @@ impl SequenceWorker {
                 }
             }
             SequenceCommand::StampDone => self.stamp_done = true,
+            SequenceCommand::AdjustCoarse { entry, steps } => {
+                if let Some(state) = &mut self.state {
+                    let from = state.index + 1;
+                    for (e, step) in state.steps.iter_mut().skip(from) {
+                        if *e == entry {
+                            if let Step::CoarseMove { steps: s } = step {
+                                info!("entry {}: coarse move {s:?} -> {steps:?} steps", entry + 1);
+                                *s = steps;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -191,30 +328,67 @@ impl SequenceWorker {
         self.state.as_ref().is_some_and(|s| s.pause_requested)
     }
 
-    /// Sleep for `dur`, checking commands every slice.
-    fn interruptible_sleep(&mut self, dur: Duration, report: bool) -> Outcome {
+    /// Did the app report someone using the instrument?
+    fn take_interrupt(&mut self) -> Option<String> {
+        self.state.as_mut().and_then(|s| s.interrupt.take())
+    }
+
+    /// Compare Nanonis with how the sequence left it (at most every
+    /// [`CHECK_EVERY`] unless `now`). The first check after a reset just
+    /// records the settings.
+    fn external_change(&mut self, conn: &mut NanonisTcp, now: bool) -> NanonisTcpResult<Option<String>> {
+        let Some(state) = &self.state else {
+            return Ok(None);
+        };
+        if !now && state.last_check.is_some_and(|t| t.elapsed() < CHECK_EVERY) {
+            return Ok(None);
+        }
+        let snap = Snapshot::read(conn)?;
+        let state = self.state.as_mut().unwrap();
+        state.last_check = Some(Instant::now());
+        match &state.baseline {
+            None => {
+                state.baseline = Some(snap);
+                Ok(None)
+            }
+            Some(base) => Ok(base.change(&snap)),
+        }
+    }
+
+    /// A UI interrupt or a change in Nanonis, checked while a step runs.
+    fn interrupted(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<Option<String>> {
+        if let Some(reason) = self.take_interrupt() {
+            return Ok(Some(reason));
+        }
+        self.external_change(conn, false)
+    }
+
+    /// A wait step, checking commands every slice and stopping when the
+    /// instrument is used outside the sequence.
+    fn wait_step(&mut self, conn: &mut NanonisTcp, dur: Duration, report: bool) -> NanonisTcpResult<Outcome> {
         let end = Instant::now() + dur;
         let mut last_report = Instant::now() - Duration::from_secs(1);
         loop {
             self.drain_commands();
             if self.abort {
-                return Outcome::Aborted;
+                return Ok(Outcome::Aborted);
             }
-            if report && self.pause_requested() {
-                return Outcome::Interrupted;
+            if self.pause_requested() {
+                return Ok(Outcome::Interrupted);
+            }
+            if let Some(reason) = self.interrupted(conn)? {
+                return Ok(Outcome::External(reason));
             }
             let now = Instant::now();
             if now >= end {
                 if report {
                     self.emit(SequenceEvent::WaitProgress { remaining: 0. });
                 }
-                return Outcome::Completed;
+                return Ok(Outcome::Completed);
             }
             if report && now - last_report >= Duration::from_millis(250) {
                 last_report = now;
-                self.emit(SequenceEvent::WaitProgress {
-                    remaining: (end - now).as_secs_f64(),
-                });
+                self.emit(SequenceEvent::WaitProgress { remaining: (end - now).as_secs_f64() });
             }
             std::thread::sleep(SLICE.min(end - now));
         }
@@ -232,7 +406,7 @@ impl SequenceWorker {
                 self.emit(SequenceEvent::CoarseMoved { steps });
             }
             Step::Wait(secs) => {
-                return Ok(self.interruptible_sleep(Duration::from_secs_f64(secs.max(0.)), true));
+                return self.wait_step(conn, Duration::from_secs_f64(secs.max(0.)), true);
             }
             Step::SetFrame(spec) => {
                 let current = Frame::from_get(&conn.scan_frame_get()?);
@@ -308,6 +482,11 @@ impl SequenceWorker {
                 let here = xy(conn)?;
                 conn.fol_me_xy_pos_set(here.x, here.y, false)?;
                 return Ok(Outcome::Aborted);
+            }
+            if let Some(reason) = self.take_interrupt() {
+                let here = xy(conn)?;
+                conn.fol_me_xy_pos_set(here.x, here.y, false)?;
+                return Ok(Outcome::External(reason));
             }
             let pos = xy(conn)?;
             if pos.distance(target) <= TIP_TOLERANCE_M {
@@ -419,6 +598,9 @@ impl SequenceWorker {
             if self.pause_requested() {
                 return Ok(Outcome::Interrupted);
             }
+            if let Some(reason) = self.take_interrupt() {
+                return Ok(Outcome::External(reason));
+            }
             let resp = conn.scan_wait_end_of_scan(Some(SCAN_POLL))?;
             if !resp.timed_out || !conn.scan_status_get()?.running {
                 return Ok(Outcome::Completed);
@@ -426,30 +608,132 @@ impl SequenceWorker {
         }
     }
 
-    /// Start (or resume) the scan and wait for it to end, reacting to Pause
-    /// and Abort while it runs. `check_running`: also stop waiting when Nanonis
-    /// says no scan is running (for a scan the sequence didn't start, which
-    /// may already have been stopped by hand).
-    fn execute_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir, check_running: bool) -> NanonisTcpResult<Outcome> {
+    /// Start the scan and note how long a full frame should take.
+    /// Pressing Start again a few seconds later lets the scanner settle
+    /// after jumping to the frame start ([`ScanStart`]). Returns an outcome
+    /// if the run was stopped, paused or held during the restarts.
+    fn start_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir) -> NanonisTcpResult<Option<Outcome>> {
+        let expected = Snapshot::read(conn).map(|s| s.frame_s()).unwrap_or(0.);
+        let scan_start = self.state.as_ref().map_or(ScanStart::default(), |s| s.scan_start);
+        if scan_start.park_s > 0. {
+            if let Some(outcome) = self.park_at_start(conn, dir, scan_start.park_s)? {
+                return Ok(Some(outcome));
+            }
+        }
+        let starts = scan_start.starts.max(1);
+        for k in 0..starts {
+            conn.scan_action(ActionType::Start, dir)?;
+            if let Some(state) = &mut self.state {
+                state.scan = ScanPhase::Running(dir);
+                state.scan_active = Duration::ZERO;
+                state.scan_since = Some(Instant::now());
+                state.scan_expected_s = expected;
+            }
+            if k + 1 == starts {
+                break;
+            }
+            debug!("scan start {} of {starts}", k + 1);
+            match self.wait_step(conn, Duration::from_secs_f64(scan_start.gap_s.max(0.)), false)? {
+                Outcome::Completed => {}
+                Outcome::Aborted => {
+                    conn.scan_action(ActionType::Stop, dir)?;
+                    self.set_scan_phase(ScanPhase::NotStarted);
+                    return Ok(Some(Outcome::Aborted));
+                }
+                Outcome::Interrupted => {
+                    // Paused before the kept start: start over on resume.
+                    conn.scan_action(ActionType::Stop, dir)?;
+                    self.set_scan_phase(ScanPhase::NotStarted);
+                    return Ok(Some(Outcome::Interrupted));
+                }
+                other => return Ok(Some(other)),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Move the tip to where the scan will begin and wait there, so the
+    /// creep after that jump is over before the first line. A tip that
+    /// can't get there is not fatal: the scan just starts as before.
+    fn park_at_start(&mut self, conn: &mut NanonisTcp, dir: ScanDir, wait_s: f64) -> NanonisTcpResult<Option<Outcome>> {
+        let frame = Frame::from_get(&conn.scan_frame_get()?);
+        let target = scan_start_point(&frame, matches!(dir, ScanDir::Up));
+        debug!("parking at the scan start ({:.1}, {:.1}) nm for {wait_s} s", target.x * 1e9, target.y * 1e9);
+        let moved = match self.move_tip(conn, target) {
+            Ok(o) => o,
+            Err(NanonisTcpError::Api(m)) => {
+                warn!("could not park the tip at the scan start ({m}); starting anyway");
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let outcome = match moved {
+            Outcome::Completed => self.wait_step(conn, Duration::from_secs_f64(wait_s), false)?,
+            other => other,
+        };
+        match outcome {
+            Outcome::Completed => Ok(None),
+            other => {
+                // Not started yet: on resume the scan starts (and parks) afresh.
+                self.set_scan_phase(ScanPhase::NotStarted);
+                Ok(Some(other))
+            }
+        }
+    }
+
+    /// The scan is not running where the sequence expected it to be (paused
+    /// or stopped while the sequence held). Try resuming it; if that fails,
+    /// it counts as done when it ran its full time, else it is scanned again.
+    fn recover_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir) -> NanonisTcpResult<Option<Outcome>> {
+        conn.scan_action(ActionType::Resume, dir)?;
+        std::thread::sleep(RESUME_CHECK);
+        if conn.scan_status_get()?.running {
+            return Ok(None);
+        }
+        if self.state.as_ref().is_some_and(|s| s.scan_complete()) {
+            info!("scan had finished while the sequence was held; continuing");
+            self.set_scan_phase(ScanPhase::NotStarted);
+            return Ok(Some(Outcome::Completed));
+        }
+        info!("scan was stopped while the sequence was held; scanning it again");
+        self.start_scan(conn, dir)
+    }
+
+    /// Start (or resume) the scan and wait for it to end, reacting to Pause,
+    /// Abort and use of the instrument outside the sequence while it runs.
+    /// `adopted`: a scan the sequence didn't start (its length is unknown).
+    fn execute_scan(&mut self, conn: &mut NanonisTcp, dir: ScanDir, adopted: bool) -> NanonisTcpResult<Outcome> {
         let phase = self.state.as_ref().map_or(ScanPhase::NotStarted, |s| s.scan);
         let dir = match phase {
             ScanPhase::NotStarted => {
-                conn.scan_action(ActionType::Start, dir)?;
-                dir
-            }
-            ScanPhase::Paused(dir) => {
-                conn.scan_action(ActionType::Resume, dir)?;
-                std::thread::sleep(RESUME_CHECK);
-                if !conn.scan_status_get()?.running {
-                    // Finished or stopped by hand while the sequence was paused.
-                    info!("scan was no longer running after resume; continuing");
-                    self.set_scan_phase(ScanPhase::NotStarted);
-                    return Ok(Outcome::Completed);
+                if let Some(outcome) = self.start_scan(conn, dir)? {
+                    return Ok(outcome);
                 }
                 dir
             }
-            // Reconnected mid-scan: just keep waiting for it.
-            ScanPhase::Running(dir) => dir,
+            ScanPhase::Paused(dir) => {
+                if let Some(state) = &mut self.state {
+                    state.scan_since = Some(Instant::now());
+                }
+                if let Some(outcome) = self.recover_scan(conn, dir)? {
+                    return Ok(outcome);
+                }
+                dir
+            }
+            ScanPhase::Running(dir) => {
+                if adopted {
+                    if let Some(state) = &mut self.state {
+                        state.scan_expected_s = 0.;
+                    }
+                }
+                // Held while the scan ran: it may have been paused or stopped.
+                if !adopted && !conn.scan_status_get()?.running {
+                    if let Some(outcome) = self.recover_scan(conn, dir)? {
+                        return Ok(outcome);
+                    }
+                }
+                dir
+            }
         };
         self.set_scan_phase(ScanPhase::Running(dir));
         loop {
@@ -462,22 +746,54 @@ impl SequenceWorker {
             if self.pause_requested() {
                 conn.scan_action(ActionType::Pause, dir)?;
                 self.set_scan_phase(ScanPhase::Paused(dir));
+                if let Some(state) = &mut self.state {
+                    if let Some(t) = state.scan_since.take() {
+                        state.scan_active += t.elapsed();
+                    }
+                }
                 return Ok(Outcome::Interrupted);
             }
+            // Someone else is using the instrument: hold, and leave the scan
+            // as it is (they may have paused, stopped or changed it).
+            if let Some(reason) = self.interrupted(conn)? {
+                return Ok(Outcome::External(reason));
+            }
             let resp = conn.scan_wait_end_of_scan(Some(SCAN_POLL))?;
-            if !resp.timed_out {
+            let ended = !resp.timed_out || !conn.scan_status_get()?.running;
+            if !ended {
+                continue;
+            }
+            if adopted || self.state.as_ref().is_some_and(|s| s.scan_complete()) {
                 self.set_scan_phase(ScanPhase::NotStarted);
-                self.emit(SequenceEvent::ScanDone {
-                    file_path: resp.file_path,
-                });
+                self.emit(SequenceEvent::ScanDone { file_path: resp.file_path });
                 return Ok(Outcome::Completed);
             }
-            if check_running && !conn.scan_status_get()?.running {
-                info!("scan stopped outside the sequence; continuing");
-                self.set_scan_phase(ScanPhase::NotStarted);
-                return Ok(Outcome::Completed);
-            }
+            // Ended long before a full frame: stopped (or paused) outside
+            // the sequence.
+            return Ok(Outcome::External("the scan was stopped or paused outside the sequence".into()));
         }
+    }
+
+    /// Restart the current entry: stop a scan it left running or paused,
+    /// go back to the entry's first step (after a finished coarse move).
+    fn restart_entry(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
+        let Some(state) = &mut self.state else {
+            return Ok(());
+        };
+        state.restart = false;
+        if let ScanPhase::Paused(dir) | ScanPhase::Running(dir) = state.scan {
+            conn.scan_action(ActionType::Stop, dir)?;
+        }
+        let state = self.state.as_mut().unwrap();
+        state.scan = ScanPhase::NotStarted;
+        state.index = restart_index(&state.steps, state.index);
+        state.paused = false;
+        state.pause_requested = false;
+        state.interrupt = None;
+        state.baseline = None;
+        info!("restarting the entry at step {}", state.index);
+        self.emit(SequenceEvent::Resumed);
+        Ok(())
     }
 
     /// Abort, stopping a scan this sequence started and left paused/running.
@@ -541,6 +857,9 @@ impl Worker for SequenceWorker {
     }
 
     fn work(&mut self, conn: &mut NanonisTcp) -> eyre::Result<()> {
+        if self.state.as_ref().is_some_and(|s| s.paused && s.restart) {
+            self.restart_entry(conn)?;
+        }
         let active = self.state.as_ref().is_some_and(|s| !s.paused);
         if !active {
             // Idle or paused: block briefly instead of spinning.
@@ -564,10 +883,55 @@ impl Worker for SequenceWorker {
             let s = self.state.as_ref().unwrap();
             (s.index, s.steps[s.index].1.clone(), s.group)
         };
-        self.emit(SequenceEvent::StepStarted { index });
-        debug!("sequence step {index}: {step}");
+        // Before each step: nothing may have changed behind the sequence.
+        let our_scan = self.state.as_ref().is_some_and(|s| s.scan != ScanPhase::NotStarted);
+        let reason = match self.take_interrupt() {
+            Some(r) => Some(r),
+            None if matches!(step, Step::AwaitScan { include: false, .. }) => None,
+            None => match self.external_change(conn, true)? {
+                Some(r) => Some(r),
+                None if !our_scan
+                    && !matches!(step, Step::AwaitScan { .. })
+                    && conn.scan_status_get()?.running =>
+                {
+                    Some("a scan was started outside the sequence".into())
+                }
+                None => None,
+            },
+        };
+        let result = match reason {
+            Some(reason) => Ok(Outcome::External(reason)),
+            None => {
+                self.emit(SequenceEvent::StepStarted { index });
+                debug!("sequence step {index}: {step}");
+                self.execute(conn, step.clone(), group)
+            }
+        };
+        // Steps that change watched settings: take them as the new normal.
+        if matches!(
+            step,
+            Step::SetFrame(_)
+                | Step::SetResolution(_)
+                | Step::SetSpeed(_)
+                | Step::SetBias(_)
+                | Step::SetCurrent(_)
+                | Step::Spectroscopy(_)
+                | Step::AwaitScan { .. }
+        ) {
+            if let Some(state) = &mut self.state {
+                state.baseline = None;
+            }
+        }
 
-        match self.execute(conn, step.clone(), group) {
+        match result {
+            Ok(Outcome::External(reason)) => {
+                warn!("sequence held at step {index}: {reason}");
+                let state = self.state.as_mut().unwrap();
+                state.paused = true;
+                state.pause_requested = false;
+                self.emit(SequenceEvent::Paused { index });
+                self.emit(SequenceEvent::Interrupted { index, reason });
+            }
             Ok(Outcome::Completed) => {
                 let state = self.state.as_mut().unwrap();
                 state.index += 1;

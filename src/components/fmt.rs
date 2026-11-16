@@ -31,7 +31,6 @@ impl<N: emath::Numeric> Display for EngFmt<N> {
     }
 }
 impl<N: emath::Numeric> EngFmt<N> {
-    pub const CHARS: &[char] = &['T', 'G', 'M', 'k', 'm', 'μ', 'u', 'n', 'p', 'f'];
     pub fn multplier_for_char(c: char) -> Option<N> {
         match c {
             'T' => Some(1e12),

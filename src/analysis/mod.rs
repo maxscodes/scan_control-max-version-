@@ -6,3 +6,6 @@ pub mod ring_match;
 pub mod sxm_match;
 pub mod ring_live;
 pub mod landing;
+pub mod register;
+pub mod mosaic;
+pub mod mosaic_image;
