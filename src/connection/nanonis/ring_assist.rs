@@ -8,7 +8,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -235,12 +238,36 @@ fn band_check_color(c: &BandCheck) -> Color32 {
     }
 }
 
+/// Which stamps "Analyse stamps" works on.
+#[derive(Clone, Debug, PartialEq)]
+enum BatchTarget {
+    Selected,
+    /// One layer group (a sequence or survey puts its stamps in one).
+    Group(String),
+    All,
+}
+
+/// Stamps being analysed in the background, one result per stamp.
+struct Batch {
+    rx: crossbeam::channel::Receiver<(uuid::Uuid, Option<RingStamp>)>,
+    cancel: Arc<AtomicBool>,
+    total: usize,
+    done: usize,
+    found: usize,
+}
+
 pub struct RingAssistState {
     window_open: bool,
     enabled: bool,
     show_debug: bool,
     /// Analyse each stamped image and save the result with it.
     save_with_stamps: bool,
+    /// "Analyse stamps": which stamps, whether to redo ones that already
+    /// have a result, the run in progress and how the last one went.
+    batch_target: BatchTarget,
+    batch_redo: bool,
+    batch: Option<Batch>,
+    batch_status: Option<String>,
     params: RingParams,
     min_radius_um: f64,
     /// GDS matching settings (only changed by retraining for now).
@@ -330,6 +357,10 @@ impl RingAssistState {
             last_good: None,
             history: VecDeque::new(),
             save_with_stamps: true,
+            batch_target: BatchTarget::Selected,
+            batch_redo: false,
+            batch: None,
+            batch_status: None,
             gds_sync_key: Vec::new(),
             show_gds: true,
             job: None,
@@ -612,6 +643,7 @@ impl RingAssistState {
         course: &mut CourseMotionState,
         locked: Option<&str>,
     ) {
+        self.poll_batch(object_list);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(self.semi_auto, "\u{25CE} Semi-auto centring")
@@ -707,6 +739,7 @@ impl RingAssistState {
             .vscroll(true)
             .frame(crate::theme::window_frame(ui.ctx()))
             .default_width(340.)
+            .resizable(true)
             .collapsible(true)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
@@ -952,6 +985,7 @@ impl RingAssistState {
 
         let gds = gds_prior::collect(object_list);
         self.sync_dataset_gds(object_list, &gds);
+        self.show_batch(ui, object_list);
         self.show_teach(ui, object_list, &gds);
         self.show_training(ui);
 
@@ -1398,6 +1432,185 @@ impl RingAssistState {
         }
         if let Some(e) = &self.label_error {
             ui.label(RichText::new(e).color(UNSURE_COLOR));
+        }
+    }
+
+    /// Z stamps the batch target covers (all of them, also those that
+    /// already have a result): (stamp, has a result, data, size, frame).
+    fn batch_stamps(
+        &self,
+        object_list: &SelectableList<Object>,
+    ) -> Vec<(uuid::Uuid, bool, Arc<Box<[f32]>>, [u32; 2], DAffine2)> {
+        let pick = |o: &Object| match o {
+            Object::ScanImage { image: im, group, .. } if im.unit == "m" => {
+                let wanted = match &self.batch_target {
+                    BatchTarget::All | BatchTarget::Selected => true,
+                    BatchTarget::Group(g) => group.as_deref() == Some(g.as_str()),
+                };
+                wanted.then(|| (im.uuid(), im.ring.is_some(), im.forward_data.data.clone(), im.forward_data.size, im.transform))
+            }
+            _ => None,
+        };
+        match self.batch_target {
+            BatchTarget::Selected => object_list.iter_selected().filter_map(|o| pick(o)).collect(),
+            _ => object_list.iter().filter_map(|o| pick(o)).collect(),
+        }
+    }
+
+    /// "Analyse stamps": run the ring analysis on stamps already on the map
+    /// (selected, one sequence or survey group, or all) and save each result
+    /// with its stamp, as if Ring Assist had been on when it was taken.
+    fn show_batch(&mut self, ui: &mut Ui, object_list: &mut SelectableList<Object>) {
+        ui.separator();
+        ui.label(RichText::new("Analyse stamps").strong());
+        let mut groups: Vec<String> = object_list
+            .iter()
+            .filter_map(|o| match &**o {
+                Object::ScanImage { image, group: Some(g), .. } if image.unit == "m" => Some(g.clone()),
+                _ => None,
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+        if let BatchTarget::Group(g) = &self.batch_target {
+            if !groups.contains(g) {
+                self.batch_target = BatchTarget::Selected;
+            }
+        }
+        let label = |t: &BatchTarget| match t {
+            BatchTarget::Selected => "Selected stamps".to_string(),
+            BatchTarget::All => "All stamps".to_string(),
+            BatchTarget::Group(g) => format!("Group: {g}"),
+        };
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("ring_batch_target")
+                .selected_text(label(&self.batch_target))
+                .width(200.)
+                .show_ui(ui, |ui| {
+                    for t in [BatchTarget::Selected, BatchTarget::All]
+                        .into_iter()
+                        .chain(groups.iter().map(|g| BatchTarget::Group(g.clone())))
+                    {
+                        let text = label(&t);
+                        ui.selectable_value(&mut self.batch_target, t, text);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Which stamps to analyse. A sequence or survey puts its stamps in one layer \
+                     group; pick it here, or click the group in Layers to select it.",
+                );
+            ui.checkbox(&mut self.batch_redo, "redo done ones").on_hover_text(
+                "Also analyse stamps that already have a ring result, replacing it (e.g. after \
+                 changing the settings). Off: only stamps without one.",
+            );
+        });
+        let stamps = self.batch_stamps(object_list);
+        let todo = stamps.iter().filter(|s| self.batch_redo || !s.1).count();
+        ui.horizontal(|ui| {
+            match &self.batch {
+                Some(b) => {
+                    ui.add(
+                        egui::ProgressBar::new(b.done as f32 / b.total.max(1) as f32)
+                            .desired_width(180.)
+                            .text(format!("{} of {}", b.done, b.total)),
+                    );
+                    if ui.button("Stop").clicked() {
+                        b.cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    let text = match todo {
+                        0 => "Analyse".to_string(),
+                        1 => "Analyse 1 stamp".to_string(),
+                        n => format!("Analyse {n} stamps"),
+                    };
+                    if ui
+                        .add_enabled(todo > 0, egui::Button::new(text))
+                        .on_hover_text(
+                            "Find the ring centre in each stamp with the current settings and save \
+                             the result with it: the green or blue arrow on the map, as if Ring \
+                             Assist had been on when it was taken. Z images only.",
+                        )
+                        .on_disabled_hover_text(if stamps.is_empty() {
+                            "No Z stamps here: select some, or pick a group or All"
+                        } else {
+                            "These stamps all have a result already (tick \u{201c}redo done ones\u{201d} to redo them)"
+                        })
+                        .clicked()
+                    {
+                        let jobs: Vec<_> = stamps.into_iter().filter(|s| self.batch_redo || !s.1).collect();
+                        self.start_batch(jobs);
+                    }
+                }
+            }
+        });
+        if let Some(s) = &self.batch_status {
+            ui.label(RichText::new(s).weak());
+        }
+    }
+
+    fn start_batch(&mut self, jobs: Vec<(uuid::Uuid, bool, Arc<Box<[f32]>>, [u32; 2], DAffine2)>) {
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (params, min_radius_um, stop) = (self.params, self.min_radius_um, cancel.clone());
+        self.batch = Some(Batch { rx, cancel, total: jobs.len(), done: 0, found: 0 });
+        self.batch_status = None;
+        std::thread::Builder::new()
+            .name("ring stamps".into())
+            .spawn(move || {
+                for (id, _, data, size, frame) in jobs {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let r = ring_stamp::analyse_frame(&data, size, frame, &params, min_radius_um);
+                    if tx.send((id, r)).is_err() {
+                        break;
+                    }
+                    crate::app::request_repaint();
+                }
+                crate::app::request_repaint();
+            })
+            .expect("could not start the ring stamps thread");
+    }
+
+    /// Save finished batch results with their stamps.
+    fn poll_batch(&mut self, object_list: &mut SelectableList<Object>) {
+        let Some(b) = &mut self.batch else { return };
+        let mut got = Vec::new();
+        let mut ended = false;
+        loop {
+            match b.rx.try_recv() {
+                Ok(r) => got.push(r),
+                Err(crossbeam::channel::TryRecvError::Empty) => break,
+                // The thread is done (finished or stopped).
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if !got.is_empty() {
+            for o in object_list.iter_mut() {
+                if let Object::ScanImage { image, .. } = &mut **o {
+                    if let Some((_, r)) = got.iter().find(|(id, _)| *id == image.uuid()) {
+                        image.ring = *r;
+                    }
+                }
+            }
+            b.done += got.len();
+            b.found += got.iter().filter(|(_, r)| r.is_some()).count();
+            self.teach_cache = None;
+        }
+        if ended {
+            let stopped = if b.done < b.total { format!(" (stopped after {} of {})", b.done, b.total) } else { String::new() };
+            self.batch_status = Some(format!(
+                "{} stamp{} analysed, {} with a result{stopped}. Saved with the stamps; they are kept when the project is saved.",
+                b.done,
+                if b.done == 1 { "" } else { "s" },
+                b.found
+            ));
+            self.batch = None;
         }
     }
 

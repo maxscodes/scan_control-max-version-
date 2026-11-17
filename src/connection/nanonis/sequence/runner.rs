@@ -12,7 +12,10 @@ use nanonis_tcp::{
 use tracing::{debug, error, info, warn};
 
 use crate::connection::nanonis::{
-    sequence::model::{restart_index, scan_start_point, Frame, ScanStart, Speed, Step},
+    sequence::{
+        checkpoint::{self, Checkpoint, SavedScan},
+        model::{restart_index, scan_start_point, Dir, Frame, ScanStart, Sequence, Speed, Step},
+    },
     spectroscopy::{
         nanonis_saved_files, run_iv_series, save_batch, IvCurve, IvSeriesSettings, SeriesHost,
         SeriesOutcome, SharedPlotChoice,
@@ -104,7 +107,18 @@ pub enum SequenceCommand {
         group: u32,
         /// How each scan is started.
         scan_start: ScanStart,
+        /// The editor's plan. `Some`: the run is saved to disk as it goes,
+        /// so it survives the app restarting (not for calibration runs).
+        plan: Option<Sequence>,
     },
+    /// Pause once the scan in progress (or the next one) is done and
+    /// stamped. Cleared when it pauses.
+    PauseAfterScan(bool),
+    /// The app wants to close (to be rebuilt): at the next safe point (a
+    /// scan keeps running in Nanonis) save the run so the next start picks
+    /// it up, then report [`SequenceEvent::Detached`].
+    Detach,
+    CancelDetach,
     /// Hold now. A scan in progress is paused in Nanonis and resumed (not
     /// restarted) on Resume. A wait in progress is cut short and restarts
     /// from the beginning on resume. Other steps finish first.
@@ -122,6 +136,9 @@ pub enum SequenceCommand {
     /// Use these steps for the coarse move of entry `entry`, if it hasn't
     /// run yet (a survey grid correcting its next move).
     AdjustCoarse { entry: usize, steps: [i32; 2] },
+    /// The run's survey tiles so far and their layer group (saved with the
+    /// run, so a restart carries on the same survey).
+    SurveyTiles { group: Option<String>, tiles: Vec<uuid::Uuid> },
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +163,22 @@ pub enum SequenceEvent {
     Finished,
     Aborted,
     Error { index: usize, message: String },
+    /// A run saved by the previous app session was picked up (paused,
+    /// unless `auto_resume`: it continues once Nanonis is connected).
+    Restored {
+        steps: Vec<(usize, Step)>,
+        index: usize,
+        plan: Sequence,
+        auto_resume: bool,
+        note: String,
+        /// The survey the run was adding tiles to (see [`SequenceCommand::SurveyTiles`]).
+        survey_group: Option<String>,
+        survey_tiles: Vec<uuid::Uuid>,
+    },
+    /// "Pause after scan" is armed or not (it clears itself once it fires).
+    PauseAfterScan(bool),
+    /// The run is saved and the app may close.
+    Detached,
 }
 
 struct RunState {
@@ -169,8 +202,98 @@ struct RunState {
     scan_active: Duration,
     scan_since: Option<Instant>,
     scan_expected_s: f64,
+    /// Saved to disk as it goes (see [`checkpoint`]), with this plan.
+    plan: Option<Sequence>,
+    /// A scan finished since the run last paused (for "pause after scan").
+    scanned: bool,
+    /// Step `index` has begun.
+    step_started: bool,
+    /// Handed off for a rebuild while running: continue after the restart.
+    resume_after_restart: bool,
+    /// Survey tiles taken so far and their layer group (from the editor).
+    survey_group: Option<String>,
+    survey_tiles: Vec<uuid::Uuid>,
 }
 impl RunState {
+    fn new(steps: Vec<(usize, Step)>, group: u32, scan_start: ScanStart, plan: Option<Sequence>) -> Self {
+        Self {
+            steps,
+            group,
+            scan_start,
+            index: 0,
+            paused: false,
+            pause_requested: false,
+            scan: ScanPhase::NotStarted,
+            interrupt: None,
+            restart: false,
+            baseline: None,
+            last_check: None,
+            scan_active: Duration::ZERO,
+            scan_since: None,
+            scan_expected_s: 0.,
+            plan,
+            scanned: false,
+            step_started: false,
+            resume_after_restart: false,
+            survey_group: None,
+            survey_tiles: Vec::new(),
+        }
+    }
+    /// What is saved to disk (`None`: this run isn't saved).
+    fn checkpoint(&self, pause_after_scan: bool) -> Option<Checkpoint> {
+        let plan = self.plan.clone()?;
+        let scan = match self.scan {
+            ScanPhase::NotStarted => SavedScan::NotStarted,
+            ScanPhase::Running(d) => SavedScan::Running(d.into()),
+            ScanPhase::Paused(d) => SavedScan::Paused(d.into()),
+        };
+        let now = checkpoint::unix_now();
+        Some(Checkpoint {
+            steps: self.steps.clone(),
+            group: self.group,
+            scan_start: self.scan_start,
+            index: self.index,
+            paused: self.paused,
+            step_started: self.step_started,
+            scan,
+            scan_active_s: self.scan_active.as_secs_f64(),
+            // Whole seconds, so an unchanged run writes the same file.
+            scan_since_unix: self.scan_since.map(|t| now.saturating_sub(t.elapsed().as_secs())),
+            scan_expected_s: self.scan_expected_s,
+            pause_after_scan,
+            resume_after_restart: self.resume_after_restart,
+            plan,
+            survey_group: self.survey_group.clone(),
+            survey_tiles: self.survey_tiles.iter().map(|id| id.to_string()).collect(),
+        })
+    }
+    /// A run saved by an earlier session, held (paused).
+    fn from_checkpoint(c: Checkpoint) -> Self {
+        let now = checkpoint::unix_now();
+        let dir = |d: Dir| -> ScanDir { d.into() };
+        let scan = match c.scan {
+            SavedScan::NotStarted => ScanPhase::NotStarted,
+            SavedScan::Running(d) => ScanPhase::Running(dir(d)),
+            SavedScan::Paused(d) => ScanPhase::Paused(dir(d)),
+        };
+        // Time the scan ran while the app was closed counts as scanned.
+        let mut scan_active = Duration::from_secs_f64(c.scan_active_s.max(0.));
+        let scan_since = c.scan_since_unix.map(|since| {
+            scan_active += Duration::from_secs(now.saturating_sub(since));
+            Instant::now()
+        });
+        let mut s = Self::new(c.steps, c.group, c.scan_start, Some(c.plan));
+        s.index = c.index;
+        s.paused = true;
+        s.scan = scan;
+        s.scan_active = scan_active;
+        s.scan_since = scan_since;
+        s.scan_expected_s = c.scan_expected_s;
+        s.step_started = c.step_started;
+        s.survey_group = c.survey_group;
+        s.survey_tiles = c.survey_tiles.iter().filter_map(|id| id.parse().ok()).collect();
+        s
+    }
     fn scan_time(&self) -> f64 {
         (self.scan_active + self.scan_since.map_or(Duration::ZERO, |t| t.elapsed())).as_secs_f64()
     }
@@ -197,6 +320,9 @@ enum Outcome {
     /// The instrument was used outside the sequence (reason): hold.
     External(String),
     Aborted,
+    /// Stopped at a safe point to hand off to a restarted app (see
+    /// [`SequenceCommand::Detach`]); a scan in progress keeps running.
+    Detach,
 }
 
 pub struct SequenceWorker {
@@ -208,6 +334,14 @@ pub struct SequenceWorker {
     state: Option<RunState>,
     abort: bool,
     stamp_done: bool,
+    /// Pause once a scan is done (one-shot).
+    pause_after_scan: bool,
+    /// Asked to hand off for a restart at the next safe point.
+    detach: bool,
+    /// A run restored after a rebuild continues once connected.
+    resume_on_connect: bool,
+    /// The checkpoint last written, so an unchanged run isn't rewritten.
+    last_saved: String,
 }
 
 impl SequenceWorker {
@@ -217,7 +351,7 @@ impl SequenceWorker {
         events: Sender<SequenceEvent>,
         plot_choice: &SharedPlotChoice,
     ) -> Self {
-        Self {
+        let mut worker = Self {
             ctx: ctx.clone(),
             commands,
             events,
@@ -225,7 +359,91 @@ impl SequenceWorker {
             state: None,
             abort: false,
             stamp_done: false,
+            pause_after_scan: false,
+            detach: false,
+            resume_on_connect: false,
+            last_saved: String::new(),
+        };
+        worker.restore();
+        worker
+    }
+
+    /// Pick up the run the previous app session saved, if any.
+    fn restore(&mut self) {
+        let Some(c) = checkpoint::load() else { return };
+        let auto_resume = c.resume_after_restart && !c.paused;
+        let pause_after_scan = c.pause_after_scan;
+        let state = RunState::from_checkpoint(c);
+        let (index, steps) = (state.index, state.steps.clone());
+        let entry = match steps.get(index) {
+            Some((crate::connection::nanonis::sequence::model::CURRENT_SCAN, _)) => "the current scan".to_string(),
+            Some((e, _)) => format!("entry {}", e + 1),
+            None => "the end".to_string(),
+        };
+        let step = &steps[index].1;
+        let scan_note = match state.scan {
+            ScanPhase::Running(_) => ", its scan was left running in Nanonis",
+            ScanPhase::Paused(_) => ", its scan is paused in Nanonis",
+            ScanPhase::NotStarted => "",
+        };
+        let mut note = format!("picked up after the app restarted, at {entry} ({step}){scan_note}");
+        let half_done = state.step_started
+            && matches!(step, Step::CoarseMove { .. } | Step::MoveTip(_) | Step::Spectroscopy(_));
+        if half_done {
+            note.push_str(
+                ". The app closed during this step, so it may be partly done: \
+                 check before Continue, which runs it again",
+            );
         }
+        let auto_resume = auto_resume && !half_done;
+        info!("restored the saved sequence at step {index} of {} (auto resume: {auto_resume})", steps.len());
+        self.resume_on_connect = auto_resume;
+        self.pause_after_scan = pause_after_scan;
+        let plan = state.plan.clone().unwrap_or_default();
+        let (survey_group, survey_tiles) = (state.survey_group.clone(), state.survey_tiles.clone());
+        self.state = Some(state);
+        self.emit(SequenceEvent::Restored { steps, index, plan, auto_resume, note, survey_group, survey_tiles });
+        self.emit(SequenceEvent::PauseAfterScan(pause_after_scan));
+        self.save();
+    }
+
+    /// Save the run to disk if it changed (see [`checkpoint`]).
+    fn save(&mut self) {
+        let Some(c) = self.state.as_ref().and_then(|s| s.checkpoint(self.pause_after_scan)) else {
+            return;
+        };
+        match serde_json::to_string(&c) {
+            Ok(json) if json != self.last_saved => {
+                checkpoint::write(&json);
+                self.last_saved = json;
+            }
+            Ok(_) => {}
+            Err(e) => warn!("could not encode the sequence checkpoint: {e}"),
+        }
+    }
+
+    /// The run ended: nothing to pick up any more.
+    fn clear_saved(&mut self) {
+        checkpoint::clear();
+        self.last_saved.clear();
+    }
+
+    /// Save the run for the restarted app and tell the UI it may close.
+    /// A running sequence continues by itself after the restart.
+    fn detach_now(&mut self) {
+        self.detach = false;
+        if let Some(state) = &mut self.state {
+            state.resume_after_restart = !state.paused;
+            let index = state.index;
+            if !state.paused {
+                state.paused = true;
+                state.pause_requested = false;
+                self.emit(SequenceEvent::Paused { index });
+            }
+            info!("sequence handed off at step {index} for a restart");
+        }
+        self.save();
+        self.emit(SequenceEvent::Detached);
     }
 
     fn emit(&self, event: SequenceEvent) {
@@ -236,7 +454,7 @@ impl SequenceWorker {
     fn handle_command(&mut self, cmd: SequenceCommand) {
         debug!("sequence command {cmd:?}");
         match cmd {
-            SequenceCommand::Run { steps, group, scan_start } => {
+            SequenceCommand::Run { steps, group, scan_start, plan } => {
                 if self.state.as_ref().is_some_and(|s| !s.paused) {
                     warn!("ignoring Run while a sequence is active");
                     return;
@@ -247,24 +465,28 @@ impl SequenceWorker {
                 }
                 info!("starting sequence with {} steps", steps.len());
                 self.abort = false;
-                self.state = Some(RunState {
-                    steps,
-                    group,
-                    scan_start,
-                    index: 0,
-                    paused: false,
-                    pause_requested: false,
-                    scan: ScanPhase::NotStarted,
-                    interrupt: None,
-                    restart: false,
-                    baseline: None,
-                    last_check: None,
-                    scan_active: Duration::ZERO,
-                    scan_since: None,
-                    scan_expected_s: 0.,
-                });
+                self.resume_on_connect = false;
+                if plan.is_none() {
+                    // Not saved: don't leave an older run to be picked up.
+                    self.clear_saved();
+                }
+                self.state = Some(RunState::new(steps, group, scan_start, plan));
                 self.emit(SequenceEvent::Started);
+                self.save();
             }
+            SequenceCommand::PauseAfterScan(on) => {
+                self.pause_after_scan = on;
+                self.save();
+            }
+            SequenceCommand::Detach => {
+                // Idle: nothing to save, the app may close at once.
+                if self.state.is_some() {
+                    self.detach = true;
+                } else {
+                    self.emit(SequenceEvent::Detached);
+                }
+            }
+            SequenceCommand::CancelDetach => self.detach = false,
             SequenceCommand::Pause => {
                 if let Some(state) = &mut self.state {
                     state.pause_requested = true;
@@ -283,6 +505,8 @@ impl SequenceWorker {
                         state.paused = false;
                         state.pause_requested = false;
                         state.interrupt = None;
+                        state.resume_after_restart = false;
+                        self.resume_on_connect = false;
                         // Whatever was changed meanwhile is accepted.
                         state.baseline = None;
                         self.emit(SequenceEvent::Resumed);
@@ -302,6 +526,13 @@ impl SequenceWorker {
                 }
             }
             SequenceCommand::StampDone => self.stamp_done = true,
+            SequenceCommand::SurveyTiles { group, tiles } => {
+                if let Some(state) = &mut self.state {
+                    state.survey_group = group;
+                    state.survey_tiles = tiles;
+                }
+                self.save();
+            }
             SequenceCommand::AdjustCoarse { entry, steps } => {
                 if let Some(state) = &mut self.state {
                     let from = state.index + 1;
@@ -372,6 +603,10 @@ impl SequenceWorker {
             self.drain_commands();
             if self.abort {
                 return Ok(Outcome::Aborted);
+            }
+            if self.detach {
+                // Restarts from the beginning after the hand-off.
+                return Ok(Outcome::Detach);
             }
             if self.pause_requested() {
                 return Ok(Outcome::Interrupted);
@@ -595,6 +830,9 @@ impl SequenceWorker {
             if self.abort {
                 return Ok(Outcome::Aborted);
             }
+            if self.detach {
+                return Ok(Outcome::Detach);
+            }
             if self.pause_requested() {
                 return Ok(Outcome::Interrupted);
             }
@@ -603,6 +841,9 @@ impl SequenceWorker {
             }
             let resp = conn.scan_wait_end_of_scan(Some(SCAN_POLL))?;
             if !resp.timed_out || !conn.scan_status_get()?.running {
+                if let Some(state) = &mut self.state {
+                    state.scanned = true;
+                }
                 return Ok(Outcome::Completed);
             }
         }
@@ -630,6 +871,9 @@ impl SequenceWorker {
                 state.scan_expected_s = expected;
             }
             if k + 1 == starts {
+                // The scan that is kept: if the app closes now, the next
+                // start finds it running.
+                self.save();
                 break;
             }
             debug!("scan start {} of {starts}", k + 1);
@@ -640,11 +884,12 @@ impl SequenceWorker {
                     self.set_scan_phase(ScanPhase::NotStarted);
                     return Ok(Some(Outcome::Aborted));
                 }
-                Outcome::Interrupted => {
-                    // Paused before the kept start: start over on resume.
+                o @ (Outcome::Interrupted | Outcome::Detach) => {
+                    // Paused (or handed off) before the kept start: start
+                    // over on resume.
                     conn.scan_action(ActionType::Stop, dir)?;
                     self.set_scan_phase(ScanPhase::NotStarted);
-                    return Ok(Some(Outcome::Interrupted));
+                    return Ok(Some(o));
                 }
                 other => return Ok(Some(other)),
             }
@@ -693,6 +938,9 @@ impl SequenceWorker {
         if self.state.as_ref().is_some_and(|s| s.scan_complete()) {
             info!("scan had finished while the sequence was held; continuing");
             self.set_scan_phase(ScanPhase::NotStarted);
+            if let Some(state) = &mut self.state {
+                state.scanned = true;
+            }
             return Ok(Some(Outcome::Completed));
         }
         info!("scan was stopped while the sequence was held; scanning it again");
@@ -743,6 +991,10 @@ impl SequenceWorker {
                 self.set_scan_phase(ScanPhase::NotStarted);
                 return Ok(Outcome::Aborted);
             }
+            if self.detach {
+                // The scan keeps running; the restarted app waits for it.
+                return Ok(Outcome::Detach);
+            }
             if self.pause_requested() {
                 conn.scan_action(ActionType::Pause, dir)?;
                 self.set_scan_phase(ScanPhase::Paused(dir));
@@ -765,6 +1017,9 @@ impl SequenceWorker {
             }
             if adopted || self.state.as_ref().is_some_and(|s| s.scan_complete()) {
                 self.set_scan_phase(ScanPhase::NotStarted);
+                if let Some(state) = &mut self.state {
+                    state.scanned = true;
+                }
                 self.emit(SequenceEvent::ScanDone { file_path: resp.file_path });
                 return Ok(Outcome::Completed);
             }
@@ -811,6 +1066,7 @@ impl SequenceWorker {
     fn finish_aborted(&mut self) {
         info!("sequence aborted");
         self.state = None;
+        self.clear_saved();
         self.abort = false;
         self.emit(SequenceEvent::Aborted);
     }
@@ -841,6 +1097,18 @@ impl Worker for SequenceWorker {
     }
 
     fn init(&mut self, _conn: &mut NanonisTcp) -> eyre::Result<()> {
+        // Handed off for a rebuild while running: carry on where it was.
+        if std::mem::take(&mut self.resume_on_connect) {
+            if let Some(state) = &mut self.state {
+                info!("continuing the sequence after the restart");
+                state.paused = false;
+                state.resume_after_restart = false;
+                state.baseline = None;
+                self.emit(SequenceEvent::Resumed);
+                self.save();
+                return Ok(());
+            }
+        }
         // After a (re)connect, never continue blindly: hold a running sequence.
         if let Some(state) = &mut self.state {
             if !state.paused {
@@ -870,12 +1138,20 @@ impl Worker for SequenceWorker {
             self.drain_commands();
             if self.abort {
                 self.abort_with_conn(conn);
+            } else if self.detach {
+                self.detach_now();
+            } else {
+                self.save();
             }
             return Ok(());
         }
         self.drain_commands();
         if self.abort {
             self.abort_with_conn(conn);
+            return Ok(());
+        }
+        if self.detach {
+            self.detach_now();
             return Ok(());
         }
 
@@ -904,6 +1180,10 @@ impl Worker for SequenceWorker {
             None => {
                 self.emit(SequenceEvent::StepStarted { index });
                 debug!("sequence step {index}: {step}");
+                if let Some(state) = &mut self.state {
+                    state.step_started = true;
+                }
+                self.save();
                 self.execute(conn, step.clone(), group)
             }
         };
@@ -935,13 +1215,31 @@ impl Worker for SequenceWorker {
             Ok(Outcome::Completed) => {
                 let state = self.state.as_mut().unwrap();
                 state.index += 1;
+                state.step_started = false;
+                // "Pause after scan": once the scan is done and stamped
+                // (never between a scan and its stamp).
+                let next_is_stamp = matches!(state.steps.get(state.index), Some((_, Step::Stamp)));
+                // A warm-up scan is followed by its entry's real scan: wait for that.
+                let entry_done = state.index.checked_sub(1).and_then(|i| state.steps.get(i)).map(|(e, _)| *e);
+                let warm_up = matches!(state.steps.get(state.index), Some((e, Step::Scan(_))) if Some(*e) == entry_done);
+                let after_scan = self.pause_after_scan && state.scanned && !next_is_stamp && !warm_up;
+                if !next_is_stamp {
+                    // Only the scan just finished counts, not an older one.
+                    state.scanned = false;
+                }
                 if state.index >= state.steps.len() {
                     info!("sequence finished");
                     self.state = None;
+                    self.clear_saved();
                     self.emit(SequenceEvent::Finished);
-                } else if state.pause_requested {
+                } else if state.pause_requested || after_scan {
                     state.paused = true;
                     let index = state.index;
+                    if after_scan {
+                        info!("pausing after the scan, as asked");
+                        self.pause_after_scan = false;
+                        self.emit(SequenceEvent::PauseAfterScan(false));
+                    }
                     self.emit(SequenceEvent::Paused { index });
                 }
             }
@@ -950,6 +1248,7 @@ impl Worker for SequenceWorker {
                 state.paused = true;
                 self.emit(SequenceEvent::Paused { index });
             }
+            Ok(Outcome::Detach) => self.detach_now(),
             Ok(Outcome::Aborted) => self.finish_aborted(),
             Err(e @ NanonisTcpError::Io(_)) => {
                 // Leave the step un-advanced; init() pauses on reconnect.
@@ -966,6 +1265,7 @@ impl Worker for SequenceWorker {
                 self.emit(SequenceEvent::Paused { index });
             }
         }
+        self.save();
         Ok(())
     }
 }
@@ -998,6 +1298,34 @@ fn speed_args(speed: Speed, width: f64, ratio: f64) -> Option<commands::scan::Sp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_round_trips() {
+        use crate::connection::nanonis::sequence::model::CURRENT_SCAN;
+        let steps = vec![
+            (CURRENT_SCAN, Step::AwaitScan { dir: Dir::Down, include: true }),
+            (0, Step::CoarseMove { steps: [3, -2] }),
+            (0, Step::Scan(Dir::Up)),
+            (0, Step::Stamp),
+        ];
+        let mut s = RunState::new(steps.clone(), 1, ScanStart::default(), Some(Sequence::default()));
+        s.index = 2;
+        s.scan = ScanPhase::Running(ScanDir::Up);
+        s.scan_active = Duration::from_secs(5);
+        s.scan_expected_s = 100.;
+        s.resume_after_restart = true;
+        let json = serde_json::to_string(&s.checkpoint(true).unwrap()).unwrap();
+        let c: Checkpoint = serde_json::from_str(&json).unwrap();
+        assert!(c.pause_after_scan && c.resume_after_restart);
+        let r = RunState::from_checkpoint(c);
+        assert_eq!(r.steps, steps);
+        assert_eq!(r.index, 2);
+        assert!(r.paused);
+        assert_eq!(r.scan, ScanPhase::Running(ScanDir::Up));
+        assert!(r.scan_active >= Duration::from_secs(5));
+        // Not saved without a plan (calibration runs).
+        assert!(RunState::new(steps, 1, ScanStart::default(), None).checkpoint(false).is_none());
+    }
 
     #[test]
     fn speed_args_are_consistent() {

@@ -296,7 +296,11 @@ pub fn decide(res: &Result<Analysis, RingError>, scale: f64, params: &RingParams
             return Verdict::Unsure(UnsureReason::OnlyLocalFeatures);
         }
     }
-    if a.features.is_empty() {
+    // Arm end caps take up most of the edges at an arm end. When the ring
+    // fit still holds more edges than everything peeled off, the peeled
+    // features were blobs or texture and the ring direction stands.
+    let peeled: usize = a.features.iter().map(|f| f.n_edges).sum();
+    if peeled < a.edges.len() {
         return Verdict::Arc { dir: a.est.direction };
     }
     if a.est.direction.x == 0. {

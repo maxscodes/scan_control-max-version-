@@ -1,7 +1,8 @@
 mod channel_state;
 mod coarse_cal;
+mod coarse_learn;
 mod command_channel;
-mod course_motion;
+pub mod course_motion;
 mod fine_motion;
 mod lithography;
 mod pair_view;
@@ -10,6 +11,7 @@ mod scan_control;
 mod scan_status;
 mod sequence;
 mod stamp_names;
+pub mod tip_check;
 mod spectroscopy;
 mod worker;
 
@@ -79,6 +81,7 @@ pub struct NanonisConnection {
     spectroscopy: SpectroscopyState,
     lithography: LithographyState,
     ring_assist: RingAssistState,
+    tip_check: tip_check::TipCheckState,
     pending_stamp: Option<PendingStamp>,
     /// Lines up survey tiles when a survey ends.
     aligner: crate::analysis::mosaic::Aligner,
@@ -148,10 +151,13 @@ impl Connection for NanonisConnection {
             fine_lock,
         );
         self.ring_assist.update(scan_area, got_forward, &gds);
+        self.tip_check.update(scan_area, got_forward);
         self.update_scan_status(scan_area);
         self.update_tip_pos(scan_area);
         self.update_base_name(scan_area);
         let stamps = scan_area.stamp.drain(..).collect_vec();
+        let coarse_now = (scan_area.coarse_log.last_move(), scan_area.world_transform);
+        let piezo_frame = scan_area.image_transform;
         let stamp_channel = scan_area.channel_selected.clone();
         let time = time::UtcDateTime::now();
         let time = time::PrimitiveDateTime::new(time.date(), time.time());
@@ -186,6 +192,11 @@ impl Connection for NanonisConnection {
             // Remember where the GDS was, to warn if it is moved later.
             stamp.gds_ref = crate::analysis::gds_prior::predict_any(&gds, stamp.transform)
                 .map(|(gi, _)| (gds[gi].uuid, gds[gi].transform));
+            // And where the stamp was put, to learn the coarse calibration
+            // from how far the user drags it.
+            stamp.coarse_ref =
+                Some(crate::analysis::coarse_fit::CoarseRef::new(coarse_now.0, coarse_now.1, stamp.transform));
+            self.tip_check.queue_stamp(&stamp, piezo_frame);
             'try_again: loop {
                 for obj in object_list.iter() {
                     let name = obj.name();
@@ -223,6 +234,7 @@ impl Connection for NanonisConnection {
             );
         }
         self.name_stamps(object_list);
+        self.tip_check.poll_stamps(object_list);
         // Put survey tiles in their survey's layer group (once their stamp
         // is on the list).
         let mut waiting = Vec::new();
@@ -237,6 +249,30 @@ impl Connection for NanonisConnection {
             }
         }
         self.sequence.keep_tile_groups(waiting);
+        // Undone (or redone) automatic placements of grid tiles: move the
+        // stamp, and the record of where it was put with it, so learning
+        // from drags doesn't take it for a drag. The latest tile carries
+        // the tip (scan area).
+        for m in self.sequence.take_stamp_moves() {
+            for o in object_list.iter_mut() {
+                if let Object::ScanImage { image, .. } = &mut **o {
+                    if image.uuid() == m.id {
+                        image.transform.translation += m.delta;
+                        if let Some(c) = &mut image.coarse_ref {
+                            for a in [&mut c.stamp_at, &mut c.world_at] {
+                                a[4] += m.delta.x;
+                                a[5] += m.delta.y;
+                            }
+                        }
+                    }
+                }
+            }
+            if m.latest {
+                if let Some(area) = object_list.iter_mut().find_map(|e| e.as_scan_area_mut()) {
+                    area.world_transform.translation += m.delta;
+                }
+            }
+        }
         // A tracked grid: tiles dragged on the map are where the tip really
         // was; the latest one carries the tip (scan area) with it.
         let ids = self.sequence.grid_tile_ids();
@@ -247,7 +283,9 @@ impl Connection for NanonisConnection {
                 .map(|o| (o.uuid(), o.transform_center()))
                 .collect();
             if let Some(delta) = self.sequence.grid_sync(|id| pos.get(&id).copied()) {
-                if delta != glam::DVec2::ZERO {
+                // Learning from drags already moves the scan area with the
+                // latest stamp: don't move it twice.
+                if delta != glam::DVec2::ZERO && !self.course_menu.follows_latest_stamp() {
                     if let Some(area) = object_list.iter_mut().find_map(|e| e.as_scan_area_mut()) {
                         area.world_transform.translation += delta;
                     }
@@ -259,13 +297,18 @@ impl Connection for NanonisConnection {
         }
         // Line up the tiles of a survey that just ended.
         if let Some(ids) = self.sequence.take_finished_survey() {
-            if self.aligner.start(object_list, &ids) {
+            if self.aligner.start(object_list, &ids, true) {
                 self.sequence.set_status(format!("Lining up {} survey tiles\u{2026}", ids.len()));
             }
         }
         if let Some(summary) = self.aligner.poll(object_list) {
             self.sequence.set_status(summary);
         }
+        if self.sequence.take_lineup_undo_request() {
+            let n = self.aligner.undo(object_list);
+            self.sequence.set_status(format!("Line-up undone: {n} tiles put back"));
+        }
+        self.sequence.set_lineup_undo_available(self.aligner.can_undo());
     }
     fn show_menu(
         &mut self,
@@ -357,6 +400,7 @@ impl Connection for NanonisConnection {
         (self.course_menu.cal_progress, self.course_menu.cal_measuring) = self.sequence.calibration_progress();
         self.course_menu.cal_can_restore = self.sequence.can_restore_calibration_frame();
         self.course_menu.line_times = line_times;
+        self.course_menu.learn_sync(ui, object_list);
         self.course_menu.show_menu(ui, object_list, locked);
         // Auto calibration runs as a sequence; its result goes back to the menu.
         if let Some(mut plan) = self.course_menu.take_calibration_request() {
@@ -371,7 +415,7 @@ impl Connection for NanonisConnection {
                 .filter(|_| rb.lines > 0 && rb.pixels > 0)
                 .map(|f| ([f.width, f.height], [rb.pixels, rb.lines]));
             plan.restore_line_time_s = Some(rb.fwd_line_time as f64).filter(|&t| t > 0.);
-            let old = self.course_menu.calibration();
+            let old = self.course_menu.baseline();
             self.sequence.start_calibration(plan, self.course_menu.group_index(), old);
         }
         if self.course_menu.take_restore_request() {
@@ -391,6 +435,7 @@ impl Connection for NanonisConnection {
             .show_menu(ui, object_list, encoder, sequence.or(spectroscopy).or(scanning).or(fine));
         self.ring_assist
             .show_menu(ui, object_list, &mut self.course_menu, locked_by);
+        self.tip_check.show_menu(ui);
     }
     fn status(&self) -> StatusInfo {
         let status = *self.scan_status.peek();
@@ -415,6 +460,7 @@ impl Connection for NanonisConnection {
     ) {
         self.course_menu.show_overlay(ui, object_list);
         self.ring_assist.show_label_overlay(ui, object_list);
+        self.tip_check.show_overlay(ui, object_list);
         if let Some(scan_area) = object_list
             .iter_mut()
             .find_map(|entry| entry.as_scan_area_mut())
@@ -442,6 +488,7 @@ impl NanonisConnection {
             theme::tool_button(&mut c[1], self.spectroscopy.open_mut(), "Spectroscopy", "I(V) spectroscopy series at stepped Z");
             theme::tool_button(&mut c[0], self.lithography.open_mut(), "Lithography", "Write a GDS pattern with the tip");
             theme::tool_button(&mut c[1], self.ring_assist.open_mut(), "Ring Assist", "Find the ring centre in Z scans and suggest moves");
+            theme::tool_button(&mut c[0], self.tip_check.open_mut(), "Tip Check", "Judge tip quality (multi-tip ghosts, tip changes) and label archive scans");
         });
         if coarse != self.course_menu.menu_open() {
             self.course_menu.set_open(coarse);
@@ -516,12 +563,13 @@ impl NanonisConnection {
         let tip_pos = SharedState::new_default();
         let readback = SharedState::new_default();
         let course_voltages = SharedState::new_default();
+        let course_freqs = SharedState::new_default();
         let (frame_queue_tx, frame_queue_rx) = overwrite_queue(2);
         let slow_status_init = Arc::new(AtomicBool::new(false));
         let fast_status_init = Arc::new(AtomicBool::new(false));
         let (move_sender, move_receiver) = command_channel::command_channel();
 
-        let course_menu = CourseMotionState::new(&course_voltages, &move_sender);
+        let course_menu = CourseMotionState::new(&course_voltages, &course_freqs, &move_sender);
         let (scan_sender, scan_receiver) = command_channel::command_channel();
         let scan_control = ScanControlState::new(&scan_sender);
         let (seq_cmd_tx, seq_cmd_rx) = crossbeam::channel::unbounded();
@@ -556,6 +604,7 @@ impl NanonisConnection {
             &base_name,
             &session_path,
             &course_voltages,
+            &course_freqs,
             &move_receiver,
             &scan_receiver,
             &readback,
@@ -587,6 +636,7 @@ impl NanonisConnection {
             spectroscopy,
             lithography,
             ring_assist: RingAssistState::new(),
+            tip_check: tip_check::TipCheckState::new(),
             pending_stamp: None,
             aligner: Default::default(),
             fast_status_init,
@@ -646,6 +696,13 @@ impl NanonisConnection {
             match action {
                 SequenceAction::CoarseMoved(steps) => {
                     self.course_menu.apply_completed_move(scan_area, steps);
+                    // A tracked survey grid places the tip with what it has
+                    // learned so far (only the tiles still to come move).
+                    let calib = self.course_menu.calibration();
+                    if let Some(extra) = self.sequence.grid_moved(steps, &calib) {
+                        let d = scan_area.world_transform.matrix2 * extra;
+                        scan_area.world_transform.translation += d;
+                    }
                 }
                 SequenceAction::SpecStarted(base) => self.spectroscopy.sequence_series_started(&base),
                 SequenceAction::SpecCurve(curve) => self.spectroscopy.sequence_curve(curve),

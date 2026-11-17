@@ -488,7 +488,11 @@ impl SpectroscopyState {
                             // Full strength: no fading, same colour everywhere.
                             .label_spacing(1.0..=2.0)])
                         .x_grid_spacer(move |input| bias_grid(input, data_w))
-                        .y_axis_label(y_label)
+                        // Full-strength y numbers too: shown or hidden,
+                        // never faded.
+                        .custom_y_axes(vec![AxisHints::new_y()
+                            .label(y_label)
+                            .label_spacing(20.0..=21.0)])
                         .link_axis("iv bias axis", [true, false]);
                     let shown = plot.show(ui, |plot_ui| {
                         let mut curves: Vec<&IvCurve> = self.curves.iter().collect();
@@ -551,7 +555,7 @@ impl SpectroscopyState {
 }
 
 /// Plot line width in points.
-const LINE_WIDTH: f32 = 2.5;
+const LINE_WIDTH: f32 = 3.5;
 
 /// Smallest 1-2-5 step at least `min`.
 fn nice_step(min: f64) -> f64 {

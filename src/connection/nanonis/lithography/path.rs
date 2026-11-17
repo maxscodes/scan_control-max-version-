@@ -60,16 +60,18 @@ impl PathMode {
                  shorten inactive travel (nearest neighbour + 2-opt)."
             }
             PathMode::Boundary => {
-                "Writes the perimeter of each polygon fully inside the frame, one \
-                 polygon at a time. Polygons crossing the frame edge are ignored."
+                "Writes the perimeter of each polygon fully inside the frame (and inside \
+                 the drawn shapes, if any), one polygon at a time. Polygons crossing \
+                 the edge are ignored."
             }
             PathMode::Comb => {
                 "Each row is written left→right only, then returned right→left \
                  (inactive) across that row's active extent. Requires the bias/current ramp."
             }
             PathMode::CombFrame => {
-                "Every row traverses the full frame width left→right (only polygon \
-                 intervals active) and back. Requires the bias/current ramp."
+                "Every row traverses the full width of the area (the drawn shapes, \
+                 or the frame without them) left→right, only polygon intervals \
+                 active, and back. Requires the bias/current ramp."
             }
         }
     }
@@ -148,11 +150,13 @@ pub fn edge_clearance(pitch_nm: f64) -> f64 {
 }
 
 /// Plan a path for `mode` over `polygons` (frame-local nm) in a frame of
-/// `size` nm. Points are clamped inside the frame (minus the edge clearance)
-/// for every mode except the full-frame comb.
+/// `size` nm. A non-empty `mask` limits writing (and the full-frame comb's
+/// rows) to the area inside it. Points are clamped inside the frame (minus
+/// the edge clearance) for every mode except the full-frame comb.
 pub fn plan(
     mode: PathMode,
     polygons: &[Polygon],
+    mask: &[Polygon],
     size: DVec2,
     pitch_nm: f64,
 ) -> Result<Vec<Segment>, String> {
@@ -177,11 +181,11 @@ pub fn plan(
         ));
     }
     let mut path = match mode {
-        PathMode::PatchLocal => local_raster(polygons, inner.x, inner.y, pitch_nm)?,
-        PathMode::Shortest => shortest_path(polygons, inner.x, inner.y, pitch_nm)?,
-        PathMode::Boundary => boundary_path(polygons, inner.x, inner.y)?,
-        PathMode::Comb => comb_raster(polygons, inner.x, inner.y, pitch_nm)?,
-        PathMode::CombFrame => comb_frame_raster(polygons, inner.x, inner.y, pitch_nm)?,
+        PathMode::PatchLocal => local_raster(polygons, mask, inner.x, inner.y, pitch_nm)?,
+        PathMode::Shortest => shortest_path(polygons, mask, inner.x, inner.y, pitch_nm)?,
+        PathMode::Boundary => boundary_path(polygons, mask, inner.x, inner.y)?,
+        PathMode::Comb => comb_raster(polygons, mask, inner.x, inner.y, pitch_nm)?,
+        PathMode::CombFrame => comb_frame_raster(polygons, mask, inner.x, inner.y, pitch_nm)?,
     };
     if mode.uses_edge_clearance() {
         let half = (size / 2. - DVec2::splat(clearance)).max(DVec2::ZERO);
@@ -229,9 +233,14 @@ fn scan_events(poly: &[DVec2], y: f64, out: &mut Vec<f64>) {
 
 type Rows = Vec<(f64, Vec<(f64, f64)>)>;
 
-/// Active scanline intervals inside the frame, bottom row first. Empty rows
-/// are omitted; intervals are clipped to the frame.
-fn raster_intervals(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -> Rows {
+/// Whether `p` is inside the mask (an empty mask covers everything).
+fn in_mask(p: DVec2, mask: &[Polygon]) -> bool {
+    mask.is_empty() || inside_any(p, mask)
+}
+
+/// Active scanline intervals inside the frame (and the mask), bottom row
+/// first. Empty rows are omitted; intervals are clipped to the frame.
+fn raster_intervals(polygons: &[Polygon], mask: &[Polygon], width: f64, height: f64, pitch: f64) -> Rows {
     let (xmin, xmax) = (-width / 2., width / 2.);
     let (ymin, ymax) = (-height / 2., height / 2.);
     let mut rows = Vec::new();
@@ -240,7 +249,7 @@ fn raster_intervals(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -
     while y <= ymax + pitch * 0.5 {
         events.clear();
         events.extend([xmin, xmax]);
-        for poly in polygons {
+        for poly in polygons.iter().chain(mask) {
             scan_events(poly, y, &mut events);
         }
         events.sort_by(f64::total_cmp);
@@ -253,7 +262,8 @@ fn raster_intervals(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -
         let mut intervals = Vec::new();
         for w in xs.windows(2) {
             let (left, right) = (w[0], w[1]);
-            if right - left <= EPS || !inside_any(DVec2::new((left + right) / 2., y), polygons) {
+            let mid = DVec2::new((left + right) / 2., y);
+            if right - left <= EPS || !inside_any(mid, polygons) || !in_mask(mid, mask) {
                 continue;
             }
             // Clip before accepting, so polygons outside the frame don't
@@ -314,8 +324,8 @@ pub fn append_strokes(path: &mut Vec<Segment>, strokes: &[Polygon]) {
 
 /// Row-extent comb: each row from its leftmost to its rightmost active
 /// extent, written L→R, returned R→L; rows joined at their left extents.
-fn comb_raster(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -> Result<Vec<Segment>, String> {
-    let rows = raster_intervals(polygons, width, height, pitch);
+fn comb_raster(polygons: &[Polygon], mask: &[Polygon], width: f64, height: f64, pitch: f64) -> Result<Vec<Segment>, String> {
+    let rows = raster_intervals(polygons, mask, width, height, pitch);
     if rows.is_empty() {
         return Err(no_geometry());
     }
@@ -357,18 +367,25 @@ fn comb_raster(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -> Res
 }
 
 /// Full-frame comb: every non-empty row xmin→xmax (polygon intervals
-/// active) then xmax→xmin inactive; rows joined at xmin.
+/// active) then xmax→xmin inactive; rows joined at xmin. With a mask, xmin
+/// and xmax are the mask's extent (within the frame) instead of the frame's.
 fn comb_frame_raster(
     polygons: &[Polygon],
+    mask: &[Polygon],
     width: f64,
     height: f64,
     pitch: f64,
 ) -> Result<Vec<Segment>, String> {
-    let rows = raster_intervals(polygons, width, height, pitch);
+    let rows = raster_intervals(polygons, mask, width, height, pitch);
     if rows.is_empty() {
         return Err(no_geometry());
     }
-    let (xmin, xmax) = (-width / 2., width / 2.);
+    let (mut xmin, mut xmax) = (-width / 2., width / 2.);
+    if !mask.is_empty() {
+        let xs = mask.iter().flatten().map(|p| p.x);
+        xmin = xs.clone().fold(f64::INFINITY, f64::min).max(xmin);
+        xmax = xs.fold(f64::NEG_INFINITY, f64::max).min(xmax);
+    }
     let mut path = Vec::new();
     let mut prev_y: Option<f64> = None;
     for (ri, (y, intervals)) in rows.iter().enumerate() {
@@ -402,11 +419,17 @@ fn comb_frame_raster(
     Ok(path)
 }
 
-/// Perimeters of the polygons completely inside the frame, one at a time.
-fn boundary_path(polygons: &[Polygon], width: f64, height: f64) -> Result<Vec<Segment>, String> {
+/// Perimeters of the polygons completely inside the frame (and the mask,
+/// judged by their vertices), one at a time.
+fn boundary_path(polygons: &[Polygon], mask: &[Polygon], width: f64, height: f64) -> Result<Vec<Segment>, String> {
     let half = DVec2::new(width / 2., height / 2.);
     let enclosed = polygons.iter().filter(|poly| {
-        poly.len() >= 3 && poly.iter().all(|p| p.x >= -half.x && p.x <= half.x && p.y >= -half.y && p.y <= half.y)
+        // A mask polygon is trivially inside the mask (its vertices sit on
+        // the mask edge, where the point test is ambiguous).
+        let masked = mask.contains(poly) || poly.iter().all(|&p| in_mask(p, mask));
+        poly.len() >= 3
+            && masked
+            && poly.iter().all(|p| p.x >= -half.x && p.x <= half.x && p.y >= -half.y && p.y <= half.y)
     });
     let mut path = Vec::new();
     let mut found = false;
@@ -434,7 +457,7 @@ fn boundary_path(polygons: &[Polygon], width: f64, height: f64) -> Result<Vec<Se
         prev_end = path.last().map(|s| s.end);
     }
     if !found {
-        return Err("No complete GDS polygon lies inside the lithography scan frame".into());
+        return Err("No complete polygon lies inside the lithography scan frame and drawn shapes".into());
     }
     if path.is_empty() {
         return Err("No non-degenerate polygon boundary lies inside the lithography scan frame".into());
@@ -445,8 +468,8 @@ fn boundary_path(polygons: &[Polygon], width: f64, height: f64) -> Result<Vec<Se
 /// Row-bundled patch raster: serpentine over all rows; consecutive rows of
 /// the same connected patch turn actively at its edge, otherwise the tip
 /// travels (same-row connector or patch jump).
-fn local_raster(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -> Result<Vec<Segment>, String> {
-    let rows = raster_intervals(polygons, width, height, pitch);
+fn local_raster(polygons: &[Polygon], mask: &[Polygon], width: f64, height: f64, pitch: f64) -> Result<Vec<Segment>, String> {
+    let rows = raster_intervals(polygons, mask, width, height, pitch);
     if rows.is_empty() {
         return Err(no_geometry());
     }
@@ -613,8 +636,8 @@ fn orient(ends: &Ends, order: &[usize]) -> Vec<usize> {
 
 /// Patch-local rasters with the patch order and direction chosen to shorten
 /// travel: nearest-neighbour start, bounded open-route 2-opt.
-fn shortest_path(polygons: &[Polygon], width: f64, height: f64, pitch: f64) -> Result<Vec<Segment>, String> {
-    let base = local_raster(polygons, width, height, pitch)?;
+fn shortest_path(polygons: &[Polygon], mask: &[Polygon], width: f64, height: f64, pitch: f64) -> Result<Vec<Segment>, String> {
+    let base = local_raster(polygons, mask, width, height, pitch)?;
     let components = split_components(&base);
     if components.len() < 2 {
         return Ok(base);
@@ -748,7 +771,7 @@ mod tests {
 
     #[test]
     fn comb_active_segments_are_left_to_right() {
-        let path = comb_raster(&three(), 20., 12., 2.).unwrap();
+        let path = comb_raster(&three(), &[], 20., 12., 2.).unwrap();
         let active: Vec<_> = path.iter().filter(|s| s.active).collect();
         assert!(!active.is_empty());
         assert!(active.iter().all(|s| s.start.x < s.end.x && s.kind == SegKind::CombLitho));
@@ -756,7 +779,7 @@ mod tests {
 
     #[test]
     fn comb_rows_start_and_return_at_active_extents() {
-        let path = comb_raster(&three(), 20., 12., 2.).unwrap();
+        let path = comb_raster(&three(), &[], 20., 12., 2.).unwrap();
         let rows: std::collections::BTreeSet<_> = path.iter().filter_map(|s| s.row).collect();
         for r in rows {
             let items: Vec<_> = path.iter().filter(|s| s.row == Some(r)).collect();
@@ -773,7 +796,7 @@ mod tests {
 
     #[test]
     fn comb_returns_inactive_and_steps_at_left_extents() {
-        let path = comb_raster(&three(), 20., 12., 2.).unwrap();
+        let path = comb_raster(&three(), &[], 20., 12., 2.).unwrap();
         let returns: Vec<_> = path.iter().filter(|s| s.kind == SegKind::CombReturn).collect();
         assert!(returns.len() >= 2);
         assert!(returns.iter().all(|s| !s.active && s.start.x > s.end.x && s.start.y == s.end.y));
@@ -797,7 +820,7 @@ mod tests {
 
     #[test]
     fn comb_uses_full_frame_only_when_geometry_reaches_it() {
-        let path = comb_raster(&[rect(-10., -5., 10., 0.)], 20., 12., 2.).unwrap();
+        let path = comb_raster(&[rect(-10., -5., 10., 0.)], &[], 20., 12., 2.).unwrap();
         let returns: Vec<_> = path.iter().filter(|s| s.kind == SegKind::CombReturn).collect();
         assert!(returns.iter().any(|s| s.start.x == 10.));
         assert!(returns.iter().any(|s| s.end.x == -10.));
@@ -807,7 +830,7 @@ mod tests {
 
     #[test]
     fn full_frame_comb_rows_span_exact_frame() {
-        let path = comb_frame_raster(&three(), 20., 12., 2.).unwrap();
+        let path = comb_frame_raster(&three(), &[], 20., 12., 2.).unwrap();
         let rows: std::collections::BTreeSet<_> = path.iter().filter_map(|s| s.row).collect();
         for &r in &rows {
             let items: Vec<_> = path.iter().filter(|s| s.row == Some(r)).collect();
@@ -834,19 +857,19 @@ mod tests {
 
     #[test]
     fn local_raster_single_patch_is_continuous() {
-        let path = local_raster(&[rect(-5., -5., 5., 5.)], 20., 20., 0.77).unwrap();
+        let path = local_raster(&[rect(-5., -5., 5., 5.)], &[], 20., 20., 0.77).unwrap();
         assert!(!path.is_empty() && continuous(&path));
     }
 
     #[test]
     fn outside_polygons_give_no_rows() {
         let polys = [rect(-20., -5., -12., 5.), rect(12., -5., 20., 5.)];
-        assert!(raster_intervals(&polys, 20., 20., 0.77).is_empty());
+        assert!(raster_intervals(&polys, &[], 20., 20., 0.77).is_empty());
     }
 
     #[test]
     fn local_raster_split_patches_jump_once() {
-        let path = local_raster(&[rect(-3., -5., 3., -2.), rect(-3., 2., 3., 5.)], 20., 20., 0.77).unwrap();
+        let path = local_raster(&[rect(-3., -5., 3., -2.), rect(-3., 2., 3., 5.)], &[], 20., 20., 0.77).unwrap();
         let jumps = path.iter().filter(|s| s.kind == SegKind::PatchJump).count();
         assert_eq!(jumps, 1);
         assert!(path.iter().all(|s| s.active || s.kind == SegKind::PatchJump));
@@ -854,7 +877,7 @@ mod tests {
 
     #[test]
     fn local_raster_side_by_side_uses_same_row_connectors() {
-        let path = local_raster(&[rect(-9., -4., -3., 0.), rect(3., -4., 9., 0.)], 20., 20., 0.77).unwrap();
+        let path = local_raster(&[rect(-9., -4., -3., 0.), rect(3., -4., 9., 0.)], &[], 20., 20., 0.77).unwrap();
         assert!(path.iter().filter(|s| s.kind == SegKind::SameYConnector).count() >= 2);
         assert!(!path.iter().any(|s| s.kind == SegKind::PatchJump));
     }
@@ -867,9 +890,9 @@ mod tests {
             rect(-8., -9., -5., -5.),
             rect(3., -9., 9., 7.),
         ];
-        let local = local_raster(&polys, 20., 20., 0.77).unwrap();
+        let local = local_raster(&polys, &[], 20., 20., 0.77).unwrap();
         assert!(local.iter().filter(|s| !s.active && s.kind == SegKind::SameYConnector).count() >= 2);
-        let path = shortest_path(&polys, 20., 20., 0.77).unwrap();
+        let path = shortest_path(&polys, &[], 20., 20., 0.77).unwrap();
         assert!(continuous(&path));
         assert!(path.iter().any(|s| s.kind == SegKind::PathfinderJump));
         // Reordering only changes travel, never the written length.
@@ -883,15 +906,15 @@ mod tests {
     fn boundary_writes_enclosed_polygons_only() {
         let a = rect(-10., -10., 0., 0.);
         let b = rect(10., 10., 20., 20.);
-        let path = boundary_path(&[a.clone(), b], 40., 40.).unwrap();
+        let path = boundary_path(&[a.clone(), b], &[], 40., 40.).unwrap();
         assert_eq!(path.iter().filter(|s| s.active).count(), 8);
         assert_eq!(path.iter().filter(|s| s.kind == SegKind::PolygonJump).count(), 1);
 
         let complete = rect(-5., -5., 5., 5.);
         let partial = vec![DVec2::new(-30., 0.), DVec2::new(0., 0.), DVec2::new(0., 1.)];
-        let path = boundary_path(&[complete, partial.clone()], 40., 40.).unwrap();
+        let path = boundary_path(&[complete, partial.clone()], &[], 40., 40.).unwrap();
         assert_eq!(path.iter().filter(|s| s.active).count(), 4);
-        assert!(boundary_path(&[partial], 40., 40.).is_err());
+        assert!(boundary_path(&[partial], &[], 40., 40.).is_err());
     }
 
     #[test]
@@ -899,17 +922,41 @@ mod tests {
         let polys = [rect(-50., -50., 50., 50.)];
         let size = DVec2::new(20., 20.);
         let half = 10. - edge_clearance(1.);
-        let p = plan(PathMode::PatchLocal, &polys, size, 1.).unwrap();
+        let p = plan(PathMode::PatchLocal, &polys, &[], size, 1.).unwrap();
         assert!(p.iter().all(|s| s.start.abs().max_element() <= half + 1e-12));
-        let f = plan(PathMode::CombFrame, &polys, size, 1.).unwrap();
+        let f = plan(PathMode::CombFrame, &polys, &[], size, 1.).unwrap();
         assert!(f.iter().any(|s| s.start.x == -10.));
-        assert!(plan(PathMode::Comb, &polys, size, 0.).is_err());
-        assert!(plan(PathMode::Comb, &polys, DVec2::new(0.5, 0.5), 1.).is_err());
+        assert!(plan(PathMode::Comb, &polys, &[], size, 0.).is_err());
+        assert!(plan(PathMode::Comb, &polys, &[], DVec2::new(0.5, 0.5), 1.).is_err());
+    }
+
+    #[test]
+    fn mask_limits_writing_to_its_area() {
+        // A GDS covering the whole frame, masked by a small drawn square.
+        let gds = [rect(-50., -50., 50., 50.)];
+        let mask = [rect(-3., -3., 3., 3.)];
+        // Boundary only writes whole polygons, and the GDS one leaves the mask.
+        assert!(plan(PathMode::Boundary, &gds, &mask, DVec2::new(20., 20.), 1.).is_err());
+        // A shape alone is its own mask: its perimeter is written.
+        assert!(plan(PathMode::Boundary, &mask, &mask, DVec2::new(20., 20.), 1.).is_ok());
+        for mode in PathMode::ALL.into_iter().filter(|&m| m != PathMode::Boundary) {
+            let path = plan(mode, &gds, &mask, DVec2::new(20., 20.), 1.).unwrap();
+            assert!(!path.is_empty(), "{mode:?}");
+            for s in &path {
+                for p in [s.start, s.end] {
+                    assert!(p.x.abs() <= 3. + 1e-9 && p.y.abs() <= 3. + 1e-9, "{mode:?} leaves the mask: {p}");
+                }
+            }
+        }
+        // The mask clips the GDS: a GDS rectangle half outside it is cut.
+        let rows = raster_intervals(&[rect(0., -5., 8., 5.)], &mask, 20., 20., 1.);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().flat_map(|r| &r.1).all(|&(l, r)| l >= -1e-9 && r <= 3. + 1e-9));
     }
 
     #[test]
     fn stats_and_estimate() {
-        let path = comb_raster(&[rect(-5., -5., 5., 5.)], 20., 20., 5.).unwrap();
+        let path = comb_raster(&[rect(-5., -5., 5., 5.)], &[], 20., 20., 5.).unwrap();
         let s = PathStats::of(&path);
         assert!(s.active_nm > 0. && s.travel_nm > 0. && s.transitions > 0);
         let t = s.estimate_s(10., Some(0.2));

@@ -80,6 +80,12 @@ impl ProjectDb {
             is_temp: false,
         })
     }
+    /// Open `path` again after a restart, keeping whether it is untitled.
+    pub fn reopen(path: PathBuf, is_temp: bool) -> Result<Self, Box<dyn Error>> {
+        let mut db = Self::open(path)?;
+        db.is_temp = is_temp;
+        Ok(db)
+    }
     pub fn current_path(&self) -> &Path {
         &self.path
     }

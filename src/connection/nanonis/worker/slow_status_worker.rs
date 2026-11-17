@@ -40,6 +40,8 @@ pub struct SlowStatusWorker {
     session_path: SharedState<String>,
     last_session_check: Option<Instant>,
     course_voltages: SharedState<DVec2>,
+    /// Motor drive frequencies (Hz), X and Y.
+    course_freqs: SharedState<DVec2>,
     course_reciever: CommandChannelReciever<CourseMoveCommand, ()>,
     scan_reciever: CommandChannelReciever<ScanCommand, ()>,
     readback: SharedState<Readback>,
@@ -55,6 +57,7 @@ impl SlowStatusWorker {
         base_name: &SharedState<String>,
         session_path: &SharedState<String>,
         course_voltages: &SharedState<DVec2>,
+        course_freqs: &SharedState<DVec2>,
         course_reciever: &CommandChannelReciever<CourseMoveCommand, ()>,
         scan_reciever: &CommandChannelReciever<ScanCommand, ()>,
         readback: &SharedState<Readback>,
@@ -69,6 +72,7 @@ impl SlowStatusWorker {
             session_path: session_path.clone(),
             last_session_check: None,
             course_voltages: course_voltages.clone(),
+            course_freqs: course_freqs.clone(),
             course_reciever: course_reciever.clone(),
             scan_reciever: scan_reciever.clone(),
             readback: readback.clone(),
@@ -272,14 +276,16 @@ impl SlowStatusWorker {
     fn update_course_voltages(&mut self, conn: &mut NanonisTcp) -> NanonisTcpResult<()> {
         let err_pred = |e: &NanonisTcpError| matches!(e, NanonisTcpError::Api(_));
         let default = if DEBUG_COURSE { 5. } else { 0. };
-        let x_data = conn
+        let (x_data, x_freq) = conn
             .motor_freq_amp_get(MotorAxis::X)
-            .map(|resp| resp.amplitude as f64)
-            .or_else(|e| err_pred(&e).then_some(default).ok_or(e))?;
-        let y_data = conn
+            .map(|resp| (resp.amplitude as f64, resp.frequency as f64))
+            .or_else(|e| err_pred(&e).then_some((default, 0.)).ok_or(e))?;
+        let (y_data, y_freq) = conn
             .motor_freq_amp_get(MotorAxis::Y)
-            .map(|resp| resp.amplitude as f64)
-            .or_else(|e| err_pred(&e).then_some(default).ok_or(e))?;
+            .map(|resp| (resp.amplitude as f64, resp.frequency as f64))
+            .or_else(|e| err_pred(&e).then_some((default, 0.)).ok_or(e))?;
+        let freqs = DVec2::new(x_freq, y_freq);
+        self.course_freqs.modify_conditional(|prev| *prev != freqs, |prev| *prev = freqs);
         let new_data = DVec2::new(x_data, y_data);
         self.course_voltages
             .modify_conditional(|prev| *prev != new_data, |prev| *prev = new_data);

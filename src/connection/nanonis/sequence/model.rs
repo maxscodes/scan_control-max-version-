@@ -81,6 +81,10 @@ pub struct ScanEntry {
     /// Take the scan. Off: the entry only sets things up, moves the tip and
     /// runs spectroscopy.
     pub scan: bool,
+    /// Scan once more first and throw that image away (not stamped): the
+    /// piezo creeps most right after a coarse move and approach, so the kept
+    /// image is the calmer second one.
+    pub warm_up_scan: bool,
     /// Tip positions visited after the scan, each with an optional I(V) series.
     pub tip: TipPlan,
     /// Survey grid cell (row, column) this entry images, if any: its stamps
@@ -144,6 +148,7 @@ impl Default for ScanEntry {
             dir: Dir::Alternate,
             stamp: true,
             scan: true,
+            warm_up_scan: false,
             tip: TipPlan::default(),
             grid: None,
             grid_pos: None,
@@ -364,7 +369,7 @@ fn normalize_degrees(a: f64) -> f64 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Step {
     Withdraw,
     CoarseMove { steps: [i32; 2] },
@@ -492,6 +497,9 @@ pub fn expand(entry: &ScanEntry) -> Vec<Step> {
         steps.push(Step::Wait(entry.wait_before_s));
     }
     if entry.scan {
+        if entry.warm_up_scan {
+            steps.push(Step::Scan(entry.dir));
+        }
         steps.push(Step::Scan(entry.dir));
         if entry.stamp {
             steps.push(Step::Stamp);
@@ -614,6 +622,24 @@ mod tests {
     fn minimal_entry_is_scan_and_stamp() {
         let e = ScanEntry::default();
         assert_eq!(expand(&e), vec![Step::Scan(Dir::Alternate), Step::Stamp]);
+    }
+
+    /// A warm-up scan comes first and only the second is stamped; with
+    /// alternating entries the kept scans all go the same way.
+    #[test]
+    fn warm_up_scan_is_discarded() {
+        let e = ScanEntry { warm_up_scan: true, ..Default::default() };
+        assert_eq!(expand(&e), vec![Step::Scan(Dir::Alternate), Step::Scan(Dir::Alternate), Step::Stamp]);
+        let seq = Sequence { entries: vec![e.clone(), e], ..Default::default() };
+        let kept: Vec<_> = compile(&seq, 0, Dir::Down)
+            .windows(2)
+            .filter_map(|w| match (&w[0].1, &w[1].1) {
+                (Step::Scan(d), Step::Stamp) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        // Last scan down: warm-up ↑, kept ↓, warm-up ↑, kept ↓.
+        assert_eq!(kept, vec![Dir::Down, Dir::Down]);
     }
 
     #[test]

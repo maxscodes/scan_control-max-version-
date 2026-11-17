@@ -33,6 +33,8 @@ pub struct LiveImage {
     /// and `backward_data` stay as recorded.
     pub filters: Filters,
     pub norm_type: NormType,
+    /// 0..1, how opaque the image is drawn on the map.
+    pub opacity: f32,
     pub line_dir: LineDir,
     pub forward_data: FrameData,
     pub backward_data: FrameData,
@@ -44,6 +46,11 @@ pub struct LiveImage {
     /// The GDS (uuid and transform) on the map when this stamp was taken or
     /// first checked, to warn if the GDS is moved later.
     pub gds_ref: Option<(Uuid, DAffine2)>,
+    /// Where the stamp was put and after which coarse move, to learn the
+    /// coarse calibration from drags.
+    pub coarse_ref: Option<crate::analysis::coarse_fit::CoarseRef>,
+    /// Tip Check result for this stamp.
+    pub tip: Option<crate::analysis::tip_quality::TipReport>,
     /// Band direction in the forward frame, measured in the background on
     /// first use.
     bands: Arc<std::sync::OnceLock<Option<crate::analysis::gds_prior::Bands>>>,
@@ -66,6 +73,7 @@ impl LiveImage {
             ),
             norm_type,
             std_dev,
+            opacity: 1.,
             line_dir: LineDir::Forward,
             background: Background::Raw,
             filters: Filters::default(),
@@ -76,6 +84,8 @@ impl LiveImage {
             ring: None,
             ring_label: None,
             gds_ref: None,
+            coarse_ref: None,
+            tip: None,
             bands: Default::default(),
             bands_queued: Default::default(),
             uuid,
@@ -105,6 +115,7 @@ impl LiveImage {
     pub fn show_image(&mut self, ui: &mut Ui) -> Response {
         self.image_view.transform = self.transform;
         self.image_view.norm_type = self.norm_type.combined(self.std_dev);
+        self.image_view.opacity = self.opacity;
         let resp = self.image_view.show(ui);
         resp
     }
@@ -118,6 +129,7 @@ impl LiveImage {
             filters: self.filters,
             norm_type: self.norm_type,
             std_dev: self.std_dev,
+            opacity: self.opacity,
             line_dir: self.line_dir,
         }
     }
@@ -146,17 +158,26 @@ impl LiveImage {
         if f0.sharpen_amount != f1.sharpen_amount {
             f.sharpen_amount = f1.sharpen_amount;
         }
-        if f0.deglitch != f1.deglitch {
-            f.deglitch = f1.deglitch;
+        if f0.lines != f1.lines {
+            f.lines = f1.lines;
         }
-        if f0.deglitch_threshold != f1.deglitch_threshold {
-            f.deglitch_threshold = f1.deglitch_threshold;
+        if f0.lines_threshold != f1.lines_threshold {
+            f.lines_threshold = f1.lines_threshold;
+        }
+        if f0.blobs != f1.blobs {
+            f.blobs = f1.blobs;
+        }
+        if f0.blob_px != f1.blob_px {
+            f.blob_px = f1.blob_px;
         }
         if from.norm_type != to.norm_type {
             self.norm_type = to.norm_type;
         }
         if from.std_dev != to.std_dev {
             self.std_dev = to.std_dev;
+        }
+        if from.opacity != to.opacity {
+            self.opacity = to.opacity;
         }
         if from.line_dir != to.line_dir {
             self.line_dir = to.line_dir;
@@ -190,6 +211,15 @@ impl LiveImage {
                         row(ui, "Y slope", *y_slope);
                     }
                 });
+        }
+        if let Some(t) = &self.tip {
+            ui.label(
+                egui::RichText::new(format!("Tip: {}", t.summary()))
+                    .color(crate::connection::nanonis::tip_check::verdict_color(&t.verdict)),
+            );
+            for n in &t.notes {
+                ui.weak(format!("  {n}"));
+            }
         }
         if let Some(r) = &self.ring {
             ui.label(egui::RichText::new(format!("Ring: {}", r.summary())).color(r.color()));
@@ -250,6 +280,7 @@ impl LiveImage {
         img.background = self.background;
         img.filters = self.filters;
         img.norm_type = self.norm_type;
+        img.opacity = self.opacity;
         img.line_dir = self.line_dir;
         img.forward_data = forward;
         img.backward_data = backward;
@@ -274,6 +305,7 @@ impl LiveImage {
             background: self.background,
             filters: self.filters,
             norm_type: self.norm_type,
+            opacity: self.opacity,
             line_dir: self.line_dir,
             forward_data: self.forward_data.clone(),
             backward_data: self.backward_data.clone(),
@@ -281,6 +313,8 @@ impl LiveImage {
             ring: None,
             ring_label: None,
             gds_ref: None,
+            coarse_ref: None,
+            tip: None,
             bands: Default::default(),
             bands_queued: Default::default(),
             uuid: Uuid::new_v4(),
@@ -295,6 +329,7 @@ pub struct DisplaySettings {
     pub filters: Filters,
     pub norm_type: NormType,
     pub std_dev: f32,
+    pub opacity: f32,
     pub line_dir: LineDir,
 }
 
@@ -330,6 +365,17 @@ pub fn display_controls(ui: &mut Ui, images: &mut [&mut LiveImage], encoder: &Im
             });
             ui.end_row();
 
+            ui.label("Opacity");
+            let mut pct = s.opacity * 100.;
+            if ui
+                .add(egui::Slider::new(&mut pct, 5.0..=100.0).suffix(" %").fixed_decimals(0))
+                .on_hover_text("See through the image to check it lines up with what is under it")
+                .changed()
+            {
+                s.opacity = (pct / 100.).clamp(0.05, 1.);
+            }
+            ui.end_row();
+
             processing::color_scale_ui(ui);
         });
 
@@ -360,6 +406,7 @@ pub fn display_controls(ui: &mut Ui, images: &mut [&mut LiveImage], encoder: &Im
         s.background = Background::Raw;
         s.filters = Filters::default();
         s.norm_type = NormType::FullScale;
+        s.opacity = 1.;
     }
     if undo {
         for img in images.iter_mut() {
@@ -387,6 +434,7 @@ pub fn display_controls(ui: &mut Ui, images: &mut [&mut LiveImage], encoder: &Im
                     background: s.background,
                     filters: s.filters,
                     norm_type: s.norm_type,
+                    opacity: s.opacity,
                     ..cur
                 };
                 img.apply_display_change(&cur, &target, encoder);
@@ -450,7 +498,12 @@ const FIT_TABLE: TableDefinition<Uuid, u8> = TableDefinition::new("liveimage_fit
 /// Optional: only images with filters changed from the defaults have a row.
 const FILTER_TABLE: TableDefinition<Uuid, [f32; 6]> =
     TableDefinition::new("liveimage_filter_table_v1");
+/// Optional: only images with blob removal changed from the defaults.
+const BLOB_TABLE: TableDefinition<Uuid, [f32; 2]> = TableDefinition::new("liveimage_blob_table_v1");
 const NORM_TABLE: TableDefinition<Uuid, u8> = TableDefinition::new("liveimage_norm_table_v1");
+/// Optional: only images drawn see-through have a row.
+const OPACITY_TABLE: TableDefinition<Uuid, f32> =
+    TableDefinition::new("liveimage_opacity_table_v1");
 const DATA_TABLE: TableDefinition<Uuid, [FrameData; 2]> =
     TableDefinition::new("liveimage_data_table_v1");
 const UNIT_TABLE: TableDefinition<Uuid, &str> = TableDefinition::new("liveimage_unit_table_v1");
@@ -462,6 +515,11 @@ const RING_LABEL_TABLE: TableDefinition<Uuid, [f64; 3]> =
 /// Optional: the GDS (uuid, transform) the stamp was taken with.
 const GDS_REF_TABLE: TableDefinition<Uuid, (Uuid, [f64; 6])> =
     TableDefinition::new("liveimage_gdsref_table_v1");
+/// Optional: where a live stamp was put (JSON), for coarse learning.
+const COARSE_REF_TABLE: TableDefinition<Uuid, &str> =
+    TableDefinition::new("liveimage_coarseref_table_v1");
+/// Optional: the Tip Check result (JSON).
+const TIP_TABLE: TableDefinition<Uuid, &str> = TableDefinition::new("liveimage_tip_table_v1");
 
 impl Persistant for LiveImage {
     fn db_update<'t>(
@@ -509,12 +567,35 @@ impl Persistant for LiveImage {
         }
         drop(filter_table);
 
+        let mut blob_table = txn.open_table(BLOB_TABLE)?;
+        let stored = blob_table.get(id)?.map(|v| v.value());
+        let wanted = self.filters.blob_array();
+        if stored != wanted {
+            match wanted {
+                Some(a) => blob_table.insert(id, a)?,
+                None => blob_table.remove(id)?,
+            };
+        }
+        drop(blob_table);
+
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         let mut norm_data = norm_table.get_mut(id)?.expect("");
         if norm_data.value() != Into::<u8>::into(self.norm_type) {
             norm_data.insert(&self.norm_type.into())?;
         }
         drop(norm_data);
+        drop(norm_table);
+
+        let mut opacity_table = txn.open_table(OPACITY_TABLE)?;
+        let stored = opacity_table.get(id)?.map(|v| v.value());
+        let wanted = (self.opacity < 1.).then_some(self.opacity);
+        if stored != wanted {
+            match wanted {
+                Some(a) => opacity_table.insert(id, a)?,
+                None => opacity_table.remove(id)?,
+            };
+        }
+        drop(opacity_table);
 
         let mut ring_table = txn.open_table(RING_TABLE)?;
         let stored = ring_table.get(id)?.map(|v| v.value());
@@ -547,6 +628,28 @@ impl Persistant for LiveImage {
                 None => gds_table.remove(id)?,
             };
         }
+        drop(gds_table);
+
+        let mut cref_table = txn.open_table(COARSE_REF_TABLE)?;
+        let stored = cref_table.get(id)?.map(|v| v.value().to_string());
+        let wanted = self.coarse_ref.and_then(|c| serde_json::to_string(&c).ok());
+        if stored != wanted {
+            match wanted {
+                Some(j) => cref_table.insert(id, j.as_str())?,
+                None => cref_table.remove(id)?,
+            };
+        }
+        drop(cref_table);
+
+        let mut tip_table = txn.open_table(TIP_TABLE)?;
+        let stored = tip_table.get(id)?.map(|v| v.value().to_string());
+        let wanted = self.tip.as_ref().and_then(|t| serde_json::to_string(t).ok());
+        if stored != wanted {
+            match wanted {
+                Some(j) => tip_table.insert(id, j.as_str())?,
+                None => tip_table.remove(id)?,
+            };
+        }
 
         Ok(())
     }
@@ -565,8 +668,12 @@ impl Persistant for LiveImage {
         fit_table.remove(id)?;
         let mut filter_table = txn.open_table(FILTER_TABLE)?;
         filter_table.remove(id)?;
+        let mut blob_table = txn.open_table(BLOB_TABLE)?;
+        blob_table.remove(id)?;
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         norm_table.remove(id)?;
+        let mut opacity_table = txn.open_table(OPACITY_TABLE)?;
+        opacity_table.remove(id)?;
         let mut unit_table = txn.open_table(UNIT_TABLE)?;
         unit_table.remove(id)?;
         let mut data_table = txn.open_table(DATA_TABLE)?;
@@ -577,6 +684,10 @@ impl Persistant for LiveImage {
         label_table.remove(id)?;
         let mut gds_table = txn.open_table(GDS_REF_TABLE)?;
         gds_table.remove(id)?;
+        let mut cref_table = txn.open_table(COARSE_REF_TABLE)?;
+        cref_table.remove(id)?;
+        let mut tip_table = txn.open_table(TIP_TABLE)?;
+        tip_table.remove(id)?;
 
         Ok(())
     }
@@ -599,8 +710,16 @@ impl Persistant for LiveImage {
             let mut filter_table = txn.open_table(FILTER_TABLE)?;
             filter_table.insert(id, self.filters.to_array())?;
         }
+        if let Some(a) = self.filters.blob_array() {
+            let mut blob_table = txn.open_table(BLOB_TABLE)?;
+            blob_table.insert(id, a)?;
+        }
         let mut norm_table = txn.open_table(NORM_TABLE)?;
         norm_table.insert(id, &self.norm_type.into())?;
+        if self.opacity < 1. {
+            let mut opacity_table = txn.open_table(OPACITY_TABLE)?;
+            opacity_table.insert(id, self.opacity)?;
+        }
         let mut unit_table = txn.open_table(UNIT_TABLE)?;
         unit_table.insert(id, self.unit.as_str())?;
         let mut data_table = txn.open_table(DATA_TABLE)?;
@@ -616,6 +735,14 @@ impl Persistant for LiveImage {
         if let Some((u, t)) = self.gds_ref {
             let mut gds_table = txn.open_table(GDS_REF_TABLE)?;
             gds_table.insert(id, (u, t.to_cols_array()))?;
+        }
+        if let Some(j) = self.coarse_ref.and_then(|c| serde_json::to_string(&c).ok()) {
+            let mut cref_table = txn.open_table(COARSE_REF_TABLE)?;
+            cref_table.insert(id, j.as_str())?;
+        }
+        if let Some(j) = self.tip.as_ref().and_then(|t| serde_json::to_string(t).ok()) {
+            let mut tip_table = txn.open_table(TIP_TABLE)?;
+            tip_table.insert(id, j.as_str())?;
         }
         Ok(())
     }
@@ -634,9 +761,15 @@ impl Persistant for LiveImage {
         let fit_table = txn.open_table(FIT_TABLE)?;
         let fit_data = fit_table.get(id)?.unwrap().value();
         let filter_table = txn.open_table(FILTER_TABLE)?;
-        let filters = filter_table.get(id)?.map(|v| Filters::from_array(v.value()));
+        let blob_table = txn.open_table(BLOB_TABLE)?;
+        let filters = Filters::from_arrays(
+            filter_table.get(id)?.map(|v| v.value()),
+            blob_table.get(id)?.map(|v| v.value()),
+        );
         let norm_table = txn.open_table(NORM_TABLE)?;
         let norm_data = norm_table.get(id)?.unwrap().value();
+        let opacity_table = txn.open_table(OPACITY_TABLE)?;
+        let opacity = opacity_table.get(id)?.map(|v| v.value()).unwrap_or(1.);
         let unit_table = txn.open_table(UNIT_TABLE)?;
         let unit_data = unit_table.get(id)?.unwrap().value().to_string();
         let data_table = txn.open_table(DATA_TABLE)?;
@@ -650,12 +783,18 @@ impl Persistant for LiveImage {
             .get(id)?
             .map(|v| v.value())
             .map(|(u, t)| (u, DAffine2::from_cols_array(&t)));
+        let cref_table = txn.open_table(COARSE_REF_TABLE)?;
+        let coarse_ref = cref_table.get(id)?.and_then(|v| serde_json::from_str(v.value()).ok());
         let mut image = Self::new(id, encoder, DAffine2::from_cols_array(&tran_data));
+        image.coarse_ref = coarse_ref;
+        let tip_table = txn.open_table(TIP_TABLE)?;
+        image.tip = tip_table.get(id)?.and_then(|v| serde_json::from_str(v.value()).ok());
         image.std_dev = stddev_data;
         image.line_dir = LineDir::try_from(dir_data).unwrap();
         image.background = Background::try_from(fit_data).unwrap_or(Background::Raw);
-        image.filters = filters.unwrap_or_default();
+        image.filters = filters;
         image.norm_type = NormType::try_from(norm_data).unwrap();
+        image.opacity = opacity;
         image.unit = unit_data;
         image.ring = ring;
         image.ring_label = ring_label;

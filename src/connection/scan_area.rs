@@ -33,6 +33,10 @@ pub struct ScanArea {
     sxm_rx: Receiver<SxmFrame>,
     pub stamp_name_base: String,
     pub course_move_history: Vec<DVec2>,
+    /// Coarse moves and scan-region drags, for learning the calibration.
+    pub coarse_log: crate::analysis::coarse_fit::CoarseLog,
+    /// The user ctrl+dragged the scan region since this was last cleared.
+    pub manual_drag: bool,
     pub show_history: bool,
     pub show_history_boxes: bool,
     /// Draw the Ring Assist result saved with each stamped image.
@@ -58,6 +62,8 @@ impl ScanArea {
             stamp: VecDeque::new(),
             stamp_name_base: String::new(),
             course_move_history: Vec::new(),
+            coarse_log: Default::default(),
+            manual_drag: false,
             show_history: false,
             show_history_boxes: false,
             show_stamp_rings: true,
@@ -302,6 +308,15 @@ const AREA_SIZE_TABLE: TableDefinition<Uuid, [f64; 2]> =
     TableDefinition::new("scanarea_area_size_table_v1");
 const HISTORY_TABLE: TableDefinition<Uuid, Vec<[f64; 2]>> =
     TableDefinition::new("scanarea_history_table_v1");
+/// Optional: the coarse move log (JSON), once there is one.
+const COARSE_LOG_TABLE: TableDefinition<Uuid, &str> =
+    TableDefinition::new("scanarea_coarse_log_v1");
+
+fn coarse_log_json(log: &crate::analysis::coarse_fit::CoarseLog) -> Option<String> {
+    (!log.moves.is_empty() || !log.drags.is_empty())
+        .then(|| serde_json::to_string(log).ok())
+        .flatten()
+}
 
 impl Persistant for ScanArea {
     fn db_update<'t>(
@@ -330,6 +345,17 @@ impl Persistant for ScanArea {
         if history_data.value() != history {
             history_data.insert(&history)?;
         }
+        drop(history_data);
+        drop(history_table);
+        let mut log_table = txn.open_table(COARSE_LOG_TABLE)?;
+        let stored = log_table.get(id)?.map(|v| v.value().to_string());
+        let wanted = coarse_log_json(&self.coarse_log);
+        if stored != wanted {
+            match wanted {
+                Some(j) => log_table.insert(id, j.as_str())?,
+                None => log_table.remove(id)?,
+            };
+        }
 
         Ok(())
     }
@@ -344,6 +370,8 @@ impl Persistant for ScanArea {
         area_table.remove(id)?;
         let mut history_table = txn.open_table(HISTORY_TABLE)?;
         history_table.remove(id)?;
+        let mut log_table = txn.open_table(COARSE_LOG_TABLE)?;
+        log_table.remove(id)?;
         Ok(())
     }
 
@@ -365,6 +393,10 @@ impl Persistant for ScanArea {
                 .map(|v| v.to_array())
                 .collect(),
         )?;
+        if let Some(j) = coarse_log_json(&self.coarse_log) {
+            let mut log_table = txn.open_table(COARSE_LOG_TABLE)?;
+            log_table.insert(id, j.as_str())?;
+        }
         Ok(())
     }
 
@@ -379,12 +411,18 @@ impl Persistant for ScanArea {
         let area_data = area_table.get(id)?.expect("").value();
         let history_table = txn.open_table(HISTORY_TABLE)?;
         let history_data = history_table.get(id)?.expect("").value();
+        let log_table = txn.open_table(COARSE_LOG_TABLE)?;
+        let coarse_log = log_table
+            .get(id)?
+            .and_then(|v| serde_json::from_str(v.value()).ok())
+            .unwrap_or_default();
         let mut scan_area = Self::new(id, encoder, DVec2::from_array(area_data));
         scan_area.world_transform = DAffine2::from_cols_array(&tran_data);
         scan_area.course_move_history = history_data
             .iter()
             .map(|arr| DVec2::from_array(*arr))
             .collect();
+        scan_area.coarse_log = coarse_log;
         Ok(scan_area)
     }
 

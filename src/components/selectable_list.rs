@@ -35,6 +35,7 @@ impl<T> SelectableList<T> {
         let n = self.items.len();
         let groups: Vec<Option<String>> =
             self.items.iter_mut().map(|it| group_of(&mut it.inner).and_then(|g| g.clone())).collect();
+        let names: Vec<String> = groups.iter().flatten().unique().cloned().collect();
         let mut done: Vec<&str> = Vec::new();
         let mut export = None;
         for i in (0..n).rev() {
@@ -48,7 +49,7 @@ impl<T> SelectableList<T> {
             done.push(g);
             // Members top to bottom, shown where the topmost one is.
             let members: Vec<usize> = (0..n).rev().filter(|&j| groups[j].as_deref() == Some(g)).collect();
-            let (open, ex) = self.group_header(ui, g, &members, group_of);
+            let (open, ex) = self.group_header(ui, g, &members, &names, group_of);
             if ex {
                 export = Some(members.clone());
             }
@@ -103,7 +104,15 @@ impl<T> SelectableList<T> {
 
     /// Header row of a group. Returns whether it is open, and whether the
     /// user asked to save it as one image.
-    fn group_header(&mut self, ui: &mut Ui, name: &str, members: &[usize], group_of: &GroupFn<T>) -> (bool, bool) {
+    /// `names`: every group's name (to merge this one into another).
+    fn group_header(
+        &mut self,
+        ui: &mut Ui,
+        name: &str,
+        members: &[usize],
+        names: &[String],
+        group_of: &GroupFn<T>,
+    ) -> (bool, bool) {
         let id = ui.make_persistent_id(("layer_group_open", name));
         let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, false));
         let all_hidden = members.iter().all(|&j| self.is_hidden(j));
@@ -142,7 +151,28 @@ impl<T> SelectableList<T> {
                         }
                     }
                 });
-                if ui.button("Save as one image\u{2026}").clicked() {
+                let others: Vec<&String> = names.iter().filter(|n| n.as_str() != name).collect();
+                ui.add_enabled_ui(!others.is_empty(), |ui| {
+                    ui.menu_button("Merge into", |ui| {
+                        for other in others {
+                            if ui
+                                .button(other.as_str())
+                                .on_hover_text(format!("Move this group's stamps into \u{201c}{other}\u{201d}"))
+                                .clicked()
+                            {
+                                for &j in members {
+                                    if let Some(g) = group_of(&mut self.items[j].inner) {
+                                        *g = Some(other.clone());
+                                    }
+                                }
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text("There is no other group to merge into");
+                });
+                if ui.button("Polish & save as one image\u{2026}").clicked() {
                     export = true;
                     ui.close();
                 }

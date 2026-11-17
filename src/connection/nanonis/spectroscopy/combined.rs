@@ -3,14 +3,28 @@
 
 use std::fmt::Write as _;
 
-use egui::{ecolor::Hsva, Color32};
+use egui::Color32;
 
 use super::model::{didv_channel_names, IvCurve};
 
+/// Saturated, dark enough to stand out on a white plot, and well separated
+/// between neighbours.
+const CURVE_COLORS: [Color32; 10] = [
+    Color32::from_rgb(0xD6, 0x1F, 0x1F), // red
+    Color32::from_rgb(0x00, 0x4F, 0xD6), // blue
+    Color32::from_rgb(0x00, 0x8A, 0x00), // green
+    Color32::from_rgb(0x9B, 0x00, 0xC8), // purple
+    Color32::from_rgb(0xE6, 0x6F, 0x00), // orange
+    Color32::from_rgb(0x00, 0x00, 0x00), // black
+    Color32::from_rgb(0x00, 0x8B, 0x8B), // teal
+    Color32::from_rgb(0xC8, 0x00, 0x78), // magenta
+    Color32::from_rgb(0x8B, 0x4A, 0x00), // brown
+    Color32::from_rgb(0x55, 0x6B, 0x00), // olive
+];
+
 /// Same colour for a curve in every plot, well separated between neighbours.
 pub fn curve_color(index: usize) -> Color32 {
-    let h = (index as f32 * 0.618_034).fract();
-    Hsva::new(h, 0.85, 0.65, 1.0).into()
+    CURVE_COLORS[index % CURVE_COLORS.len()]
 }
 
 fn hex(c: Color32) -> String {
@@ -161,7 +175,7 @@ fn draw_panel(s: &mut String, p: &Panel, x0: f64) {
         }
         let _ = writeln!(
             s,
-            r#"<polyline fill="none" stroke="{}" stroke-width="2.5" stroke-linejoin="round" points="{}"/>"#,
+            r#"<polyline fill="none" stroke="{}" stroke-width="3.5" stroke-linejoin="round" points="{}"/>"#,
             hex(curve_color(*index)),
             d.join(" ")
         );
@@ -290,7 +304,7 @@ pub fn combined_svg(title: &str, curves: &[IvCurve], choice: &PlotChoice) -> Str
         let y = MARGIN_T + 20. + 20. * k as f64;
         let _ = writeln!(
             s,
-            r#"<line x1="{lx:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="3"/>"#,
+            r#"<line x1="{lx:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="4"/>"#,
             y - 4.,
             lx + 24.,
             y - 4.,

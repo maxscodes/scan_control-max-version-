@@ -16,6 +16,7 @@ use crate::{
     connection::{
         nanonis::{
             coarse_cal::{CalPlan, CalResult},
+            coarse_learn::{CoarseLearn, LearnAction},
             pair_view::PairView,
             sequence::ScanStart,
             command_channel::CommandChannelSender,
@@ -247,10 +248,14 @@ pub struct CourseMoveCommand {
 pub struct CourseMotionState {
     menu_active: bool,
     move_target: DVec2,
+    /// The baseline: the result of the last calibration test (or edit).
     calib: CoarseCalibration,
     /// When `calib` was last changed.
     calib_updated: CalibrationStamp,
+    /// The calibration learned from corrections, and which one moves use.
+    learn: CoarseLearn,
     voltages: SharedState<DVec2>,
+    freqs: SharedState<DVec2>,
     move_sender: CommandChannelSender<CourseMoveCommand, ()>,
     currently_moving: bool,
     group: u32,
@@ -293,6 +298,12 @@ pub struct CourseMotionState {
     auto_line_time: Option<f64>,
     /// A calibration move being checked by eye.
     cal_align: Option<AlignView>,
+    /// The last applied calibration's run, loaded to look at again, with
+    /// when it was applied; `align_saved`: the by-eye window shows it.
+    saved_cal: Option<(CalResult, String)>,
+    align_saved: bool,
+    /// Outcome of saving or loading the last calibration's scans.
+    saved_note: Option<String>,
 }
 
 /// Checking calibration move `k` by eye.
@@ -348,6 +359,7 @@ impl CalPreset {
 impl CourseMotionState {
     pub fn new(
         voltages: &SharedState<DVec2>,
+        freqs: &SharedState<DVec2>,
         move_sender: &CommandChannelSender<CourseMoveCommand, ()>,
     ) -> Self {
         let (calib, calib_updated) = load_calibration();
@@ -357,7 +369,9 @@ impl CourseMotionState {
             move_target: DVec2::ZERO,
             calib,
             calib_updated,
+            learn: CoarseLearn::load(),
             voltages: voltages.clone(),
+            freqs: freqs.clone(),
             move_sender: move_sender.clone(),
             currently_moving: false,
             group: 1,
@@ -382,6 +396,9 @@ impl CourseMotionState {
             auto_axes: [true, true],
             auto_scan_start: ScanStart::default(),
             cal_align: None,
+            saved_cal: None,
+            align_saved: false,
+            saved_note: None,
             auto_preset: CalPreset::Standard,
             line_times: None,
             auto_line_time: None,
@@ -404,6 +421,16 @@ impl CourseMotionState {
             self.last_y_move = None;
         }
         let real_world_move = self.steps_to_real(steps);
+        let id = scan_area.coarse_log.next_id();
+        scan_area.coarse_log.moves.push(crate::analysis::coarse_fit::MoveRecord {
+            id,
+            unix: crate::analysis::coarse_fit::unix_now(),
+            steps: steps.to_array(),
+            volts: self.voltages.peek().to_array(),
+            freq: self.freqs.peek().to_array(),
+            predicted_nm: real_world_move.to_array(),
+            learned: self.learn.active().is_some(),
+        });
         scan_area.course_move_history.push(real_world_move);
         scan_area.world_transform =
             scan_area.world_transform * DAffine2::from_translation(real_world_move);
@@ -436,7 +463,9 @@ impl CourseMotionState {
         let n = if axis == 0 { steps.x } else { steps.y };
         let world_motion = scan_area.world_transform.translation - last_pos;
         let real_world_motion = scan_area.world_transform.inverse().transform_vector2(world_motion);
+        let old = self.calib;
         self.calib.set_column(axis, n >= 0, real_world_motion / (n as f64 * volts) * 1e-9);
+        self.learn.on_new_baseline(old, &self.calib_updated, self.calib);
         let name = match (axis, n >= 0) {
             (0, true) => "X (+X)",
             (0, false) => "X (\u{2212}X)",
@@ -491,8 +520,9 @@ impl CourseMotionState {
             .id(Id::new("Course Motion"))
             .vscroll(true)
             .frame(crate::theme::window_frame(ui.ctx()))
-            .auto_sized()
-            .collapsible(false)
+            .default_size([300., 360.])
+            .resizable(true)
+            .collapsible(true)
             .enabled(!self.currently_moving)
             .open(&mut open)
             .show(&ui.ctx(), |ui| {
@@ -562,7 +592,9 @@ impl CourseMotionState {
                                 ui.add(si_drag_value(&mut c.y));
                                 ui.end_row();
                                 if c != before {
+                                    let old = self.calib;
                                     self.calib.set_column(axis, pos, c);
+                                    self.learn.on_new_baseline(old, &self.calib_updated, self.calib);
                                     self.calib_updated = CalibrationStamp::now("edited by hand");
                                 }
                             }
@@ -587,6 +619,18 @@ impl CourseMotionState {
                             }
                         });
                     });
+                CollapsingHeader::new("Learned from corrections")
+                    .default_open(false)
+                    .show_unindented(ui, |ui| {
+                        let volts = *self.voltages.peek();
+                        match self.learn.ui(ui, &self.calib, &self.calib_updated, volts) {
+                            Some(LearnAction::Promote(c, how)) => self.set_calibration(c, how),
+                            Some(LearnAction::Restore(c, st)) => {
+                                self.set_calibration(c, format!("restored: {}", st.how));
+                            }
+                            None => {}
+                        }
+                    });
                 CollapsingHeader::new("Auto calibrate")
                     .default_open(self.cal_result.is_some())
                     .show_unindented(ui, |ui| {
@@ -595,6 +639,9 @@ impl CourseMotionState {
             });
         if !open {
             self.set_open(false);
+        }
+        if self.align_saved {
+            self.show_align_window(ui.ctx());
         }
     }
 
@@ -754,6 +801,7 @@ impl CourseMotionState {
         }
         let size = DVec2::splat(self.auto_frame_um * 1e3);
         ui.weak(format!("Calibration last updated: {}", self.calib_updated.describe()));
+        self.show_saved_calibration(ui);
         if let Some((frac, text)) = &self.cal_progress {
             ui.add(egui::ProgressBar::new(*frac).text(text.as_str()).desired_height(16.));
             ui.weak("Pause or abort it in the Sequence window.");
@@ -1269,8 +1317,15 @@ impl CourseMotionState {
                 c.set_column(row.axis, row.positive, row.column);
             }
             let dirs: Vec<&str> = result.rows.iter().filter(|r| r.use_it).map(|r| r.name()).collect();
+            let how = format!("auto calibration ({})", dirs.join(", "));
             info!("applied auto calibration: {c:?}");
-            self.set_calibration(c, format!("auto calibration ({})", dirs.join(", ")));
+            // Keep the scans, to check the moves by eye later.
+            self.saved_note = Some(match result.save(&c, &how) {
+                Ok(dir) => format!("Scans saved to {}", dir.display()),
+                Err(e) => format!("Could not save the scans: {e}"),
+            });
+            self.saved_cal = None;
+            self.set_calibration(c, how);
             self.cal_result = None;
         } else if discard {
             self.cal_result = None;
@@ -1278,15 +1333,54 @@ impl CourseMotionState {
         if let (Some(k), Some(r)) = (open_k, &self.cal_result) {
             let like = self.cal_align.take().map(|v| v.view);
             self.cal_align = AlignView::new(ui.ctx(), r, k, like.as_ref());
+            self.align_saved = false;
         }
-        self.show_align_window(ui.ctx());
+        if !self.align_saved {
+            self.show_align_window(ui.ctx());
+        }
+    }
+
+    /// Look again at the moves of the last applied calibration.
+    fn show_saved_calibration(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let exists = super::coarse_cal::saved_dir().join("calibration.json").exists();
+            if ui
+                .add_enabled(exists, Button::new("Review last applied calibration"))
+                .on_hover_text("Check its moves by eye again (the scans saved when it was applied)")
+                .clicked()
+            {
+                match CalResult::load_saved() {
+                    Ok((r, when)) => {
+                        let like = self.cal_align.take().map(|v| v.view);
+                        self.cal_align = AlignView::new(ui.ctx(), &r, 0, like.as_ref());
+                        self.saved_note = Some(format!("Applied {when}"));
+                        self.saved_cal = Some((r, when));
+                        self.align_saved = true;
+                    }
+                    Err(e) => self.saved_note = Some(format!("Could not load the saved scans: {e}")),
+                }
+            }
+            if ui
+                .add_enabled(exists, Button::new("Open folder"))
+                .on_hover_text("The saved scans and a before | after PNG for each move")
+                .clicked()
+            {
+                let _ = std::process::Command::new("explorer").arg(super::coarse_cal::saved_dir()).spawn();
+            }
+        });
+        if let Some(n) = &self.saved_note {
+            ui.weak(n.as_str());
+        }
     }
 
     /// The scan after a calibration move over the scan before it, to line
     /// up by eye.
     fn show_align_window(&mut self, ctx: &egui::Context) {
-        let (Some(view), Some(result)) = (&mut self.cal_align, &mut self.cal_result) else {
+        let saved = self.align_saved;
+        let source = if saved { self.saved_cal.as_mut().map(|(r, _)| r) } else { self.cal_result.as_mut() };
+        let (Some(view), Some(result)) = (&mut self.cal_align, source) else {
             self.cal_align = None;
+            self.align_saved = false;
             return;
         };
         let k = view.k;
@@ -1299,13 +1393,18 @@ impl CourseMotionState {
         let mut close = false;
         let mut goto = None;
         let n_moves = result.moves.len();
-        egui::Window::new(format!("Check move {} by eye", m.name()))
+        let title = if saved {
+            format!("Last applied calibration: move {} ({}/{})", m.name(), k + 1, result.moves.len())
+        } else {
+            format!("Check move {} by eye", m.name())
+        };
+        egui::Window::new(title)
             .id(Id::new("cal_align_window"))
             .open(&mut open)
             .resizable(true)
             .default_size([820., 900.])
             .min_size([360., 400.])
-            .collapsible(false)
+            .collapsible(true)
             .show(ctx, |ui| {
                 view.view.ui(ui, &a, &b, m.auto_px, 70.);
                 let shift = view.view.shift;
@@ -1328,7 +1427,15 @@ impl CourseMotionState {
                     )),
                     None => ui.weak("The automatic match found nothing"),
                 };
-                ui.horizontal(|ui| {
+                if saved {
+                    ui.weak(format!(
+                        "{} move, {} steps{}. Looking only: changes here aren't applied.",
+                        m.name(),
+                        m.steps,
+                        if m.manual { ", aligned by eye" } else { "" }
+                    ));
+                }
+                ui.add_enabled_ui(!saved, |ui| ui.horizontal(|ui| {
                     if ui.button("\u{2714} Use this alignment").clicked() {
                         result.set_manual(k, shift);
                         close = true;
@@ -1345,7 +1452,7 @@ impl CourseMotionState {
                     if ui.button("No shift").on_hover_text("Lay the scans exactly on top of each other").clicked() {
                         view.view.shift = DVec2::ZERO;
                     }
-                });
+                }));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(k > 0, Button::new("\u{25c0} Previous move")).clicked() {
                         goto = Some(k - 1);
@@ -1357,8 +1464,10 @@ impl CourseMotionState {
             });
         if !open || close {
             self.cal_align = None;
+            self.align_saved = false;
         }
-        if let (Some(g), Some(r)) = (goto, &self.cal_result) {
+        let source = if saved { self.saved_cal.as_ref().map(|(r, _)| r) } else { self.cal_result.as_ref() };
+        if let (Some(g), Some(r)) = (goto, source) {
             // Keep the processing and view when stepping through the moves.
             let like = self.cal_align.take().map(|v| v.view);
             self.cal_align = AlignView::new(ctx, r, g, like.as_ref());
@@ -1367,22 +1476,45 @@ impl CourseMotionState {
 
     /// Real move (nm, scan-area axes) for `steps` at the current amplitudes.
     pub fn steps_to_real(&self, steps: IVec2) -> DVec2 {
-        self.calib.steps_to_real(steps, *self.voltages.peek())
+        self.active().steps_to_real(steps, *self.voltages.peek())
+    }
+    /// The calibration moves use: the learned one in "on-the-fly" mode
+    /// (once there is one), else the last test.
+    pub fn active(&self) -> CoarseCalibration {
+        self.learn.active().unwrap_or(self.calib)
+    }
+    /// The last calibration test (never changed by learning).
+    pub fn baseline(&self) -> CoarseCalibration {
+        self.calib
+    }
+    /// Learn from the user's drags of stamps and the scan region (call
+    /// every frame).
+    pub fn learn_sync(&mut self, ui: &Ui, object_list: &mut SelectableList<Object>) {
+        self.learn.sync(ui, object_list, &self.calib, self.calib_updated.unix);
+    }
+    /// A drag of the latest stamp moves the scan region with it (learning
+    /// from drags does that itself).
+    pub fn follows_latest_stamp(&self) -> bool {
+        self.learn.follows_latest()
     }
     /// The coarse motion can turn distances into steps.
     pub fn is_calibrated(&self) -> bool {
         let v = *self.voltages.peek();
-        v.x > 0. && v.y > 0. && self.calib.is_usable()
+        v.x > 0. && v.y > 0. && self.active().is_usable()
     }
     /// Driver amplitudes now (V).
     pub fn volts(&self) -> DVec2 {
         *self.voltages.peek()
     }
+    /// The calibration in use for moves (see [`Self::active`]).
     pub fn calibration(&self) -> CoarseCalibration {
-        self.calib
+        self.active()
     }
-    /// Replace the calibration and save it, noting when and `how`.
+    /// Replace the baseline (a new calibration test) and save it, noting
+    /// when and `how`. Learning starts again from it.
     pub fn set_calibration(&mut self, c: CoarseCalibration, how: impl Into<String>) {
+        let old = self.calib;
+        self.learn.on_new_baseline(old, &self.calib_updated, c);
         self.calib = c;
         self.calib_updated = CalibrationStamp::now(how);
         save_calibration(&self.calib, &self.calib_updated);
@@ -1392,7 +1524,7 @@ impl CourseMotionState {
     }
     /// Nearest whole number of motor steps for a real-world (nm) move.
     pub fn real_to_steps(&self, real: DVec2) -> IVec2 {
-        self.calib.real_to_steps(real, *self.voltages.peek())
+        self.active().real_to_steps(real, *self.voltages.peek())
     }
     /// The Course Motion window is open (it owns ctrl+drag on the map).
     pub fn menu_open(&self) -> bool {

@@ -1,6 +1,5 @@
 const low_color: vec3<f32> = vec3(0.0, 0.0, 1.0);
 const high_color: vec3<f32> = vec3(1.0, 0.0, 0.0);
-const IMAGE_ALPHA: f32 = 1.;
 
 // ------------ Vertex Shader ------------
 
@@ -60,14 +59,14 @@ fn fs_main(vertex: VertexOutput) -> @location(0) vec4<f32> {
 
     // if the hight is out of range, draw the high or low overflow color
     if height < 0.0 {
-        return vec4(low_color, IMAGE_ALPHA);
+        return shade(low_color);
     }
     if height > 1.0 {
-        return vec4(high_color, IMAGE_ALPHA);
+        return shade(high_color);
     }
 
     // sample the color from the color-map and return it
-    return vec4(textureSample(color_map, tex_sampler, height).rgb, IMAGE_ALPHA);
+    return shade(textureSample(color_map, tex_sampler, height).rgb);
 }
 
 // ------------ Structs and Data ------------
@@ -75,7 +74,15 @@ fn fs_main(vertex: VertexOutput) -> @location(0) vec4<f32> {
 struct NormalizeControl {
     max_min: u32,
     _pad: u32,
-    std_dev_mul: f32}
+    std_dev_mul: f32,
+    // 0..1; the pipeline blends premultiplied alpha.
+    opacity: f32,
+}
+
+fn shade(rgb: vec3<f32>) -> vec4<f32> {
+    let a = clamp(normalize_control.opacity, 0.0, 1.0);
+    return vec4(rgb * a, a);
+}
 
 struct NormalizeData {
     stddev: f32,

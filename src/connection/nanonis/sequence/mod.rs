@@ -1,6 +1,7 @@
 //! Automated scan sequences: plan a list of scan entries (bias, current,
 //! frame, coarse moves, waits) and run them unattended on a dedicated worker.
 
+mod checkpoint;
 mod editor;
 mod eta;
 mod grid_track;

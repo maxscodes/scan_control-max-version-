@@ -387,6 +387,7 @@ impl LithographyState {
                     });
                 }
                 ui.weak("The GDS is used where it sits on the map: drag it to align before previewing.");
+                ui.weak("Enabled filled shapes limit writing to their area; without shapes the whole frame is used.");
             }
             ui.add_space(4.);
             self.show_shapes(ui, area);
@@ -687,8 +688,8 @@ impl LithographyState {
 
 /// Plan the path for `key`: GDS polygons and drawn shapes (map world) →
 /// piezo nm → frame-local nm, plan, and convert the segments back to piezo
-/// nm. Filled shapes are planned with the GDS polygons; drawn lines are
-/// written along their length after them.
+/// nm. Filled shapes limit the GDS to their area (or are the pattern when
+/// there is no GDS); drawn lines are written along their length after them.
 fn build_path(gds: Option<&GDSImage>, area: &ScanArea, key: &PlanKey) -> Result<Vec<Segment>, String> {
     let frame_tf = DAffine2::from_cols_array(&key.frame_transform);
     let frame = Frame::from_transform(frame_tf);
@@ -710,10 +711,11 @@ fn build_path(gds: Option<&GDSImage>, area: &ScanArea, key: &PlanKey) -> Result<
     }
     let size = DVec2::new(frame.width, frame.height);
     let mut strokes: Vec<Polygon> = Vec::new();
+    let mut fills: Vec<Polygon> = Vec::new();
     for shape in &key.shapes {
         let local = |pts: Vec<DVec2>| -> Polygon { pts.into_iter().map(|p| world_to_local.transform_point2(p)).collect() };
         match shape.geometry() {
-            Some(Geometry::Fill(poly)) => polygons.push(local(poly)),
+            Some(Geometry::Fill(poly)) => fills.push(local(poly)),
             Some(Geometry::Stroke(line)) => {
                 let line = local(line);
                 let half = size / 2. + DVec2::splat(1e-6);
@@ -725,13 +727,18 @@ fn build_path(gds: Option<&GDSImage>, area: &ScanArea, key: &PlanKey) -> Result<
             None => {}
         }
     }
+    // The filled shapes define the written area: a GDS is only written
+    // inside them, and without a GDS they are the pattern themselves.
+    if polygons.is_empty() {
+        polygons = fills.clone();
+    }
     if polygons.is_empty() && strokes.is_empty() {
         return Err("no polygons on the selected GDS layers and no usable drawn shapes".into());
     }
     let mut local = if polygons.is_empty() {
         Vec::new()
     } else {
-        plan(key.mode, &polygons, size, key.pitch_nm)?
+        plan(key.mode, &polygons, &fills, size, key.pitch_nm)?
     };
     append_strokes(&mut local, &strokes);
     Ok(local

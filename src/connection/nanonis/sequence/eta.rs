@@ -165,24 +165,39 @@ impl RunClock {
             step_paused: Duration::ZERO,
         }
     }
-    fn paused_now(&self) -> Duration {
-        self.paused_since.map_or(Duration::ZERO, |t| t.elapsed())
+    /// Starting at step `index` (a run picked up part way).
+    pub fn at(mut self, index: usize) -> Self {
+        self.step_index = index;
+        self
+    }
+    fn paused_at(&self, now: Instant) -> Duration {
+        self.paused_since
+            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
     }
     /// Unpaused time since the run started, s.
     pub fn elapsed(&self) -> f64 {
-        (self.started.elapsed() - self.paused_total - self.paused_now()).as_secs_f64()
+        // One clock read for every term, and saturate: a run paused from the
+        // start would otherwise subtract a slightly later reading and panic.
+        let now = Instant::now();
+        now.saturating_duration_since(self.started)
+            .saturating_sub(self.paused_total + self.paused_at(now))
+            .as_secs_f64()
     }
     /// Unpaused time in the current step, s.
     pub fn step_elapsed(&self) -> f64 {
-        (self.step_started.elapsed().saturating_sub(self.step_paused + self.paused_now())).as_secs_f64()
+        let now = Instant::now();
+        now.saturating_duration_since(self.step_started)
+            .saturating_sub(self.step_paused + self.paused_at(now))
+            .as_secs_f64()
     }
     pub fn pause(&mut self) {
         self.paused_since.get_or_insert_with(Instant::now);
     }
     pub fn resume(&mut self) {
         if let Some(t) = self.paused_since.take() {
-            self.paused_total += t.elapsed();
-            self.step_paused += t.elapsed();
+            let paused = t.elapsed();
+            self.paused_total += paused;
+            self.step_paused += paused;
         }
     }
     /// Step `index` started: learn from the one that just ended.

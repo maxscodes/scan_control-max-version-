@@ -34,6 +34,7 @@ impl From<NormalizationType> for NormalizeControl {
                 NormalizationType::FullScale => 0.,
                 NormalizationType::StdDev(f) => f,
             },
+            opacity: 1.,
         }
     }
 }
@@ -162,6 +163,21 @@ impl ImageComputeBuffers {
             .normalize_control_buffer
             .queue_write_with(queue, 0, 1)?;
         buf[0] = normalization_type.into();
+        Ok(())
+    }
+    /// Contrast and opacity (0..1) used when drawing the image.
+    pub fn write_display(
+        &self,
+        queue: &Queue,
+        normalization_type: NormalizationType,
+        opacity: f32,
+    ) -> Result<(), BufferOpError> {
+        let mut buf = self
+            .normalize_control_buffer
+            .queue_write_with(queue, 0, 1)?;
+        let mut c: NormalizeControl = normalization_type.into();
+        c.opacity = opacity.clamp(0., 1.);
+        buf[0] = c;
         Ok(())
     }
     pub fn write_lines_range(

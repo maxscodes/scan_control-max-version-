@@ -928,3 +928,177 @@ mod tests {
         assert!((plan.estimate_s(1., 30.) - (5. * 67. + 160.)).abs() < 1e-9);
     }
 }
+
+// ---- Keeping the scans of the last applied calibration ----
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedMove {
+    axis: usize,
+    positive: bool,
+    steps: i32,
+    shift_px: Option<[f64; 2]>,
+    auto_px: Option<[f64; 2]>,
+    score: f64,
+    manual: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedFrame {
+    size: [u32; 2],
+    frame: [f64; 6],
+    source: String,
+    /// Raw f32 (little-endian) forward image, row-major.
+    file: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedResult {
+    unix: u64,
+    how: String,
+    volts: [f64; 2],
+    old: CoarseCalibration,
+    applied: CoarseCalibration,
+    moves: Vec<SavedMove>,
+    frames: Vec<SavedFrame>,
+}
+
+/// Where the last applied calibration's scans are kept.
+pub fn saved_dir() -> std::path::PathBuf {
+    crate::app::CONFIG_DIR.config_local_dir().join("last_calibration")
+}
+
+impl CalResult {
+    /// Keep this run's scans and alignments (the "check by eye" pairs) in
+    /// [`saved_dir`], replacing the last ones, with a PNG per move (before |
+    /// after). `applied` is the calibration that was applied from it.
+    pub fn save(&self, applied: &CoarseCalibration, how: &str) -> Result<std::path::PathBuf, String> {
+        let dir = saved_dir();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut frames = Vec::new();
+        for (i, f) in self.frames.iter().enumerate() {
+            let file = format!("scan_{i:02}.bin");
+            let bytes: Vec<u8> = f.data.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join(&file), bytes).map_err(|e| e.to_string())?;
+            frames.push(SavedFrame { size: f.data.size, frame: f.frame.to_cols_array(), source: f.source.clone(), file });
+        }
+        for (k, m) in self.moves.iter().enumerate() {
+            if let Some((a, b)) = self.pair(k) {
+                let name = format!("move_{k:02}_{}_{}steps.png", m.name().replace('\u{2212}', "-"), m.steps);
+                if let Err(e) = pair_png(a, b, &dir.join(name)) {
+                    tracing::warn!("could not write the calibration image: {e}");
+                }
+            }
+        }
+        let saved = SavedResult {
+            unix: crate::analysis::coarse_fit::unix_now(),
+            how: how.to_string(),
+            volts: self.volts.to_array(),
+            old: self.old,
+            applied: *applied,
+            moves: self
+                .moves
+                .iter()
+                .map(|m| SavedMove {
+                    axis: m.axis,
+                    positive: m.positive,
+                    steps: m.steps,
+                    shift_px: m.shift_px.map(|v| v.to_array()),
+                    auto_px: m.auto_px.map(|v| v.to_array()),
+                    score: m.score,
+                    manual: m.manual,
+                })
+                .collect(),
+            frames,
+        };
+        let json = serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("calibration.json"), json).map_err(|e| e.to_string())?;
+        Ok(dir)
+    }
+
+    /// The last applied calibration's run, as saved by [`Self::save`], and
+    /// a line saying when and how it was applied.
+    pub fn load_saved() -> Result<(Self, String), String> {
+        let dir = saved_dir();
+        let text = std::fs::read_to_string(dir.join("calibration.json")).map_err(|e| e.to_string())?;
+        let s: SavedResult = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let mut frames = Vec::new();
+        for f in &s.frames {
+            let bytes = std::fs::read(dir.join(&f.file)).map_err(|e| e.to_string())?;
+            let data: Vec<f32> =
+                bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if data.len() != f.size[0] as usize * f.size[1] as usize {
+                return Err(format!("{} has the wrong size", f.file));
+            }
+            frames.push(CalFrame {
+                data: FrameData { size: f.size, data: std::sync::Arc::new(data.into_boxed_slice()) },
+                frame: DAffine2::from_cols_array(&f.frame),
+                source: f.source.clone(),
+            });
+        }
+        let moves = s
+            .moves
+            .iter()
+            .map(|m| MoveMeasure {
+                axis: m.axis,
+                positive: m.positive,
+                steps: m.steps,
+                shift_px: m.shift_px.map(DVec2::from_array),
+                auto_px: m.auto_px.map(DVec2::from_array),
+                score: m.score,
+                manual: m.manual,
+            })
+            .collect();
+        let mut r = CalResult { rows: Vec::new(), problem: None, volts: DVec2::from_array(s.volts), frames, moves, old: s.old };
+        r.update_rows(None);
+        let when = crate::connection::nanonis::course_motion::CalibrationStamp { unix: Some(s.unix), how: s.how };
+        Ok((r, when.describe()))
+    }
+}
+
+/// Before | after, grey, each levelled line by line and scaled to its 1–99 %
+/// range.
+fn pair_png(a: &CalFrame, b: &CalFrame, path: &std::path::Path) -> Result<(), String> {
+    let gray = |f: &CalFrame| -> (u32, u32, Vec<u8>) {
+        let [w, h] = f.data.size;
+        let (wu, hu) = (w as usize, h as usize);
+        let mut d: Vec<f32> = f.data.data.to_vec();
+        for y in 0..hu {
+            let row = &mut d[y * wu..(y + 1) * wu];
+            let fin: Vec<f32> = row.iter().copied().filter(|v| v.is_finite()).collect();
+            if fin.is_empty() {
+                continue;
+            }
+            let m = fin.iter().sum::<f32>() / fin.len() as f32;
+            row.iter_mut().for_each(|v| *v -= m);
+        }
+        let mut fin: Vec<f32> = d.iter().copied().filter(|v| v.is_finite()).collect();
+        fin.sort_by(f32::total_cmp);
+        let (lo, hi) = if fin.is_empty() {
+            (0., 1.)
+        } else {
+            (fin[fin.len() / 100], fin[(fin.len() * 99 / 100).min(fin.len() - 1)])
+        };
+        let span = (hi - lo).max(1e-30);
+        let px = d.iter().map(|v| if v.is_finite() { (((v - lo) / span).clamp(0., 1.) * 255.) as u8 } else { 0 }).collect();
+        (w, h, px)
+    };
+    let (wa, ha, pa) = gray(a);
+    let (wb, hb, pb) = gray(b);
+    let gap = 8;
+    let (w, h) = (wa + gap + wb, ha.max(hb));
+    let mut img = image::GrayImage::from_pixel(w, h, image::Luma([255]));
+    for y in 0..ha {
+        for x in 0..wa {
+            img.put_pixel(x, y, image::Luma([pa[(y * wa + x) as usize]]));
+        }
+    }
+    for y in 0..hb {
+        for x in 0..wb {
+            img.put_pixel(wa + gap + x, y, image::Luma([pb[(y * wb + x) as usize]]));
+        }
+    }
+    img.save(path).map_err(|e| e.to_string())
+}

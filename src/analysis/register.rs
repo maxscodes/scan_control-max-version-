@@ -260,6 +260,107 @@ pub fn shift_near(
     Some(Shift { dx: dx as f64 + sub_x, dy: dy as f64 + sub_y, score, overlap })
 }
 
+/// The best few distinct matches within a circle of `radius` pixels around
+/// `guess` (same convention as [`shift_near`]), best first. On a surface
+/// that repeats, several spots can match about as well; seeing the runner-up
+/// tells a clear match from a look-alike.
+pub fn shift_candidates(
+    a: &[f32],
+    b: &[f32],
+    w: usize,
+    h: usize,
+    guess: (f64, f64),
+    radius: f64,
+    min_overlap: f64,
+    max_n: usize,
+) -> Vec<Shift> {
+    if w < 8 || h < 8 || a.len() != w * h || b.len() != w * h || max_n == 0 {
+        return Vec::new();
+    }
+    let a = slope_x(a, w, h);
+    let b = slope_x(b, w, h);
+    let f = w.max(h).div_ceil(128).max(1);
+    let (sa, ws, hs) = downsample(&a, w, h, f);
+    let (sb, _, _) = downsample(&b, w, h, f);
+    let (gx, gy) = (guess.0 / f as f64, guess.1 / f as f64);
+    let r = radius / f as f64;
+    let (x0, x1) = ((gx - r).floor() as i64, (gx + r).ceil() as i64);
+    let (y0, y1) = ((gy - r).floor() as i64, (gy + r).ceil() as i64);
+    let nx = (x1 - x0 + 1) as usize;
+    let ny = (y1 - y0 + 1) as usize;
+    // Rank of every rough shift in the circle (NaN: not tried).
+    let mut rank = vec![f64::NAN; nx * ny];
+    for dy in y0..=y1 {
+        for dx in x0..=x1 {
+            let (ex, ey) = (dx as f64 - gx, dy as f64 - gy);
+            if ex * ex + ey * ey > r * r {
+                continue;
+            }
+            let (c, overlap) = ncc(&sa, &sb, ws, hs, dx, dy);
+            if overlap < min_overlap {
+                continue;
+            }
+            rank[(dy - y0) as usize * nx + (dx - x0) as usize] = c * overlap.sqrt();
+        }
+    }
+    // Local maxima, best first, at least a few rough pixels apart.
+    let at = |i: i64, j: i64| -> f64 {
+        if i < 0 || j < 0 || i >= nx as i64 || j >= ny as i64 {
+            f64::NAN
+        } else {
+            rank[j as usize * nx + i as usize]
+        }
+    };
+    let mut peaks: Vec<(f64, i64, i64)> = Vec::new();
+    for j in 0..ny as i64 {
+        for i in 0..nx as i64 {
+            let v = at(i, j);
+            if !v.is_finite() {
+                continue;
+            }
+            let is_max = (-1..=1).all(|dj| (-1..=1).all(|di| (di == 0 && dj == 0) || !(at(i + di, j + dj) > v)));
+            if is_max {
+                peaks.push((v, i + x0, j + y0));
+            }
+        }
+    }
+    peaks.sort_by(|p, q| q.0.total_cmp(&p.0));
+    const APART: i64 = 4;
+    let mut kept: Vec<(i64, i64)> = Vec::new();
+    for &(_, x, y) in &peaks {
+        if kept.iter().all(|&(kx, ky)| (kx - x).abs().max((ky - y).abs()) >= APART) {
+            kept.push((x, y));
+            if kept.len() == max_n {
+                break;
+            }
+        }
+    }
+    // Refine each at full resolution.
+    let rf = f as i64 + 1;
+    let mut out: Vec<Shift> = kept
+        .into_iter()
+        .filter_map(|(cx, cy)| {
+            let (cx, cy) = (cx * f as i64, cy * f as i64);
+            let mut fine: Option<(f64, f64, i64, i64)> = None;
+            for dy in cy - rf..=cy + rf {
+                for dx in cx - rf..=cx + rf {
+                    let (c, overlap) = ncc(&a, &b, w, h, dx, dy);
+                    if overlap >= min_overlap * 0.8 && fine.is_none_or(|b| c > b.0) {
+                        fine = Some((c, overlap, dx, dy));
+                    }
+                }
+            }
+            let (score, overlap, dx, dy) = fine?;
+            let at = |x: i64, y: i64| ncc(&a, &b, w, h, x, y).0;
+            let sub_x = parabola(at(dx - 1, dy), score, at(dx + 1, dy));
+            let sub_y = parabola(at(dx, dy - 1), score, at(dx, dy + 1));
+            Some(Shift { dx: dx as f64 + sub_x, dy: dy as f64 + sub_y, score, overlap })
+        })
+        .collect();
+    out.sort_by(|p, q| (q.score * q.overlap.sqrt()).total_cmp(&(p.score * p.overlap.sqrt())));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +431,18 @@ mod tests {
         let s = shift_near(&a, &b, w, h, (-104., 0.), 25., 0.05).unwrap();
         assert!((s.dx + 113.).abs() < 0.3 && (s.dy - 4.).abs() < 0.3, "{s:?}");
         assert!(s.score > 0.9, "{s:?}");
+    }
+
+    #[test]
+    fn candidates_find_the_narrow_overlap_first() {
+        let (w, h) = (128, 128);
+        let (a, b) = pair(w, h, -113., 4.);
+        let c = shift_candidates(&a, &b, w, h, (-104., 0.), 25., 0.05, 3);
+        assert!(!c.is_empty());
+        assert!((c[0].dx + 113.).abs() < 0.3 && (c[0].dy - 4.).abs() < 0.3, "{c:?}");
+        assert!(c[0].score > 0.9, "{c:?}");
+        // Nothing outside the circle.
+        assert!(c.iter().all(|s| ((s.dx + 104.).powi(2) + s.dy.powi(2)).sqrt() < 25. + 3.), "{c:?}");
     }
 
     #[test]

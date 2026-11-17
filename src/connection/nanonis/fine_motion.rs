@@ -172,11 +172,11 @@ impl FineMotionState {
         egui::Window::new("Fine Motion")
             .vscroll(true)
             .frame(theme::window_frame(ui.ctx()))
-            .resizable(false)
+            .default_width(300.)
+            .resizable(true)
             .collapsible(true)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.set_max_width(300.);
                 self.show_window(ui, scan_area, locked);
             });
         if !open {

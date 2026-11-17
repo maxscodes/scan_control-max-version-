@@ -211,7 +211,11 @@ impl Object {
             Object::Gds { image, .. } => image.transform = tran * image.transform,
             Object::File { image, .. } => image.transform_world_points(tran),
             Object::ScanImage { image, .. } => image.transform = tran * image.transform,
-            Object::ScanArea { image, .. } => image.world_transform = tran * image.world_transform,
+            Object::ScanArea { image, .. } => {
+                let before = image.world_transform;
+                image.world_transform = tran * image.world_transform;
+                image.manual_drag |= image.world_transform != before;
+            }
         }
     }
     pub fn goto_transform(&self) -> DAffine2 {

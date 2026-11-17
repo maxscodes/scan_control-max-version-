@@ -95,7 +95,7 @@ impl SequenceState {
                     );
                 }
                 Step::CoarseMove { steps } => {
-                    offset += course.steps_to_real(IVec2::from_array(*steps));
+                    offset += self.predict_move(IVec2::from_array(*steps), course);
                 }
                 Step::SetFrame(spec) => frame = spec.apply(frame),
                 Step::Scan(_) => {
@@ -132,6 +132,17 @@ impl SequenceState {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Where a coarse move of the run will take the tip (piezo nm): with
+    /// what a tracked survey grid has learned so far, else the coarse
+    /// calibration. Tiles already done stay where they are; this only
+    /// places the ones still to come.
+    fn predict_move(&self, steps: IVec2, course: &CourseMotionState) -> DVec2 {
+        match &self.grid_track {
+            Some(t) if self.run.is_some() && self.survey.track => t.predict(steps),
+            _ => course.steps_to_real(steps),
         }
     }
 

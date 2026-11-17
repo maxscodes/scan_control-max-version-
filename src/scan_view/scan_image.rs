@@ -21,6 +21,8 @@ pub struct ScanViewImage {
     uuid: Uuid,
     pub transform: DAffine2,
     pub norm_type: NormalizationType,
+    /// 0..1, how opaque the image is drawn on the map.
+    pub opacity: f32,
     image_buffers: ImageComputeBuffers,
     pub fit_data: Arc<RwLock<Option<FitData>>>,
     pub norm_data: Arc<RwLock<Option<NormalizeData>>>,
@@ -44,12 +46,15 @@ impl ScanViewImage {
             transform,
             image_buffers,
             norm_type,
+            opacity: 1.,
             fit_data: Arc::new(RwLock::new(None)),
             norm_data: Arc::new(RwLock::new(None)),
         }
     }
     pub fn resized(&self, image_encoder: &ImageEncoder, size: [u32; 2]) -> Self {
-        Self::new(self.uuid, image_encoder, size, self.transform, self.norm_type)
+        let mut img = Self::new(self.uuid, image_encoder, size, self.transform, self.norm_type);
+        img.opacity = self.opacity;
+        img
     }
     pub fn uuid(&self) -> Uuid {
         self.uuid
@@ -79,6 +84,7 @@ impl ScanViewImage {
             ctx.rect,
             ImageCallback {
                 norm_type: self.norm_type,
+                opacity: self.opacity,
                 transform: self.transform,
                 image_buffers: self.image_buffers.clone(),
             },

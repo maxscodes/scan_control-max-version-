@@ -68,10 +68,11 @@ pub struct MyApp {
     resync_placements: bool,
     /// "Align stamps": lines up the selected stamps by their overlaps.
     aligner: crate::analysis::mosaic::Aligner,
+    /// "Align stamps" also undoes each stamp's drift stretch.
+    align_stretch: bool,
     align_status: Option<(String, std::time::Instant)>,
-    /// "Save as one image": result messages from the background save.
-    export_tx: crossbeam::channel::Sender<String>,
-    export_rx: crossbeam::channel::Receiver<String>,
+    /// "Polish images": cleans up several stamps into one picture.
+    polish: crate::polish_window::PolishWindow,
 }
 
 pub struct AppState {
@@ -92,8 +93,7 @@ impl MyApp {
         let project_save_dialog = ProjectSaveDialog::new();
         let project_open_dialog = ProjectOpenDialog::new();
 
-        let export_channel = crossbeam::channel::unbounded();
-        Self {
+        let mut app = Self {
             app_state: AppState {
                 scan_view: ScanView::new(&image_encoder),
                 object_list,
@@ -107,14 +107,64 @@ impl MyApp {
             placements: HashMap::new(),
             resync_placements: true,
             aligner: Default::default(),
+            align_stretch: true,
             align_status: None,
-            export_tx: export_channel.0,
-            export_rx: export_channel.1,
+            polish: Default::default(),
             pending_connections: vec![nanonis_connection],
             active_connection: None,
             project,
             project_save_dialog,
             project_open_dialog,
+        };
+        app.reopen_after_restart(&cc.egui_ctx);
+        app
+    }
+
+    /// Started by "Rebuild & restart": reopen the project it left.
+    fn reopen_after_restart(&mut self, ctx: &egui::Context) {
+        let Some(h) = crate::restart::take_handoff() else { return };
+        let path = h.project.display().to_string();
+        let loaded = ProjectDb::reopen(h.project, h.temp).and_then(|project| {
+            let txn = project.db().begin_write()?;
+            let list = SelectableList::<Object>::db_read(Uuid::new_v4(), &txn, &self.image_encoder)?;
+            drop(txn);
+            Ok((project, list))
+        });
+        match loaded {
+            Ok((project, list)) => {
+                info!("reopened {path} after the restart: {} objects", list.len());
+                self.project = project;
+                self.app_state.object_list = list;
+                self.resync_placements = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+            }
+            Err(e) => error!("could not reopen {path} after the restart: {e}"),
+        }
+    }
+
+    /// Save the project, start the rebuild and close. The sequence runner
+    /// has already saved a running sequence (it continues after the restart).
+    fn restart_for_rebuild(&mut self, ctx: &egui::Context) {
+        let result = self.write_project().map_err(|e| format!("saving the project failed: {e}")).and_then(|_| {
+            crate::restart::save_handoff(&crate::restart::Handoff {
+                project: self.project.current_path().to_path_buf(),
+                temp: self.project.is_temp(),
+            })
+            .map_err(|e| format!("could not save the restart hand-off: {e}"))?;
+            crate::restart::spawn_rebuild().map_err(|e| {
+                crate::restart::clear_handoff();
+                format!("could not start the rebuild: {e}")
+            })
+        });
+        match result {
+            Ok(()) => {
+                info!("closing for the rebuild");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                error!("rebuild & restart: {e}");
+                self.align_status = Some((format!("Rebuild & restart: {e}"), std::time::Instant::now()));
+            }
         }
     }
     pub fn mod_state<T: StateModify<AppState>>(&mut self, modifier: T) {
@@ -129,48 +179,68 @@ impl MyApp {
         self.resync_placements = true;
     }
 
-    /// Save the stamps at `indexes` (topmost first) as one picture laid out
-    /// as on the map; asks where to save it.
-    fn export_image(&mut self, indexes: &[usize], name: &str) {
-        let pieces: Vec<crate::analysis::mosaic_image::Piece> = indexes
+    /// Open "Polish images" on the stamps at `indexes` (topmost first).
+    fn open_polish(&mut self, indexes: &[usize], name: &str) {
+        let mut first = None;
+        let sources: Vec<crate::analysis::polish::Source> = indexes
             .iter()
             .filter_map(|&i| match &**self.app_state.object_list.get(i)? {
-                Object::ScanImage { image, .. } => Some(crate::analysis::mosaic_image::Piece {
-                    transform: image.transform,
-                    data: image.forward_data.clone(),
-                }),
+                Object::ScanImage { image, name, .. } => {
+                    first.get_or_insert((image.background, image.filters));
+                    Some(crate::analysis::polish::Source {
+                        id: image.uuid(),
+                        name: name.clone(),
+                        transform: image.transform,
+                        forward: image.forward_data.clone(),
+                        backward: image.backward_data.clone(),
+                    })
+                }
                 _ => None,
             })
             .collect();
-        if pieces.is_empty() {
-            return;
+        let gds = crate::analysis::gds_prior::collect(&self.app_state.object_list);
+        self.polish.open_with(sources, name, first, gds);
+    }
+
+    /// Put pictures made in "Polish images" on the map as image layers.
+    fn place_polished(&mut self) {
+        let moves = self.polish.take_moves();
+        if !moves.is_empty() {
+            for obj in self.app_state.object_list.iter_mut() {
+                let id = obj.uuid();
+                if let (Object::ScanImage { image, .. }, Some((_, d))) = (&mut **obj, moves.iter().find(|m| m.0 == id)) {
+                    image.transform.translation += *d;
+                }
+            }
         }
-        let file: String = name
-            .chars()
-            .map(|c| if c.is_alphanumeric() || " -_().".contains(c) { c } else { '_' })
-            .collect();
-        let dialog = crate::components::file_dialog_native::dialog()
-            .add_filter("PNG image", &["png"])
-            .set_title("Save as one image")
-            .set_file_name(format!("{}.png", file.trim()));
-        let tx = self.export_tx.clone();
-        std::thread::spawn(move || {
-            let Some(path) = dialog.save_file() else { return };
-            let n = pieces.len();
-            let msg = match crate::analysis::mosaic_image::render(&pieces, 8000) {
-                Some(img) => match img.save(&path) {
-                    Ok(()) => format!(
-                        "Saved {n} stamps as {} ({}\u{d7}{} px)",
-                        path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
-                        img.width(),
-                        img.height()
-                    ),
-                    Err(e) => format!("Could not save the image: {e}"),
-                },
-                None => "Nothing to save: the stamps have no image data".into(),
-            };
-            let _ = tx.send(msg);
-        });
+        for m in self.polish.take_for_map() {
+            let (w, h) = (m.image.width(), m.image.height());
+            let size = DVec2::new(w as f64 * m.px, h as f64 * m.px);
+            let center = m.top_left + DVec2::new(size.x / 2., -size.y / 2.);
+            // Local y +0.5 is the picture's top row.
+            let tf = DAffine2::from_scale_angle_translation(size, 0., center);
+            let local = [DVec2::new(-0.5, -0.5), DVec2::new(0.5, -0.5), DVec2::new(0.5, 0.5), DVec2::new(-0.5, 0.5)];
+            let world = local.map(|p| tf.transform_point2(p));
+            let image = crate::scan_view::FileImage::new_from_data(
+                Uuid::new_v4(),
+                &self.image_encoder,
+                [w, h],
+                m.image.into_raw(),
+                tf.into(),
+                world,
+                local,
+            );
+            let object = Object::File { image, path: format!("{}.png", m.name).into(), hidden: false };
+            if m.hide_sources {
+                for obj in self.app_state.object_list.iter_mut() {
+                    if m.sources.contains(&obj.uuid()) {
+                        *obj.hidden_mut() = true;
+                    }
+                }
+            }
+            self.app_state.object_list.push(object.into_entry(Uuid::new_v4()));
+            self.align_status = Some((format!("\u{201c}{}\u{201d} put on the map", m.name), std::time::Instant::now()));
+        }
     }
 
     /// Record moves of map objects (dragging, typed positions, Shift GDS,
@@ -229,6 +299,60 @@ impl MyApp {
         recent_files::add_project(self.project.current_path());
         self.verify_saved();
         Ok(())
+    }
+    /// The Nanonis session folder (today's data folder), if it is known.
+    fn nanonis_dir(&self) -> Option<std::path::PathBuf> {
+        let dir = self
+            .app_state
+            .object_list
+            .iter()
+            .find_map(|o| o.as_scan_area())
+            .map(|a| std::path::PathBuf::from(a.session_dir.trim()))?;
+        (!dir.as_os_str().is_empty() && dir.is_dir()).then_some(dir)
+    }
+    /// Where "Save to Nanonis folder" writes: the project's name, or
+    /// "project(<today>)" for an untitled or date-named project, in the
+    /// session folder. Numbered so another project already there is never
+    /// overwritten; saving again to the same place reuses the file.
+    fn nanonis_save_path(&self) -> Option<std::path::PathBuf> {
+        let dir = self.nanonis_dir()?;
+        let name = self.project_name();
+        let dated = self.project.is_temp() || name == "project" || name.starts_with("project(");
+        let stem = if dated {
+            let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            format!("project({})", now.date())
+        } else {
+            name
+        };
+        let current = self.project.current_path();
+        let free = |p: &std::path::Path| {
+            !p.exists() || (!self.project.is_temp() && p.canonicalize().ok() == current.canonicalize().ok())
+        };
+        std::iter::once(format!("{stem}.scp"))
+            .chain((2..).map(|k| format!("{stem}({k}).scp")))
+            .map(|f| dir.join(f))
+            .find(|p| free(p))
+    }
+    /// Save the project into the Nanonis session folder, next to today's scans.
+    fn save_to_nanonis(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.nanonis_save_path() else {
+            self.align_status = Some((
+                "Nanonis folder not known yet: connect to Nanonis first".into(),
+                std::time::Instant::now(),
+            ));
+            return;
+        };
+        let msg = match self.save_project_as(path.clone()) {
+            Ok(()) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+                format!("Saved project to {}", path.display())
+            }
+            Err(e) => {
+                error!("save to Nanonis folder failed: {e}");
+                format!("Could not save to {}: {e}", path.display())
+            }
+        };
+        self.align_status = Some((msg, std::time::Instant::now()));
     }
     fn project_name(&self) -> String {
         if self.project.is_temp() {
@@ -307,6 +431,9 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if crate::restart::take_requested() {
+            self.restart_for_rebuild(ctx);
+        }
         match &mut self.active_connection {
             Some(conn) => conn.update(&mut self.app_state.object_list, &self.image_encoder),
             None => {
@@ -326,8 +453,11 @@ impl eframe::App for MyApp {
         if let Some(summary) = self.aligner.poll(&mut self.app_state.object_list) {
             self.align_status = Some((summary, std::time::Instant::now()));
         }
-        if let Ok(msg) = self.export_rx.try_recv() {
-            self.align_status = Some((msg, std::time::Instant::now()));
+        self.polish.show(ctx);
+        self.place_polished();
+        // Ctrl+Shift+S first: Ctrl+S would also take it.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, egui::Key::S)) {
+            self.save_to_nanonis(ctx);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, egui::Key::S)) {
             self.save_project();
@@ -429,6 +559,8 @@ impl eframe::App for MyApp {
                     self.redo();
                 }
                 ui.separator();
+                nanonis_save_button(ui, self, "\u{1F4BE} Save to day folder");
+                ui.separator();
                 let selected: Vec<Uuid> = self
                     .app_state
                     .object_list
@@ -443,24 +575,41 @@ impl eframe::App for MyApp {
                     )
                     .on_hover_text(
                         "Line up the selected stamps by matching the image where they overlap \
-                         (e.g. survey tiles). Only their positions change; Undo puts them back.",
+                         (e.g. survey tiles). \u{201c}Undo align\u{201d} puts them back.",
                     )
                     .on_disabled_hover_text("Select two or more overlapping stamps")
                     .clicked()
                 {
-                    self.aligner.start(&self.app_state.object_list, &selected);
+                    self.aligner.start(&self.app_state.object_list, &selected, self.align_stretch);
                 }
+                if self.aligner.can_undo()
+                    && ui
+                        .button("Undo align")
+                        .on_hover_text("Put the stamps of the last alignment back where they were.")
+                        .clicked()
+                {
+                    let n = self.aligner.undo(&mut self.app_state.object_list);
+                    self.align_status =
+                        Some((format!("Alignment undone: {n} stamps put back"), std::time::Instant::now()));
+                }
+                ui.checkbox(&mut self.align_stretch, "fix drift stretch").on_hover_text(
+                    "Also undo the stretch and slant drift puts into each scan (along the slow \
+                     scan direction), so the seams meet along their whole length, not just in \
+                     the middle. Off: stamps are only moved.",
+                );
                 if ui
-                    .add_enabled(!selected.is_empty(), Button::new("Save as image\u{2026}"))
+                    .add_enabled(!selected.is_empty(), Button::new("\u{2728} Polish\u{2026}"))
                     .on_hover_text(
-                        "Save the selected stamps as one PNG, laid out as on the map \
-                         (e.g. a survey grid). Tip: click a group in Layers to select it all.",
+                        "Open the selected stamps (e.g. a survey grid) in their own window to clean \
+                         them up into one seamless picture: background, glitch lines, matched seams, \
+                         contrast stretch, colours. Save it as a PNG or put it back on the map. \
+                         Tip: click a group in Layers to select it all.",
                     )
-                    .on_disabled_hover_text("Select the stamps to save")
+                    .on_disabled_hover_text("Select the stamps to polish")
                     .clicked()
                 {
                     let idxs: Vec<usize> = self.app_state.object_list.iter_selected_indexes().rev().collect();
-                    self.export_image(&idxs, "stamps");
+                    self.open_polish(&idxs, "stamps");
                 }
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -670,7 +819,7 @@ impl eframe::App for MyApp {
                                 .and_then(|&i| self.app_state.object_list.get_mut(i))
                                 .and_then(|o| o.group_mut().and_then(|g| g.clone()))
                                 .unwrap_or_else(|| "stamps".into());
-                            self.export_image(&members, &name);
+                            self.open_polish(&members, &name);
                         }
                     })
                     .map(|resp| {
@@ -685,14 +834,12 @@ impl eframe::App for MyApp {
                 self.show_gds_moved_warning(ctx, ui.min_rect());
                 let mut new_top = ui.clip_rect().top();
                 if let Some(conn) = &mut self.active_connection {
-                    if let Some(resp) = egui::Window::new("Scan Control")
-                        .vscroll(true)
-                        .frame(theme::overlay_frame(ctx))
-                        .constrain_to(ui.min_rect())
-                        .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
-                        .resizable(false)
+                    let map = ui.min_rect();
+                    if let Some(resp) = side_window("Scan Control", ctx, map, new_top)
+                        // Tall enough to show everything on most screens;
+                        // drag the bottom edge to change it.
+                        .default_height((map.height() - 10.).min(900.))
                         .show(ctx, |ui| {
-                            ui.set_width(theme::SIDE_PANEL_WIDTH);
                             conn.show_menu(
                                 ui,
                                 &mut self.app_state.object_list,
@@ -717,17 +864,9 @@ impl eframe::App for MyApp {
                     .collect_vec();
                 let multi = stamps.len() >= 2;
                 if multi {
-                    let mut rect = ui.min_rect();
-                    rect.set_top(new_top);
-                    if let Some(resp) = egui::Window::new(format!("{} stamps", stamps.len()))
-                        .vscroll(true)
+                    if let Some(resp) = side_window(format!("{} stamps", stamps.len()), ctx, ui.min_rect(), new_top)
                         .id(egui::Id::new("multi_stamp_menu"))
-                        .frame(theme::overlay_frame(ctx))
-                        .constrain_to(rect)
-                        .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
-                        .resizable(false)
                         .show(ctx, |ui| {
-                            ui.set_width(theme::SIDE_PANEL_WIDTH);
                             ui.weak("Changes apply to every selected stamp.");
                             let mut images = self
                                 .app_state
@@ -760,16 +899,8 @@ impl eframe::App for MyApp {
                         continue;
                     }
                     let name = self.app_state.object_list[i].name();
-                    let mut rect = ui.min_rect();
-                    rect.set_top(new_top);
-                    if let Some(resp) = egui::Window::new(name)
-                        .vscroll(true)
-                        .frame(theme::overlay_frame(ctx))
-                        .constrain_to(rect)
-                        .anchor(Align2::RIGHT_TOP, egui::Vec2::new(5., 5.))
-                        .resizable(false)
+                    if let Some(resp) = side_window(name, ctx, ui.min_rect(), new_top)
                         .show(ctx, |ui| {
-                            ui.set_width(theme::SIDE_PANEL_WIDTH);
                             self.app_state.object_list[i].show_menu(ui, &mut self.image_encoder);
                             if matches!(&*self.app_state.object_list[i], Object::Gds { .. }) {
                                 gds_ring_check_ui(
@@ -812,9 +943,10 @@ impl MyApp {
             return;
         }
         let objects = &mut self.app_state.object_list;
-        egui::Window::new("GDS moved")
+        egui::Window::new("\u{26A0} GDS moved")
+            .id(egui::Id::new("GDS moved"))
             .frame(theme::overlay_frame(ctx))
-            .title_bar(false)
+            .collapsible(true)
             .resizable(false)
             .constrain_to(rect)
             .anchor(Align2::CENTER_TOP, egui::Vec2::new(0., 5.))
@@ -875,6 +1007,26 @@ impl MyApp {
                 }
             });
     }
+}
+
+/// A settings panel over the map: opens at the top right (below `top`, the
+/// bottom of the panel above it) and can be moved, resized and collapsed.
+fn side_window<'a>(
+    title: impl Into<egui::WidgetText>,
+    ctx: &egui::Context,
+    map: egui::Rect,
+    top: f32,
+) -> egui::Window<'a> {
+    egui::Window::new(title)
+        .frame(theme::overlay_frame(ctx))
+        .constrain_to(map)
+        .pivot(Align2::RIGHT_TOP)
+        .default_pos(egui::pos2(map.right() - 5., top + 5.))
+        .default_size([theme::SIDE_PANEL_WIDTH, 420.])
+        .min_width(theme::SIDE_PANEL_WIDTH)
+        .resizable(true)
+        .collapsible(true)
+        .vscroll(true)
 }
 
 /// Point these stamps' GDS reference at the GDS as it is now.
@@ -1152,6 +1304,7 @@ fn file_menu_button(ui: &mut Ui, app: &mut MyApp) {
             // The current state is written when the path comes back.
             app.project_save_dialog.select_path();
         }
+        nanonis_save_button(ui, app, "Save to Nanonis folder  (Ctrl+Shift+S)");
         ui.separator();
         if ui.add(Button::new("Import Files")).clicked() {
             let tf = import_transform(app);
@@ -1181,6 +1334,24 @@ fn file_menu_button(ui: &mut Ui, app: &mut MyApp) {
             });
         });
     });
+}
+
+/// Button for "Save to Nanonis folder", with the target path as its tooltip.
+fn nanonis_save_button(ui: &mut Ui, app: &mut MyApp, text: &str) {
+    let target = app.nanonis_save_path();
+    let hover = match &target {
+        Some(p) => format!("Save the project in the Nanonis session folder, with today's scans:\n{}", p.display()),
+        None => String::new(),
+    };
+    if ui
+        .add_enabled(target.is_some(), Button::new(text))
+        .on_hover_text(hover)
+        .on_disabled_hover_text("The Nanonis session folder is not known yet: connect to Nanonis first")
+        .clicked()
+    {
+        app.save_to_nanonis(ui.ctx());
+        ui.close();
+    }
 }
 
 /// Where imported files land: the centre of the current view.

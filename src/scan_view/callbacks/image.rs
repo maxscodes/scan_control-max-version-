@@ -7,6 +7,8 @@ use crate::scan_view::callbacks::global::GlobalResources;
 pub struct ImageCallback {
     pub transform: DAffine2,
     pub norm_type: NormalizationType,
+    /// 0..1
+    pub opacity: f32,
     pub image_buffers: ImageComputeBuffers,
 }
 impl CallbackTrait for ImageCallback {
@@ -22,7 +24,7 @@ impl CallbackTrait for ImageCallback {
         self.image_buffers
             .write_world_transform(queue, self.transform);
         self.image_buffers
-            .write_normalization_type(queue, self.norm_type)
+            .write_display(queue, self.norm_type, self.opacity)
             .unwrap();
         vec![]
     }

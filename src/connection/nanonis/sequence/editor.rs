@@ -13,7 +13,7 @@ use crate::{
             course_motion::{CoarseCalibration, CourseMotionState},
             sequence::{
                 eta::{self, RunClock, ScanState, StepTimes},
-                grid_track::GridTrack,
+                grid_track::{GridTrack, Placement, StampMove, Unmatched},
                 model::{
                     compile, expand, with_current_scan, CoarseSpec, CurrentScan, Dir, ScanStart,
                     Frame as ScanFrame,
@@ -78,8 +78,17 @@ struct SweepSettings {
     list: String,
 }
 
+/// A change a tracked grid wants to make, held for the user to accept.
+struct GridApproval {
+    /// Tile (index in the grid) just placed.
+    tile: usize,
+    /// The next tile's entry, its coarse move step, and the corrected
+    /// steps, when the move would change.
+    next: Option<(usize, usize, [i32; 2])>,
+}
+
 /// Survey grid: tiles of the scan frame side by side, joined by coarse moves.
-struct SurveySettings {
+pub(super) struct SurveySettings {
     cols: u32,
     rows: u32,
     /// Fraction of the frame shared with the neighbouring tile, in %.
@@ -91,7 +100,15 @@ struct SurveySettings {
     settle_s: f64,
     /// Place each tile by matching it with the one before, take dragged
     /// tiles as where they really are, and aim the next move from that.
-    track: bool,
+    pub(super) track: bool,
+    /// Hold the run and ask before a tracked grid changes a move or places
+    /// a tile well away from its plan.
+    approve: bool,
+    /// Slow-scan direction of every tile: alternating, or all the same way
+    /// (drift then distorts every tile alike, so the seams fit better).
+    dir: Dir,
+    /// Scan each tile after a move twice, keeping only the second (creep).
+    warm_up: bool,
 }
 
 /// One tile of the grid: column, row (0-based) in visiting order.
@@ -132,7 +149,7 @@ pub struct SequenceState {
     /// Why the sequence is held: the instrument was used outside it.
     interrupted: Option<String>,
     sweep: SweepSettings,
-    survey: SurveySettings,
+    pub(super) survey: SurveySettings,
     load_tx: Sender<Result<Sequence, String>>,
     load_rx: Receiver<Result<Sequence, String>>,
     /// After a sequence finishes its plan is hidden from the map, until the
@@ -178,8 +195,24 @@ pub struct SequenceState {
     clock: Option<(RunClock, ScanState)>,
     /// A survey grid steering its moves as it runs (kept after the run,
     /// so tiles can still be dragged into place and the calibration saved).
-    grid_track: Option<GridTrack>,
+    pub(super) grid_track: Option<GridTrack>,
     grid_calib_save: Option<(CoarseCalibration, usize)>,
+    /// Each tracked tile entry's coarse move as planned, before any correction.
+    grid_planned: std::collections::HashMap<usize, [i32; 2]>,
+    /// Entries whose move is kept as planned (a correction was turned down).
+    grid_pinned: std::collections::HashSet<usize>,
+    /// A change the grid wants to make, waiting for the user (run held).
+    grid_approval: Option<GridApproval>,
+    /// Stamps to move on the map (undo or redo of an automatic placement).
+    stamp_moves: Vec<StampMove>,
+    /// The last line-up of survey tiles can be undone, and the user asked to.
+    lineup_undo_available: bool,
+    lineup_undo_request: bool,
+    /// Pause once the scan in progress (or the next) is done and stamped.
+    pause_after_scan: bool,
+    /// "Rebuild & restart" was clicked: waiting for the runner to save the
+    /// run at a safe point.
+    restart_pending: bool,
 }
 
 impl SequenceState {
@@ -216,6 +249,9 @@ impl SequenceState {
                 plus_y: false,
                 settle_s: 30.,
                 track: true,
+                approve: true,
+                dir: Dir::Alternate,
+                warm_up: false,
             },
             load_tx,
             load_rx,
@@ -241,6 +277,14 @@ impl SequenceState {
             tile_groups: Vec::new(),
             grid_track: None,
             grid_calib_save: None,
+            grid_planned: Default::default(),
+            grid_pinned: Default::default(),
+            grid_approval: None,
+            stamp_moves: Vec::new(),
+            lineup_undo_available: false,
+            lineup_undo_request: false,
+            pause_after_scan: false,
+            restart_pending: false,
         }
     }
 
@@ -355,6 +399,8 @@ impl SequenceState {
                 }
                 SequenceEvent::Resumed => {
                     self.status = "Running".into();
+                    // Carried on without an answer: the move stays as planned.
+                    self.grid_approval = None;
                     self.interrupted = None;
                     if let Some((clock, _)) = &mut self.clock {
                         clock.resume();
@@ -366,6 +412,7 @@ impl SequenceState {
                 }
                 SequenceEvent::Finished => {
                     self.status = "Finished".into();
+                    self.grid_approval = None;
                     // A tracked grid is already placed (and hand-corrected).
                     if self.survey_tiles.len() >= 2 && self.grid_track.is_none() {
                         self.finished_survey = Some(std::mem::take(&mut self.survey_tiles));
@@ -388,6 +435,7 @@ impl SequenceState {
                 }
                 SequenceEvent::Aborted => {
                     self.status = "Aborted".into();
+                    self.grid_approval = None;
                     if self.survey_tiles.len() >= 2 && self.grid_track.is_none() {
                         self.finished_survey = Some(std::mem::take(&mut self.survey_tiles));
                     }
@@ -416,6 +464,38 @@ impl SequenceState {
                 SequenceEvent::Error { index, message } => {
                     error!("sequence error at step {index}: {message}");
                     self.last_error = Some(message);
+                }
+                SequenceEvent::Restored { steps, index, plan, auto_resume, note, survey_group, survey_tiles } => {
+                    info!("sequence {note}");
+                    self.seq = plan;
+                    // Tiles taken from here on join the same survey.
+                    self.survey_group = survey_group;
+                    self.survey_tiles = survey_tiles;
+                    self.selected = None;
+                    self.plan_hidden = None;
+                    self.run = Some(RunView {
+                        steps,
+                        current: index,
+                        paused: true,
+                        wait_remaining: None,
+                        detail: None,
+                    });
+                    self.clock = None;
+                    if auto_resume {
+                        self.status = "Restarted: continues once Nanonis is connected".into();
+                    } else {
+                        self.status = "Paused".into();
+                        self.interrupted = Some(note);
+                    }
+                    self.window_open = true;
+                }
+                SequenceEvent::PauseAfterScan(on) => self.pause_after_scan = on,
+                SequenceEvent::Detached => {
+                    if self.restart_pending {
+                        self.restart_pending = false;
+                        self.status = "Saved; restarting to rebuild…".into();
+                        crate::restart::request();
+                    }
                 }
             }
         }
@@ -462,7 +542,8 @@ impl SequenceState {
         }
         self.cal = None;
         let scan_start = self.seq.scan_start;
-        self.run_steps(steps, group, scan_start);
+        let plan = Some(self.seq.clone());
+        self.run_steps(steps, group, scan_start, plan);
     }
 
     /// Run the coarse calibration scans (the user's entries stay as they are).
@@ -479,7 +560,7 @@ impl SequenceState {
         // Show the progress, small.
         self.window_open = true;
         self.minimized = true;
-        self.run_steps(steps, group, seq.scan_start);
+        self.run_steps(steps, group, seq.scan_start, None);
         self.status = "Calibrating".into();
     }
 
@@ -495,7 +576,7 @@ impl SequenceState {
         }
         if let Some((seq, group)) = self.cal_restore.take() {
             let steps = compile(&seq, 0, Dir::Down);
-            self.run_steps(steps, group, seq.scan_start);
+            self.run_steps(steps, group, seq.scan_start, None);
             self.status = "Restoring frame and resolution".into();
         }
     }
@@ -513,8 +594,9 @@ impl SequenceState {
     }
     /// A survey tile was scanned (its image): measure the move that got
     /// here by matching it with the previous tile, and correct the move to
-    /// the next tile. Returns how far (piezo nm) the tip is from where the
-    /// moves predicted: move the scan area by it before stamping, so the
+    /// the next tile (or, when asking first, hold the run for the user to
+    /// accept the change). Returns how far (piezo nm) the tip is from where
+    /// the scan area is: move the scan area by it before stamping, so the
     /// tile lands in the right place on the map.
     pub fn grid_tile_scanned(
         &mut self,
@@ -532,44 +614,149 @@ impl SequenceState {
         let target = DVec2::from_array(entry.grid_pos?);
         let moved = entry.coarse.map(|c| IVec2::from_array(c.steps));
         let track = self.grid_track.get_or_insert_with(|| GridTrack::new(calib, volts, world_m2));
-        // The map moved the scan area with the normal calibration.
         let off = track.tile_scanned(frame, here, target, moved, &calib);
         info!("{}", track.summary());
-        self.correct_next_move();
+        let info = *track.tiles_info().last()?;
+        let plan = self.next_move_plan();
+        let changes_move = plan.is_some_and(|(_, _, planned, steps)| steps != planned);
+        // Placed well away from where the moves put it (a tenth of the spacing).
+        let spacing = self.grid_spacing(here).unwrap_or(f64::INFINITY);
+        let big_shift = matches!(info.placement, Placement::Matched { .. }) && info.auto_shift_nm > 0.1 * spacing;
+        let running = self.run.as_ref().is_some_and(|r| !r.paused);
+        if self.survey.approve && (changes_move || big_shift) && running {
+            self.grid_approval = Some(GridApproval {
+                tile: info.index,
+                next: plan.filter(|_| changes_move).map(|(next, at, _, steps)| (next, at, steps)),
+            });
+            // Held once the stamp is done, before anything moves the tip.
+            self.send(SequenceCommand::Pause);
+            self.status = "Waiting for you to accept or reject the grid's correction".into();
+        } else if let Some((next, at, _, steps)) = plan {
+            self.apply_move(next, at, steps);
+        }
         Some(off)
     }
 
-    /// Re-aim the move to the tile after the latest one, unless it has
-    /// started already.
-    fn correct_next_move(&mut self) {
-        let plan = (|| {
-            let (track, run) = (self.grid_track.as_ref()?, self.run.as_ref()?);
-            let here = track.latest_entry()?;
-            let last_here = run.steps.iter().rposition(|(e, _)| *e == here)?;
-            let &(next, _) = run.steps.get(last_here + 1)?;
-            let entry = self.seq.entries.get(next)?;
-            let target = DVec2::from_array(entry.grid_pos?);
-            let planned = entry.coarse?.steps;
-            let move_at = run
-                .steps
-                .iter()
-                .position(|(e, s)| *e == next && matches!(s, Step::CoarseMove { .. }))?;
-            if move_at <= run.current {
-                return None;
-            }
-            let steps = track.next_steps(target)?.to_array();
-            (steps != planned).then_some((next, move_at, steps))
-        })();
-        let Some((next, move_at, steps)) = plan else { return };
-        if let Some(c) = self.seq.entries[next].coarse.as_mut() {
-            c.steps = steps;
+    /// The scan area was moved by a coarse move of the run: when a tracked
+    /// grid is going, how much further (piezo nm) to move it so it sits
+    /// where the grid's learned calibration puts the tip.
+    pub fn grid_moved(&mut self, steps: IVec2, map_calib: &CoarseCalibration) -> Option<DVec2> {
+        if !self.survey.track || self.cal.is_some() || !self.current_entry_is_tile() {
+            return None;
         }
+        Some(self.grid_track.as_mut()?.moved(steps, map_calib))
+    }
+
+    /// Distance between tile `entry`'s plan and the tile before it, nm.
+    fn grid_spacing(&self, entry: usize) -> Option<f64> {
+        let here = DVec2::from_array(self.seq.entries.get(entry)?.grid_pos?);
+        let prev = self.seq.entries[..entry].iter().rev().find_map(|e| e.grid_pos)?;
+        Some((here - DVec2::from_array(prev)).length())
+    }
+
+    /// The move to the tile after the latest one, unless it has started:
+    /// (entry, its coarse move step, planned steps, steps to use).
+    fn next_move_plan(&mut self) -> Option<(usize, usize, [i32; 2], [i32; 2])> {
+        let (track, run) = (self.grid_track.as_ref()?, self.run.as_ref()?);
+        let here = track.latest_entry()?;
+        let last_here = run.steps.iter().rposition(|(e, _)| *e == here)?;
+        let &(next, _) = run.steps.get(last_here + 1)?;
+        let entry = self.seq.entries.get(next)?;
+        let target = DVec2::from_array(entry.grid_pos?);
+        let current = entry.coarse?.steps;
+        let move_at =
+            run.steps.iter().position(|(e, s)| *e == next && matches!(s, Step::CoarseMove { .. }))?;
+        if move_at <= run.current {
+            return None;
+        }
+        let planned = *self.grid_planned.entry(next).or_insert(current);
+        let steps = if self.grid_pinned.contains(&next) {
+            planned
+        } else {
+            self.grid_track.as_ref()?.next_steps(target, IVec2::from_array(planned))?.to_array()
+        };
+        Some((next, move_at, planned, steps))
+    }
+
+    /// Use `steps` for entry `next`'s coarse move (step `move_at`).
+    fn apply_move(&mut self, next: usize, move_at: usize, steps: [i32; 2]) {
+        let Some(c) = self.seq.entries.get_mut(next).and_then(|e| e.coarse.as_mut()) else { return };
+        if c.steps == steps {
+            return;
+        }
+        c.steps = steps;
         self.send(SequenceCommand::AdjustCoarse { entry: next, steps });
         if let Some(run) = &mut self.run {
             if let Some((_, Step::CoarseMove { steps: s })) = run.steps.get_mut(move_at) {
                 *s = steps;
             }
         }
+    }
+
+    /// Re-aim the move to the tile after the latest one (after tiles were
+    /// dragged, a placement undone, or learning switched), unless it has
+    /// started. While the user is being asked, only the question changes.
+    fn correct_next_move(&mut self) {
+        let Some((next, at, planned, steps)) = self.next_move_plan() else { return };
+        if let Some(a) = &mut self.grid_approval {
+            a.next = (steps != planned).then_some((next, at, steps));
+            return;
+        }
+        self.apply_move(next, at, steps);
+    }
+
+    /// The user accepted the grid's correction: use it and carry on.
+    fn approve_grid(&mut self) {
+        let Some(a) = self.grid_approval.take() else { return };
+        if let Some((next, at, steps)) = a.next {
+            self.apply_move(next, at, steps);
+        }
+        self.send(SequenceCommand::Resume);
+    }
+
+    /// The user turned the correction down: the tile goes back to where the
+    /// moves put it, the next move stays as planned, and the run carries on.
+    fn reject_grid(&mut self) {
+        let Some(a) = self.grid_approval.take() else { return };
+        self.set_tile_undone(a.tile, true);
+        if let Some((next, at, _)) = a.next {
+            self.pin_move(next, at, true);
+        }
+        self.send(SequenceCommand::Resume);
+    }
+
+    /// Keep entry `next`'s move as planned (or let the grid correct it again).
+    fn pin_move(&mut self, next: usize, move_at: usize, pinned: bool) {
+        if pinned {
+            self.grid_pinned.insert(next);
+            if let Some(&planned) = self.grid_planned.get(&next) {
+                self.apply_move(next, move_at, planned);
+            }
+        } else {
+            self.grid_pinned.remove(&next);
+            self.correct_next_move();
+        }
+    }
+
+    /// Undo (or redo) the automatic placement of tile `k`.
+    fn set_tile_undone(&mut self, k: usize, undone: bool) {
+        let Some(m) = self.grid_track.as_mut().and_then(|t| t.set_undone(k, undone)) else { return };
+        info!("grid tile {}: automatic placement {}", k + 1, if undone { "undone" } else { "restored" });
+        self.stamp_moves.push(m);
+        self.correct_next_move();
+    }
+
+    /// Stamps to move on the map (undo or redo of automatic placements).
+    pub fn take_stamp_moves(&mut self) -> Vec<StampMove> {
+        std::mem::take(&mut self.stamp_moves)
+    }
+    /// Whether the last line-up of survey tiles can be undone.
+    pub fn set_lineup_undo_available(&mut self, on: bool) {
+        self.lineup_undo_available = on;
+    }
+    /// The user asked to undo the last line-up (once).
+    pub fn take_lineup_undo_request(&mut self) -> bool {
+        std::mem::take(&mut self.lineup_undo_request)
     }
 
     /// Stamps of the tracked grid's tiles.
@@ -608,6 +795,8 @@ impl SequenceState {
             )
         });
         self.tile_groups.push((id, group.clone()));
+        let (group, tiles) = (self.survey_group.clone(), self.survey_tiles.clone());
+        self.send(SequenceCommand::SurveyTiles { group, tiles });
     }
     /// Survey tiles to put in their layer group.
     pub fn take_tile_groups(&mut self) -> Vec<(uuid::Uuid, String)> {
@@ -646,10 +835,14 @@ impl SequenceState {
         Some(r)
     }
 
-    fn run_steps(&mut self, steps: Vec<(usize, Step)>, group: u32, scan_start: ScanStart) {
+    /// `plan`: the run is saved as it goes, to survive an app restart.
+    fn run_steps(&mut self, steps: Vec<(usize, Step)>, group: u32, scan_start: ScanStart, plan: Option<Sequence>) {
         self.survey_tiles.clear();
         self.survey_group = None;
         self.grid_track = None;
+        self.grid_planned.clear();
+        self.grid_pinned.clear();
+        self.grid_approval = None;
         self.plan_hidden = None;
         self.last_error = None;
         self.status = "Starting".into();
@@ -663,7 +856,7 @@ impl SequenceState {
         self.clock = self
             .scan_now
             .map(|scan| (RunClock::new(self.times.clone()), scan));
-        self.send(SequenceCommand::Run { steps, group, scan_start });
+        self.send(SequenceCommand::Run { steps, group, scan_start, plan });
     }
 
     /// Refresh what the time estimate needs from the scan area (each frame,
@@ -695,6 +888,14 @@ impl SequenceState {
             };
             (h - done) as f64 * (f + b)
         });
+        // A run restored after a restart gets its clock once the scan set-up is known.
+        if let (Some(run), None, Some(scan)) = (&self.run, &self.clock, self.scan_now) {
+            let mut clock = RunClock::new(self.times.clone()).at(run.current);
+            if run.paused {
+                clock.pause();
+            }
+            self.clock = Some((clock, scan));
+        }
     }
 
     /// The "Sequence" button and window. Shown from the Scan Region menu.
@@ -722,26 +923,21 @@ impl SequenceState {
                 .vscroll(true)
                 .id(egui::Id::new("sequence_window_minimized"))
                 .frame(crate::theme::window_frame(ui.ctx()))
-                .auto_sized()
-                .collapsible(false)
+                .default_size([380., 200.])
+                .min_width(320.)
+                .resizable(true)
+                .collapsible(true)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
-                    // The progress bar and wrapped labels take all the width
-                    // they are offered, so an auto-sized window would grow to
-                    // the screen width without a cap.
-                    ui.set_min_width(320.);
-                    ui.set_max_width(480.);
                     self.show_window(ui, scan_area.as_deref(), course, blocked_by);
                 });
         } else {
             egui::Window::new("Sequence")
                 .vscroll(true)
                 .frame(crate::theme::window_frame(ui.ctx()))
-                .default_width(720.)
-                // Width is adjustable; height follows the content, so the window
-                // shrinks when entry details are hidden.
-                .resizable([true, false])
-                .collapsible(false)
+                .default_size([720., 600.])
+                .resizable(true)
+                .collapsible(true)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
                     self.show_window(ui, scan_area.as_deref(), course, blocked_by);
@@ -1334,6 +1530,15 @@ impl SequenceState {
                     .on_hover_text("Off: this entry only sets things up, moves the tip and runs spectroscopy");
                 ui.end_row();
 
+                ui.label("Warm-up");
+                ui.add_enabled(e.scan, egui::Checkbox::new(&mut e.warm_up_scan, "scan once first, discard it"))
+                    .on_hover_text(
+                        "Scan twice and keep only the second image. The piezo creeps most \
+                         right after a coarse move and approach; the first scan uses up that \
+                         time, so the kept image is less distorted. Doubles the scan time.",
+                    );
+                ui.end_row();
+
                 ui.label("Stamp");
                 ui.add_enabled(e.scan, egui::Checkbox::new(&mut e.stamp, "add image to layers when done"));
                 ui.end_row();
@@ -1586,6 +1791,35 @@ impl SequenceState {
                          Keep 30 % overlap or more.",
                     );
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Scan direction");
+                    ui.selectable_value(&mut sv.dir, Dir::Alternate, "⇅ Alternate").on_hover_text(
+                        "Each tile scans the opposite way to the one before (no time lost \
+                         going back to the start line). Drift then stretches one tile and \
+                         squeezes the next, so neighbours may not quite meet.",
+                    );
+                    ui.selectable_value(&mut sv.dir, Dir::Down, "↓ All down").on_hover_text(
+                        "Every tile scans downwards: drift distorts every tile the same way, \
+                         so the seams fit better.",
+                    );
+                    ui.selectable_value(&mut sv.dir, Dir::Up, "↑ All up").on_hover_text(
+                        "Every tile scans upwards: drift distorts every tile the same way, \
+                         so the seams fit better.",
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut sv.warm_up, "Warm-up scan after each move").on_hover_text(
+                        "Scan each tile twice after its coarse move and keep only the second \
+                         image. The piezo creeps most right after a move and approach; the \
+                         first scan uses up that time, so kept tiles are less distorted and \
+                         fit together better. Doubles the scan time of every tile but the \
+                         first. Raising \u{201c}Settle after approach\u{201d} helps the same way \
+                         without scanning.",
+                    );
+                    if sv.warm_up && sv.dir == Dir::Alternate {
+                        ui.weak("(warm-up and kept scans go opposite ways: every kept tile scans the same way)");
+                    }
+                });
 
                 // Tile size: the template's frame if it sets one, else Nanonis' frame.
                 let template = self
@@ -1618,14 +1852,30 @@ impl SequenceState {
                 let ov_x = real_overlap(steps_x, step_x, frame.width)
                     .min(real_overlap(steps_x_back, step_x, frame.width));
                 let ov_y = real_overlap(steps_y, step_y, frame.height);
+                let ov_min = match (sv.cols > 1, sv.rows > 1) {
+                    (true, true) => ov_x.min(ov_y),
+                    (true, false) => ov_x,
+                    (false, true) => ov_y,
+                    (false, false) => 100.,
+                };
+                if sv.track && ov_min < 30. {
+                    ui.colored_label(
+                        Color32::ORANGE,
+                        format!(
+                            "Only {ov_min:.0} % overlap: tiles may not share enough to be matched \
+                             (look-alikes win). Use 30 % or more for \u{201c}Correct moves as it runs\u{201d}."
+                        ),
+                    );
+                }
                 let tiles = sv.cols * sv.rows;
+                let scans = if sv.warm_up { 2 * tiles - 1 } else { tiles };
                 ui.weak(format!(
                     "Tile {:.2} × {:.2} µm · area ≈ {:.1} × {:.1} µm · {} scans, {} coarse moves",
                     frame.width * 1e-3,
                     frame.height * 1e-3,
                     (frame.width * (1. + (sv.cols - 1) as f64 * keep)) * 1e-3,
                     (frame.height * (1. + (sv.rows - 1) as f64 * keep)) * 1e-3,
-                    tiles,
+                    scans,
                     tiles - 1,
                 ));
                 ui.weak(format!(
@@ -1644,7 +1894,7 @@ impl SequenceState {
                     );
                 }
                 let template_label = match self.selected.filter(|&i| i < self.seq.entries.len()) {
-                    Some(i) => format!("Template: entry {} (bias, current, speed, waits, dir)", i + 1),
+                    Some(i) => format!("Template: entry {} (bias, current, speed, waits)", i + 1),
                     None => "Template: default entry (select one to use it as template)".into(),
                 };
                 ui.weak(template_label);
@@ -1663,6 +1913,7 @@ impl SequenceState {
                         e.enabled = true;
                         e.scan = true;
                         e.stamp = true;
+                        e.dir = sv.dir;
                         e.tip = Default::default();
                         // Same frame for every tile; the stage does the moving.
                         if matches!(e.frame.position, Position::Shift(_)) {
@@ -1678,6 +1929,7 @@ impl SequenceState {
                         });
                         if prev.is_some() {
                             e.settle_s = e.settle_s.max(sv.settle_s);
+                            e.warm_up_scan = sv.warm_up;
                         }
                         self.seq.entries.push(e);
                         prev = Some((c, r));
@@ -1735,8 +1987,10 @@ impl SequenceState {
             }
             let paused = self.run.as_ref().is_some_and(|r| r.paused);
             if paused {
+                let asked = self.grid_approval.is_some();
                 if ui
-                    .button("\u{23f5} Continue")
+                    .add_enabled(!asked, egui::Button::new("\u{23f5} Continue"))
+                    .on_disabled_hover_text("Accept or reject the grid's correction first (below)")
                     .on_hover_text(
                         "Carry on from where it stopped, keeping any changes you made. \
                          A scan that was paused is resumed; one that was stopped is scanned again.",
@@ -1774,6 +2028,16 @@ impl SequenceState {
             {
                 self.status = "Aborting…".into();
                 self.send(SequenceCommand::Abort);
+            }
+            if ui
+                .toggle_value(&mut self.pause_after_scan, "⏸ After scan")
+                .on_hover_text(
+                    "Pause once the scan in progress (or the next one, if none is running) \
+                     is done and stamped. Turns itself off when it pauses.",
+                )
+                .changed()
+            {
+                self.send(SequenceCommand::PauseAfterScan(self.pause_after_scan));
             }
             ui.separator();
             let progress = match &self.run {
@@ -1813,21 +2077,221 @@ impl SequenceState {
         if let Some(err) = &self.last_error {
             ui.colored_label(Color32::RED, format!("Error: {err}"));
         }
-        if let Some(t) = &self.grid_track {
-            ui.weak(t.summary());
-            let n = t.n_moves();
-            if n > 0
-                && ui
-                    .button(format!("Save grid calibration ({n} moves)"))
-                    .on_hover_text(
-                        "Use the step sizes learned from where the tiles are on the map as the \
-                         coarse calibration. Drag any misplaced tiles into place first.",
-                    )
-                    .clicked()
-            {
-                self.grid_calib_save = Some((t.calib, n));
-            }
+        self.show_rebuild(ui);
+        self.show_grid_track(ui);
+    }
+
+    /// Name of sequence entry `i` (for the grid's lists).
+    fn entry_name(&self, i: usize) -> String {
+        self.seq.entries.get(i).map(|e| e.name.clone()).unwrap_or_else(|| format!("entry {}", i + 1))
+    }
+
+    /// A tracked grid: the question waiting for the user, what it fixed by
+    /// itself (each undoable), and its settings.
+    fn show_grid_track(&mut self, ui: &mut Ui) {
+        if self.lineup_undo_available
+            && ui
+                .button("Undo line-up of survey tiles")
+                .on_hover_text("Put the tiles back where they were before the survey's tiles were lined up.")
+                .clicked()
+        {
+            self.lineup_undo_request = true;
         }
+        let Some(t) = &self.grid_track else { return };
+        ui.weak(t.summary());
+        let tiles = t.tiles_info();
+        let (n, calib, learning) = (t.n_moves(), t.calib, t.learning());
+        let pending = self.next_move_plan();
+
+        // The question, while the run is held for it.
+        let mut answer = None;
+        if let Some(a) = &self.grid_approval {
+            egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.5, Color32::ORANGE)).show(ui, |ui| {
+                ui.colored_label(Color32::ORANGE, "The grid wants to correct the survey. Held until you choose.");
+                if let Some(info) = tiles.get(a.tile) {
+                    ui.label(format!(
+                        "{}: {} \u{2014} placed {:.0} nm from where the coarse calibration put it, {:.0} nm from its plan.",
+                        self.entry_name(info.entry),
+                        placement_text(info.placement),
+                        info.auto_shift_nm,
+                        info.error_nm.unwrap_or(0.)
+                    ));
+                }
+                match a.next {
+                    Some((next, _, steps)) => {
+                        let planned = self.grid_planned.get(&next).copied().unwrap_or(steps);
+                        ui.label(format!(
+                            "Move to {}: {:?} steps instead of the planned {:?}.",
+                            self.entry_name(next),
+                            steps,
+                            planned
+                        ));
+                    }
+                    None => {
+                        ui.label("The next move stays as planned.");
+                    }
+                }
+                ui.weak(
+                    "Check the new tile against its neighbours on the map. Accept if it sits right; \
+                     reject to put it back where the coarse calibration put it and keep the planned \
+                     move. You can also drag the tile into place first.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("\u{2714} Accept and continue").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("\u{2716} Reject and continue").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        }
+        match answer {
+            Some(true) => self.approve_grid(),
+            Some(false) => self.reject_grid(),
+            None => {}
+        }
+
+        // Automatic fixes so far, each undoable.
+        let mut undo = None;
+        let mut pin = None;
+        let mut learn = None;
+        egui::CollapsingHeader::new(format!("Automatic fixes ({} tiles)", tiles.len()))
+            .id_salt("grid_fixes")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("grid_fix_list").num_columns(4).striped(true).show(ui, |ui| {
+                    for info in &tiles {
+                        ui.label(self.entry_name(info.entry));
+                        ui.label(placement_text(info.placement));
+                        match info.error_nm {
+                            Some(e) => ui.weak(format!("{e:.0} nm from plan")),
+                            None => ui.weak("start"),
+                        };
+                        if info.placement == Placement::First {
+                            ui.label("");
+                        } else if info.undone {
+                            if ui
+                                .small_button("Redo placement")
+                                .on_hover_text("Put the tile back where the automatic placement put it.")
+                                .clicked()
+                            {
+                                undo = Some((info.index, false));
+                            }
+                        } else if ui
+                            .small_button("Undo placement")
+                            .on_hover_text(format!(
+                                "Move the tile {:.0} nm back to where the coarse calibration put it, and \
+                                 don't learn the step size from it.",
+                                info.auto_shift_nm
+                            ))
+                            .clicked()
+                        {
+                            undo = Some((info.index, true));
+                        }
+                        ui.end_row();
+                    }
+                });
+                if let Some((next, at, planned, steps)) = pending {
+                    let pinned = self.grid_pinned.contains(&next);
+                    ui.horizontal(|ui| {
+                        if pinned {
+                            ui.label(format!("Next move to {}: kept as planned {:?}", self.entry_name(next), planned));
+                            if ui.small_button("Let the grid correct it").clicked() {
+                                pin = Some((next, at, false));
+                            }
+                        } else if steps != planned {
+                            ui.label(format!(
+                                "Next move to {}: {:?} (planned {:?})",
+                                self.entry_name(next),
+                                steps,
+                                planned
+                            ));
+                            if ui.small_button("Use the planned move").clicked() {
+                                pin = Some((next, at, true));
+                            }
+                        } else {
+                            ui.label(format!("Next move to {}: as planned {:?}", self.entry_name(next), planned));
+                        }
+                    });
+                }
+                let mut on = learning;
+                if ui
+                    .checkbox(&mut on, "Learn the step size from the tiles")
+                    .on_hover_text(
+                        "Off: moves use the coarse calibration the run started with, corrected only \
+                         for where the latest tile is.",
+                    )
+                    .changed()
+                {
+                    learn = Some(on);
+                }
+            });
+        if let Some((k, on)) = undo {
+            self.set_tile_undone(k, on);
+        }
+        if let Some((next, at, on)) = pin {
+            self.pin_move(next, at, on);
+        }
+        if let Some(on) = learn {
+            if let Some(t) = &mut self.grid_track {
+                t.set_learning(on);
+            }
+            self.correct_next_move();
+        }
+        ui.checkbox(&mut self.survey.approve, "Ask before correcting a move or placing a tile off its plan")
+            .on_hover_text(
+                "Hold the run after each tile whose next move would change, or that was placed more \
+                 than a tenth of the tile spacing away from where the coarse calibration put it.",
+            );
+        if n > 0
+            && ui
+                .button(format!("Save grid calibration ({n} moves)"))
+                .on_hover_text(
+                    "Use the step sizes learned from where the tiles are on the map as the \
+                     coarse calibration. Drag any misplaced tiles into place first.",
+                )
+                .clicked()
+        {
+            self.grid_calib_save = Some((calib, n));
+        }
+    }
+
+    /// "Rebuild & restart": save the run at a safe point, rebuild the app
+    /// from source and pick the run up again in the new build.
+    fn show_rebuild(&mut self, ui: &mut Ui) {
+        if crate::restart::source_dir().is_none() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            if self.restart_pending {
+                ui.spinner();
+                ui.label("Restart waits for a safe point (a coarse move, tip move or I(V) series finishes first)");
+                if ui.small_button("Cancel").clicked() {
+                    self.restart_pending = false;
+                    self.send(SequenceCommand::CancelDetach);
+                }
+                return;
+            }
+            let hover = if self.is_active() {
+                "Close the app, rebuild it from source and start the new build. The sequence \
+                 is saved first: a running scan keeps going in Nanonis, and the new app \
+                 reopens this project and carries on where the sequence was (a paused \
+                 sequence stays paused). If the build fails, its window shows why; run it \
+                 again once fixed."
+            } else {
+                "Close the app, rebuild it from source and start the new build, which reopens \
+                 this project. If the build fails, its window shows why; run it again once fixed."
+            };
+            if ui.button("🔨 Rebuild & restart").on_hover_text(hover).clicked() {
+                if self.is_active() {
+                    self.restart_pending = true;
+                    self.send(SequenceCommand::Detach);
+                } else {
+                    crate::restart::request();
+                }
+            }
+        });
     }
 
     /// Progress bar with the time left while running; the estimated length
@@ -2041,6 +2505,16 @@ fn drag_toggle(ui: &mut Ui, drag: &mut Option<DragTarget>, target: DragTarget) -
         *drag = if on { None } else { Some(target) };
     }
     clicked && !on
+}
+
+/// How a grid tile was placed, in words.
+fn placement_text(p: Placement) -> String {
+    match p {
+        Placement::First => "first tile".into(),
+        Placement::Matched { score } => format!("matched (score {score:.2})"),
+        Placement::Predicted(Unmatched::NoMatch) => "no clear match: placed as the moves predict".into(),
+        Placement::Predicted(Unmatched::Ambiguous) => "two spots matched alike: placed as the moves predict".into(),
+    }
 }
 
 #[cfg(test)]

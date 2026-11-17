@@ -21,10 +21,13 @@ mod utils;
 mod view_object;
 mod project;
 mod theme;
+mod polish_window;
 mod version;
+mod restart;
 
 fn main() -> Result<(), Box<dyn Error>> {
     attach_parent_console();
+    install_crash_log();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -95,6 +98,28 @@ fn init_wgpu() -> eyre::Result<(Instance, Adapter, Device, Queue)> {
     }))
     .context("Device request failed")?;
     Ok((instance, adapter, dev, queue))
+}
+
+/// Record every panic (message, place, backtrace) in `crash.log` in the
+/// config folder: the app has no console, so otherwise a crash leaves no
+/// trace.
+fn install_crash_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = app::CONFIG_DIR.config_local_dir().join("crash.log");
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let text = format!(
+            "==== {now} v{} thread '{thread}'\n{info}\n{}\n\n",
+            version::version(),
+            std::backtrace::Backtrace::force_capture()
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write as _;
+            let _ = f.write_all(text.as_bytes());
+        }
+        default(info);
+    }));
 }
 
 fn adapter_to_str(adapter: &Adapter) -> String {
